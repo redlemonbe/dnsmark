@@ -95,10 +95,10 @@ dnsmark -s 192.168.1.10 --random -Q 2000 -l 30 --json
 dnsmark -s 192.168.1.10 -d queries.txt -l 30
 
 # Compare two servers side by side
-dnsmark -s 8.8.8.8 --compare 1.1.1.1 --random -l 30
+dnsmark -s 192.168.1.10 --compare 192.168.1.11 --random -l 30
 
 # DNS-over-TLS
-dnsmark -s 1.1.1.1 --protocol dot --random -l 10
+dnsmark -s YOUR_DNS_SERVER --protocol dot --random -l 10
 
 # Quiet mode — no TUI, final stats only
 dnsmark -s 192.168.1.10 --random -l 30 -q

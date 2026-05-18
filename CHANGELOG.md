@@ -1,0 +1,43 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.2.0] - 2026-05-18
+
+### Fixed
+- **Latency inflation at low QPS**: UDP worker now processes responses during the
+  inter-send pause via `tokio::select!`. Previously, at 500 QPS / 16 workers the
+  worker slept ~32 ms between sends, leaving responses unread until the next
+  iteration and inflating RTT measurements by the full sleep duration.
+- **README examples**: Replaced public DNS servers (8.8.8.8, 1.1.1.1) in usage
+  examples with private/placeholder addresses, consistent with the ACCEPTABLE_USE
+  disclaimer.
+
+### Added
+- `CHANGELOG.md` (this file)
+- `.github/workflows/ci.yml` — cargo clippy + cargo test on push / PR
+- `deny.toml` — supply-chain policy via cargo-deny (licenses, advisories, bans)
+
+## [0.1.0] - 2026-05-18
+
+### Added
+- Initial release
+- High-performance UDP / TCP / DoT DNS benchmark
+- HDR histogram (p50 / p95 / p99 / p999)
+- Ramp mode (auto saturation detection, doubles every 5 s)
+- Compare mode (two servers side-by-side, diff output)
+- Live TUI dashboard (ratatui)
+- Random UUID subdomain generator (`--random`, `--random-type`)
+- JSON and CSV output
+- jemalloc allocator
+- AF/XDP opt-in (`--features xdp`)
+- Static musl binary (no system dependencies)
+- dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
+
+[0.2.0]: https://github.com/redlemonbe/dnsmark/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/redlemonbe/dnsmark/releases/tag/v0.1.0

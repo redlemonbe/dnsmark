@@ -77,11 +77,37 @@ pub async fn run_udp_worker(
             }
         });
 
-        // Rate limit
+        // Rate limit — keep receiving during the inter-send pause so RTT is not
+        // inflated by tokio scheduling delay at low QPS (e.g. 32ms sleep at 31 QPS/worker).
         let qps = qps_per_worker.load(Ordering::Relaxed);
         if qps > 0 {
-            let sleep = std::time::Duration::from_secs_f64(1.0 / qps as f64);
-            tokio::time::sleep(sleep).await;
+            let interval = std::time::Duration::from_secs_f64(1.0 / qps as f64);
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut sleep => break,
+                    result = socket.recv(&mut recv_buf) => {
+                        if let Ok(n) = result {
+                            if let Some(resp) = parse_response(&recv_buf[..n]) {
+                                if let Some(sent_at) = in_flight.remove(&resp.id) {
+                                    let rtt_us = sent_at.elapsed().as_micros() as u64;
+                                    stats.record_response(resp.rcode, rtt_us);
+                                    if verbose {
+                                        tracing::debug!(
+                                            id = resp.id,
+                                            rcode = resp.rcode,
+                                            rtt_us,
+                                            "response"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             tokio::task::yield_now().await;
         }

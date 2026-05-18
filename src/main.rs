@@ -25,7 +25,7 @@ const DISCLAIMER: &str = "dnsmark is provided for authorized performance testing
 #[derive(Parser)]
 #[command(
     name = "dnsmark",
-    version = "0.1.0",
+    version = "0.2.0",
     about = "High-performance DNS benchmark — drop-in dnsperf replacement",
     after_help = DISCLAIMER,
 )]
