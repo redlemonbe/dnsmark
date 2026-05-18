@@ -117,6 +117,10 @@ struct Cli {
     /// Disable AF_XDP even if available
     #[arg(long)]
     no_xdp: bool,
+
+    /// Max outstanding queries per worker, 0 = unlimited (mirrors dnsperf -q, default: 100)
+    #[arg(long, default_value_t = 100)]
+    max_outstanding: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -209,6 +213,7 @@ fn main() -> anyhow::Result<()> {
         no_tui: cli.no_tui || cli.quiet,
         force_xdp: cli.xdp,
         no_xdp: cli.no_xdp,
+        max_outstanding: cli.max_outstanding,
     });
 
     // Build tokio runtime

@@ -52,4 +52,6 @@ pub struct Config {
     pub no_tui: bool,
     pub force_xdp: bool,
     pub no_xdp: bool,
+    /// Max outstanding queries per worker (0 = unlimited). Mirrors dnsperf -q.
+    pub max_outstanding: usize,
 }

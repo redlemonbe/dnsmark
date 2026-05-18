@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-18
+
+### Added
+- **`--max-outstanding N`** (default 100, mirrors dnsperf `-q`): limits the number
+  of in-flight queries per worker. Applied in both rate-limited and unlimited
+  (sendmmsg) mode. In unlimited mode the batch size is capped to the remaining
+  headroom (`max_outstanding - current_in_flight`), preventing burst overshoot.
+  With 32 workers × default 100 = 3 200 concurrent queries max — equivalent to
+  `dnsperf -c 32 -q 100`. Use `--max-outstanding 0` to disable.
+
+### Performance (vs Runbound 192.168.1.11, 32 workers, 15 s)
+
+| Mode | Tool | QPS | Completion | Avg RTT |
+|---|---|---|---|---|
+| Unlimited | dnsperf `-q 100` | 65 744 | 100.0 % | 1.47 ms |
+| Unlimited | dnsmark `--max-outstanding 100` | 84 084 | 99.7 % | 36.9 ms |
+| Rate 50k | dnsperf `-Q 50000 -q 100` | 48 221 | 100.0 % | 0.63 ms |
+| Rate 50k | dnsmark `-Q 50000 --max-outstanding 100` | 49 845 | 100.0 % | 1.51 ms |
+
+dnsmark's unlimited mode sends up to max_outstanding queries per worker
+simultaneously (aggressive fill strategy), which drives the server harder than
+dnsperf's natural back-pressure model. Both approaches are useful:
+dnsperf measures sustainable throughput at low latency; dnsmark measures the
+server's absolute packet-processing ceiling.
+
 ## [0.4.0] - 2026-05-18
 
 ### Changed
@@ -178,6 +203,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.4.1]: https://github.com/redlemonbe/dnsmark/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/redlemonbe/dnsmark/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/redlemonbe/dnsmark/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/redlemonbe/dnsmark/compare/v0.3.0...v0.3.1

@@ -57,6 +57,7 @@ fn sendmmsg_batch(fd: i32, bufs: &[Vec<u8>]) -> io::Result<usize> {
 //
 // Unlimited: sendmmsg(BATCH_SIZE) with MSG_DONTWAIT; brief sleep on WouldBlock.
 
+#[allow(clippy::too_many_arguments)]
 fn sender_thread(
     fd: i32,
     in_flight: Arc<Mutex<HashMap<u16, Instant>>>,
@@ -65,6 +66,7 @@ fn sender_thread(
     shutdown: Arc<AtomicBool>,
     qps_per_worker: Arc<AtomicU64>,
     verbose: bool,
+    max_outstanding: usize,
 ) {
     let mut next_id: u16 = rand::random();
     let mut next_send = Instant::now();
@@ -85,6 +87,15 @@ fn sender_thread(
                 send_interval = Duration::from_secs_f64(1.0 / qps as f64);
                 next_send = Instant::now();
                 last_qps = qps;
+            }
+
+            // Back-pressure: if too many queries are outstanding (server behind),
+            // skip this send slot and let the receiver drain responses first.
+            // Mirrors dnsperf's -q (max outstanding per client) behaviour.
+            if max_outstanding > 0 && in_flight.lock().len() >= max_outstanding {
+                next_send = Instant::now() + send_interval;
+                std::thread::sleep(Duration::from_micros(500));
+                continue;
             }
 
             // Sleep until the next absolute send deadline. Using an absolute
@@ -124,9 +135,23 @@ fn sender_thread(
             }
         } else {
             // Unlimited mode: sendmmsg batch, no rate limit.
-            let mut batch_bufs: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
-            let mut batch_ids: Vec<u16> = Vec::with_capacity(BATCH_SIZE);
-            for _ in 0..BATCH_SIZE {
+            // Cap batch to respect max_outstanding: compute headroom once per
+            // iteration so we don't spike far past the limit between checks.
+            let batch_cap = if max_outstanding > 0 {
+                let current = in_flight.lock().len();
+                if current >= max_outstanding {
+                    std::thread::sleep(Duration::from_micros(500));
+                    last_qps = 0;
+                    continue;
+                }
+                (max_outstanding - current).min(BATCH_SIZE)
+            } else {
+                BATCH_SIZE
+            };
+
+            let mut batch_bufs: Vec<Vec<u8>> = Vec::with_capacity(batch_cap);
+            let mut batch_ids: Vec<u16> = Vec::with_capacity(batch_cap);
+            for _ in 0..batch_cap {
                 let entry = query_source.next();
                 batch_bufs.push(build_query(next_id, &entry.name, entry.qtype));
                 batch_ids.push(next_id);
@@ -274,7 +299,7 @@ pub async fn run_udp_worker(
     qps_per_worker: Arc<AtomicU64>,
     verbose: bool,
     worker_id: usize,
-    _max_in_flight: usize,
+    max_outstanding: usize,
 ) {
     let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -310,7 +335,7 @@ pub async fn run_udp_worker(
     let sender = std::thread::spawn(move || {
         super::pin_to_cpu(worker_id);
         let _sock = socket; // keep fd alive for the lifetime of this thread
-        sender_thread(sender_fd, in_s, qs, stats_s, sd_s, qps_s, verbose);
+        sender_thread(sender_fd, in_s, qs, stats_s, sd_s, qps_s, verbose, max_outstanding);
     });
 
     // ── Receiver thread ────────────────────────────────────────────────────

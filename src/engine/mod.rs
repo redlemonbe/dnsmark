@@ -68,10 +68,6 @@ pub async fn run_with_shutdown(
     };
     let shared_qps = Arc::new(AtomicU64::new(initial_qps_per_worker));
 
-    // max_in_flight per worker: 4× the worker count gives enough pipeline depth
-    // to sustain the QPS target under normal latency without blocking the sender.
-    let max_in_flight = (config.concurrent * 4).max(1);
-
     // Spawn workers
     let mut handles = Vec::with_capacity(config.concurrent);
     for i in 0..config.concurrent {
@@ -84,13 +80,16 @@ pub async fn run_with_shutdown(
 
         let handle = match config.protocol {
             Protocol::Udp => tokio::spawn(sender::run_udp_worker(
-                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i, max_in_flight,
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i,
+                cfg.max_outstanding,
             )),
             Protocol::Tcp => tokio::spawn(sender::run_tcp_worker(
-                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i, max_in_flight,
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i,
+                cfg.max_outstanding,
             )),
             Protocol::Dot => tokio::spawn(sender::run_dot_worker(
-                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, sn, i, max_in_flight,
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, sn, i,
+                cfg.max_outstanding,
             )),
         };
         handles.push(handle);
