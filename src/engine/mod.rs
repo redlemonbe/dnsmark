@@ -1,0 +1,190 @@
+pub mod compare;
+pub mod ramp;
+pub mod receiver;
+pub mod sender;
+
+use std::net::SocketAddr;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Instant;
+
+use anyhow::Context;
+
+use crate::config::{Config, Protocol};
+use crate::query::{file::FileQuerySource, random::RandomQuerySource, QuerySource};
+use crate::stats::{oom_guard, StatsCollector, StatsSnapshot};
+
+pub async fn run(config: Arc<Config>) -> anyhow::Result<StatsSnapshot> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let result = run_with_shutdown(config, shutdown.clone()).await;
+
+    // Ensure shutdown is set so OOM guard and other tasks exit
+    shutdown.store(true, Ordering::Relaxed);
+    result
+}
+
+pub async fn run_with_shutdown(
+    config: Arc<Config>,
+    shutdown: Arc<AtomicBool>,
+) -> anyhow::Result<StatsSnapshot> {
+    let stats = Arc::new(StatsCollector::new());
+
+    // OOM guard
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(oom_guard::run(sd));
+    }
+
+    // Build query source
+    let query_source: Arc<dyn QuerySource> = if config.random {
+        Arc::new(RandomQuerySource::new(&config.random_domain))
+    } else if let Some(path) = &config.query_file {
+        Arc::new(FileQuerySource::load(path).context("load query file")?)
+    } else {
+        Arc::new(RandomQuerySource::new(&config.random_domain))
+    };
+
+    // Verify server is reachable (quick UDP probe for UDP mode)
+    let server_addr: SocketAddr = (config.server, config.port).into();
+    if config.protocol == Protocol::Udp {
+        let probe = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind probe socket")?;
+        probe.connect(server_addr).await.context(format!(
+            "server {}:{} is unreachable",
+            config.server, config.port
+        ))?;
+    }
+
+    // QPS per worker
+    let qps_per_worker = if config.qps > 0 {
+        (config.qps / config.concurrent.max(1) as u64).max(1)
+    } else {
+        0
+    };
+    let shared_qps = Arc::new(AtomicU64::new(qps_per_worker));
+
+    // Spawn workers
+    let mut handles = Vec::with_capacity(config.concurrent);
+    for _ in 0..config.concurrent {
+        let qs = query_source.clone();
+        let st = stats.clone();
+        let sd = shutdown.clone();
+        let qps_arc = shared_qps.clone();
+        let cfg = config.clone();
+        let sn = config.server.to_string();
+
+        let handle = match config.protocol {
+            Protocol::Udp => tokio::spawn(sender::run_udp_worker(
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose,
+            )),
+            Protocol::Tcp => tokio::spawn(sender::run_tcp_worker(
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose,
+            )),
+            Protocol::Dot => tokio::spawn(sender::run_dot_worker(
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, sn,
+            )),
+        };
+        handles.push(handle);
+    }
+
+    // Ramp mode controller
+    let ramp_handle = if config.ramp {
+        let st = stats.clone();
+        let sd = shutdown.clone();
+        let qps_arc = shared_qps.clone();
+        let concurrent = config.concurrent;
+        Some(tokio::spawn(async move {
+            let mut ctrl = ramp::RampController::new();
+            let mut prev_sent = 0u64;
+            let mut prev_timeouts = 0u64;
+            let mut prev_servfail = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if sd.load(Ordering::Relaxed) {
+                    break;
+                }
+                let cur_sent = st.sent.load(Ordering::Relaxed);
+                let cur_timeouts = st.timeouts.load(Ordering::Relaxed);
+                let cur_servfail = st.rcode_servfail.load(Ordering::Relaxed);
+
+                let delta_sent = cur_sent.saturating_sub(prev_sent);
+                let delta_timeouts = cur_timeouts.saturating_sub(prev_timeouts);
+                let delta_sf = cur_servfail.saturating_sub(prev_servfail);
+
+                let (new_qps, saturated, max_sustainable) =
+                    ctrl.advance(delta_sent, delta_timeouts, delta_sf);
+
+                if saturated {
+                    println!("\nMax sustainable QPS: {}", max_sustainable);
+                    sd.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                // Update shared QPS (per worker)
+                let per_worker = (new_qps / concurrent.max(1) as u64).max(1);
+                qps_arc.store(per_worker, Ordering::Relaxed);
+                println!("Ramp: target QPS -> {}", new_qps);
+
+                prev_sent = cur_sent;
+                prev_timeouts = cur_timeouts;
+                prev_servfail = cur_servfail;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // TUI
+    let tui_handle = if !config.no_tui
+        && !config.quiet
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        let st = stats.clone();
+        let sd = shutdown.clone();
+        let cfg = config.clone();
+        Some(tokio::spawn(crate::output::tui::run_tui(st, sd, cfg)))
+    } else {
+        None
+    };
+
+    let start = Instant::now();
+
+    // Wait for duration or Ctrl-C
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)), if !config.ramp => {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+        _ = wait_forever(), if config.ramp => {
+            // Ramp mode: the ramp controller sets shutdown when saturated
+        }
+        _ = tokio::signal::ctrl_c() => {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // Ensure shutdown is set
+    shutdown.store(true, Ordering::Relaxed);
+
+    // Wait for workers
+    for h in handles {
+        let _ = h.await;
+    }
+    if let Some(h) = ramp_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = tui_handle {
+        let _ = h.await;
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    Ok(stats.snapshot(elapsed))
+}
+
+async fn wait_forever() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
