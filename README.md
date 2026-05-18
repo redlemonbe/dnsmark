@@ -9,19 +9,10 @@
 
 ---
 
-> **Designed to benchmark [Runbound](https://github.com/redlemonbe/Runbound)**
-> — a hardened Rust DNS server. Works against any RFC 1035-compliant resolver.
+> **Works against any RFC 1035-compliant resolver.**
+> Designed as a drop-in replacement for dnsperf with production-grade diagnostics.
 > Read [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) before use.
-
----
-
-## Disclaimer
-
-> **dnsmark is provided for authorized performance testing only.**
-> The authors disclaim all liability for any unauthorized, abusive,
-> or malicious use of this tool.
-> Only use dnsmark against DNS servers you own or have explicit
-> written authorization to test.
+> **Authorized testing only** — only use dnsmark against DNS servers you own or have explicit written authorization to test.
 
 ---
 
@@ -69,13 +60,13 @@ loopback, same DNS server:
 |---|:---:|---|
 | dnsperf 2.14 | 1 | 87 000 |
 | dnsperf 2.14 | 8 | 127 000 |
-| **dnsmark 0.3.2** | **1** | **128 000** |
+| **dnsmark 0.4.3** | **1** | **128 000** |
 
 dnsmark auto-detects physical cores, pins each worker with CPU
 affinity, and uses `sendmmsg()` batch sends — zero manual tuning
 required.
 
-→ Full benchmark methodology: [docs/benchmark-report-v0.4.6.md](docs/benchmark-report-v0.4.6.md)
+→ Full benchmark methodology: [docs/benchmark-dnsperf-vs-dnsmark.md](docs/benchmark-dnsperf-vs-dnsmark.md)
 
 ---
 
@@ -83,9 +74,11 @@ required.
 
 ```bash
 # Static binary — no dependencies, recommended
-curl -LO https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-0.4.3-linux-x86_64-musl
-chmod +x dnsmark-0.4.3-linux-x86_64-musl
-sudo mv dnsmark-0.4.3-linux-x86_64-musl /usr/local/bin/dnsmark
+# Replace linux-x86_64-musl with linux-aarch64-musl for ARM64,
+# or *-linux-gnu variants for glibc-linked builds.
+curl -LO https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-linux-x86_64-musl
+chmod +x dnsmark-linux-x86_64-musl
+sudo mv dnsmark-linux-x86_64-musl /usr/local/bin/dnsmark
 
 # From source
 cargo build --release
@@ -140,6 +133,44 @@ No manual tuning. No guessing. One command, one answer.
 
 ---
 
+## Common use cases
+
+**Find max capacity before a deployment**
+
+```bash
+dnsmark -s YOUR_DNS_SERVER --random --ramp
+```
+
+Automatically doubles QPS every 5 s and reports the last stable throughput. No manual iteration.
+
+**Regression test between two server versions**
+
+```bash
+dnsmark -s OLD_SERVER --compare NEW_SERVER --random -l 60
+```
+
+Runs both in parallel, prints a side-by-side diff of QPS, latency, and completion rate.
+
+**CI/CD gate — fail if p99 exceeds a threshold**
+
+```bash
+result=$(dnsmark -s YOUR_DNS_SERVER --random -l 30 -q --json)
+p99=$(echo "$result" | python3 -c "import sys,json; s=json.load(sys.stdin)['statistics']; print(s['p99_us'])")
+[ "$p99" -lt 50000 ] || { echo "p99 exceeded 50 ms"; exit 1; }
+```
+
+JSON output makes it trivial to parse any metric in a pipeline.
+
+**Reproduce a production incident**
+
+```bash
+dnsmark -s YOUR_DNS_SERVER -d incident-queries.txt -Q 8000 -l 300
+```
+
+Replay the exact query mix, rate, and duration — with full percentile output that `dnsperf` cannot provide.
+
+---
+
 ## Flags
 
 ### dnsperf-compatible (same letter)
@@ -191,6 +222,10 @@ _smtp._tcp.example.com SRV
 ---
 
 ## Output
+
+> Example: `--random` mode against a recursive resolver. NXDOMAIN is expected —
+> random UUID subdomains of `bench.invalid.` have no delegation, so any correct
+> resolver returns NXDOMAIN. Use a query file (`-d queries.txt`) to get NOERROR responses.
 
 ```
 DNS Performance Testing Tool — dnsmark 0.4.3
