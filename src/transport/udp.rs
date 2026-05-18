@@ -99,6 +99,12 @@ pub async fn run_udp_worker(
     let mut recv_buf = [0u8; 4096];
     let timeout_dur = Duration::from_millis(timeout_ms);
 
+    // Drift-compensating rate limiter: track absolute send deadlines so that
+    // timer quantization overshoot in one iteration is recovered in the next.
+    let mut next_send = Instant::now();
+    let mut last_qps: u64 = 0;
+    let mut send_interval = Duration::ZERO;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -135,12 +141,22 @@ pub async fn run_udp_worker(
 
         let qps = qps_per_worker.load(Ordering::Relaxed);
         if qps > 0 {
-            // Rate-limited: keep receiving during the inter-send pause so RTT is not
-            // inflated by tokio scheduling delay at low QPS.
-            let interval = Duration::from_secs_f64(1.0 / qps as f64);
-            let sleep = tokio::time::sleep(interval);
-            tokio::pin!(sleep);
+            // Reset deadline when QPS target changes (ramp mode step-up).
+            if qps != last_qps {
+                send_interval = Duration::from_secs_f64(1.0 / qps as f64);
+                next_send = Instant::now();
+                last_qps = qps;
+            }
+
+            // Wait until next_send deadline, draining responses in the meantime.
+            // Using an absolute deadline means timer overshoot in one iteration
+            // is absorbed by a shorter sleep in the next, keeping long-run rate accurate.
             loop {
+                let now = Instant::now();
+                if now >= next_send { break; }
+                let remaining = next_send - now;
+                let sleep = tokio::time::sleep(remaining);
+                tokio::pin!(sleep);
                 tokio::select! {
                     biased;
                     _ = &mut sleep => break,
@@ -163,6 +179,13 @@ pub async fn run_udp_worker(
                         }
                     }
                 }
+            }
+
+            // Advance absolute deadline. Cap to now if we fell far behind (e.g. blocked
+            // on semaphore) so we don't fire a burst of sends to catch up.
+            next_send += send_interval;
+            if next_send < Instant::now() {
+                next_send = Instant::now();
             }
 
             if shutdown.load(Ordering::Relaxed) {

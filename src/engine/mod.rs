@@ -68,9 +68,9 @@ pub async fn run_with_shutdown(
     };
     let shared_qps = Arc::new(AtomicU64::new(initial_qps_per_worker));
 
-    // max_in_flight per worker: limits outstanding UDP queries for back-pressure
-    let num_threads = if config.threads > 0 { config.threads } else { num_cpus::get() };
-    let max_in_flight = (config.concurrent / num_threads).max(1);
+    // max_in_flight per worker: 4× the worker count gives enough pipeline depth
+    // to sustain the QPS target under normal latency without blocking the sender.
+    let max_in_flight = (config.concurrent * 4).max(1);
 
     // Spawn workers
     let mut handles = Vec::with_capacity(config.concurrent);

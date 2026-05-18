@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-18
+
+### Fixed
+- **`-c auto` minimum 8 workers**: auto mode now guarantees at least 8 concurrent
+  workers even on machines with fewer physical cores (VMs, containers).
+  Startup message now distinguishes the capped case:
+  `Workers: 8 (auto — min 8, VM has 2 physical cores)` vs.
+  `Workers: 32 (auto — physical cores, HT excluded)`.
+- **`max_in_flight` too restrictive**: changed from `concurrent / threads` (could be
+  1 on a matching worker/thread count) to `concurrent × 4`, giving each UDP worker
+  enough in-flight slots to sustain the QPS target without blocking the sender
+  pipeline.
+- **Drift-compensating rate limiter**: the UDP rate-limited path now tracks absolute
+  send deadlines (`next_send: Instant`) instead of sleeping a fixed duration each
+  iteration. When the tokio timer overshoots (e.g. 3 ms instead of 2.13 ms), the
+  next sleep is proportionally shorter to compensate, keeping the long-run rate
+  accurate. Result: `-Q 15000` now delivers ~15 000 QPS at 100% completion instead
+  of ~9 700 QPS.
+
 ## [0.3.1] - 2026-05-18
 
 ### Changed
@@ -128,6 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.3.2]: https://github.com/redlemonbe/dnsmark/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/redlemonbe/dnsmark/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/redlemonbe/dnsmark/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/redlemonbe/dnsmark/compare/v0.2.4...v0.2.5

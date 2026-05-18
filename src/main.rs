@@ -154,7 +154,8 @@ fn main() -> anyhow::Result<()> {
     let protocol = Protocol::from_str(&cli.protocol)?;
 
     let physical = autodetect::physical_cores();
-    let auto_concurrent = physical.len().max(1);
+    let physical_count = physical.len();
+    let auto_concurrent = physical_count.max(8);
     let (concurrent, concurrent_auto) = match cli.clients.as_str() {
         "auto" | "0" => (auto_concurrent, true),
         n => (n.parse::<usize>().context("invalid -c value")?.max(1), false),
@@ -164,10 +165,19 @@ fn main() -> anyhow::Result<()> {
 
     if !cli.quiet {
         if concurrent_auto {
-            println!(
-                "Workers: {} (auto — physical cores, HT excluded)",
-                concurrent
-            );
+            if physical_count < 8 {
+                println!(
+                    "Workers: {} (auto — min 8, VM has {} physical core{})",
+                    concurrent,
+                    physical_count,
+                    if physical_count == 1 { "" } else { "s" }
+                );
+            } else {
+                println!(
+                    "Workers: {} (auto — physical cores, HT excluded)",
+                    concurrent
+                );
+            }
         } else {
             println!("Workers: {} (manual)", concurrent);
         }
