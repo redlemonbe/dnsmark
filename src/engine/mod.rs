@@ -107,30 +107,37 @@ pub async fn run_with_shutdown(
             let mut prev_sent = 0u64;
             let mut prev_timeouts = 0u64;
             let mut prev_servfail = 0u64;
-            let mut prev_completed = 0u64;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if sd.load(Ordering::Relaxed) {
-                    break;
-                }
+                // 2s warm-up: let tokio, sockets, and jemalloc reach steady state
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if sd.load(Ordering::Relaxed) { break; }
+                let mid_completed = st.completed.load(Ordering::Relaxed);
+
+                // 3s stable measurement window
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if sd.load(Ordering::Relaxed) { break; }
+
                 let cur_sent = st.sent.load(Ordering::Relaxed);
                 let cur_timeouts = st.timeouts.load(Ordering::Relaxed);
                 let cur_servfail = st.rcode_servfail.load(Ordering::Relaxed);
                 let cur_completed = st.completed.load(Ordering::Relaxed);
                 let p99_us = st.p99_us();
 
+                // Rates over the full 5s window (timeout/servfail are not warm-up sensitive)
                 let delta_sent = cur_sent.saturating_sub(prev_sent);
                 let delta_timeouts = cur_timeouts.saturating_sub(prev_timeouts);
                 let delta_sf = cur_servfail.saturating_sub(prev_servfail);
-                let delta_completed = cur_completed.saturating_sub(prev_completed);
+
+                // Throughput measured only on the stable 3s window (skips warm-up)
+                let stable_completed = cur_completed.saturating_sub(mid_completed);
+                let effective_qps = stable_completed / 3;
 
                 let target_qps = ctrl.current_qps;
                 let (new_qps, saturated, max_sustainable) =
-                    ctrl.advance(delta_sent, delta_timeouts, delta_sf, delta_completed, p99_us);
+                    ctrl.advance(delta_sent, delta_timeouts, delta_sf, effective_qps, p99_us);
 
                 if saturated {
                     let reported = if max_sustainable == 0 { target_qps } else { max_sustainable };
-                    let effective_qps = delta_completed / 5;
                     let timeout_rate = if delta_sent > 0 {
                         delta_timeouts as f64 / delta_sent as f64
                     } else {
@@ -138,7 +145,7 @@ pub async fn run_with_shutdown(
                     };
                     let reason = if timeout_rate > 0.01 {
                         format!("timeout rate {:.1}%", timeout_rate * 100.0)
-                    } else if effective_qps < (target_qps as f64 * 0.85) as u64 {
+                    } else if effective_qps < (target_qps as f64 * 0.70) as u64 {
                         format!("throughput {}/s vs {}/s target", effective_qps, target_qps)
                     } else if p99_us > 50_000 {
                         format!("p99 {}ms > 50ms", p99_us / 1000)
@@ -159,7 +166,6 @@ pub async fn run_with_shutdown(
                 prev_sent = cur_sent;
                 prev_timeouts = cur_timeouts;
                 prev_servfail = cur_servfail;
-                prev_completed = cur_completed;
             }
         }))
     } else {
