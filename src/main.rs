@@ -118,7 +118,7 @@ struct Cli {
     #[arg(long)]
     no_xdp: bool,
 
-    /// Max outstanding queries per worker, 0 = unlimited (mirrors dnsperf -q, default: 100)
+    /// Max outstanding queries total across all workers, 0 = unlimited (mirrors dnsperf -q N×clients)
     #[arg(long, default_value_t = 100)]
     max_outstanding: usize,
 }

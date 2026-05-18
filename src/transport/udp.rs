@@ -3,7 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -53,14 +53,18 @@ fn sendmmsg_batch(fd: i32, bufs: &[Vec<u8>]) -> io::Result<usize> {
 //
 // Rate-limited: drift-compensating sleep via nanosleep (std::thread::sleep).
 //   RTT timer starts at the actual send() call, matching dnsperf behaviour.
-//   No semaphore — the send rate itself is the natural back-pressure.
 //
 // Unlimited: sendmmsg(BATCH_SIZE) with MSG_DONTWAIT; brief sleep on WouldBlock.
+//
+// global_in_flight: shared AtomicUsize across ALL workers — incremented here on
+//   send, decremented by receiver_thread on response or timeout. The limit
+//   max_outstanding therefore applies to the total across all workers combined.
 
 #[allow(clippy::too_many_arguments)]
 fn sender_thread(
     fd: i32,
     in_flight: Arc<Mutex<HashMap<u16, Instant>>>,
+    global_in_flight: Arc<AtomicUsize>,
     query_source: Arc<dyn QuerySource>,
     stats: Arc<StatsCollector>,
     shutdown: Arc<AtomicBool>,
@@ -89,10 +93,10 @@ fn sender_thread(
                 last_qps = qps;
             }
 
-            // Back-pressure: if too many queries are outstanding (server behind),
-            // skip this send slot and let the receiver drain responses first.
-            // Mirrors dnsperf's -q (max outstanding per client) behaviour.
-            if max_outstanding > 0 && in_flight.lock().len() >= max_outstanding {
+            // Back-pressure: pause if global in-flight cap is reached.
+            if max_outstanding > 0
+                && global_in_flight.load(Ordering::Relaxed) >= max_outstanding
+            {
                 next_send = Instant::now() + send_interval;
                 std::thread::sleep(Duration::from_micros(500));
                 continue;
@@ -124,6 +128,7 @@ fn sender_thread(
             };
             if ret >= 0 {
                 in_flight.lock().insert(next_id, Instant::now());
+                global_in_flight.fetch_add(1, Ordering::Relaxed);
                 stats.inc_sent();
                 if verbose {
                     tracing::debug!(id = next_id, name = %entry.name, "sent query");
@@ -135,10 +140,9 @@ fn sender_thread(
             }
         } else {
             // Unlimited mode: sendmmsg batch, no rate limit.
-            // Cap batch to respect max_outstanding: compute headroom once per
-            // iteration so we don't spike far past the limit between checks.
+            // Cap batch to global headroom so we never spike past max_outstanding.
             let batch_cap = if max_outstanding > 0 {
-                let current = in_flight.lock().len();
+                let current = global_in_flight.load(Ordering::Relaxed);
                 if current >= max_outstanding {
                     std::thread::sleep(Duration::from_micros(500));
                     last_qps = 0;
@@ -177,6 +181,7 @@ fn sender_thread(
                     map.insert(*id, send_time);
                     stats.inc_sent();
                 }
+                global_in_flight.fetch_add(sent, Ordering::Relaxed);
             }
 
             // Force re-init of deadline when transitioning back to rate-limited.
@@ -194,6 +199,7 @@ fn sender_thread(
 fn receiver_thread(
     fd: i32,
     in_flight: Arc<Mutex<HashMap<u16, Instant>>>,
+    global_in_flight: Arc<AtomicUsize>,
     stats: Arc<StatsCollector>,
     shutdown: Arc<AtomicBool>,
     timeout_dur: Duration,
@@ -260,22 +266,36 @@ fn receiver_thread(
                     .collect()
             }; // in_flight lock released here
 
+            let completed = responses.len();
             for (rcode, rtt_us) in responses {
                 stats.record_response(rcode, rtt_us);
+            }
+            // Decrement global counter for each query that left in_flight.
+            if completed > 0 {
+                global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                    Some(x.saturating_sub(completed))
+                }).ok();
             }
         } else {
             // Nothing received — expire timeouts every 10 ms, then yield briefly.
             let now = Instant::now();
             if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
+                let mut expired = 0usize;
                 let mut map = in_flight.lock();
                 map.retain(|_, sent_at| {
                     if now.duration_since(*sent_at) > timeout_dur {
                         stats.inc_timeout();
+                        expired += 1;
                         false
                     } else {
                         true
                     }
                 });
+                if expired > 0 {
+                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                        Some(x.saturating_sub(expired))
+                    }).ok();
+                }
                 last_timeout_check = now;
             }
             std::thread::sleep(Duration::from_micros(50));
@@ -300,6 +320,7 @@ pub async fn run_udp_worker(
     verbose: bool,
     worker_id: usize,
     max_outstanding: usize,
+    global_in_flight: Arc<AtomicUsize>,
 ) {
     let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -328,6 +349,7 @@ pub async fn run_udp_worker(
 
     // ── Sender thread ──────────────────────────────────────────────────────
     let in_s = in_flight.clone();
+    let gif_s = global_in_flight.clone();
     let stats_s = stats.clone();
     let sd_s = shutdown.clone();
     let qps_s = qps_per_worker.clone();
@@ -335,16 +357,17 @@ pub async fn run_udp_worker(
     let sender = std::thread::spawn(move || {
         super::pin_to_cpu(worker_id);
         let _sock = socket; // keep fd alive for the lifetime of this thread
-        sender_thread(sender_fd, in_s, qs, stats_s, sd_s, qps_s, verbose, max_outstanding);
+        sender_thread(sender_fd, in_s, gif_s, qs, stats_s, sd_s, qps_s, verbose, max_outstanding);
     });
 
     // ── Receiver thread ────────────────────────────────────────────────────
     let in_r = in_flight;
+    let gif_r = global_in_flight;
     let stats_r = stats;
     let sd_r = shutdown;
     let receiver = std::thread::spawn(move || {
         let _sock = recv_socket; // keep fd alive
-        receiver_thread(recv_fd, in_r, stats_r, sd_r, timeout_dur);
+        receiver_thread(recv_fd, in_r, gif_r, stats_r, sd_r, timeout_dur);
     });
 
     // Wait for both without blocking the tokio runtime.

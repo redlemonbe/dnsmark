@@ -5,7 +5,7 @@ pub mod sender;
 
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Instant;
@@ -68,6 +68,9 @@ pub async fn run_with_shutdown(
     };
     let shared_qps = Arc::new(AtomicU64::new(initial_qps_per_worker));
 
+    // Global in-flight counter shared across all UDP workers (max_outstanding total).
+    let global_in_flight = Arc::new(AtomicUsize::new(0));
+
     // Spawn workers
     let mut handles = Vec::with_capacity(config.concurrent);
     for i in 0..config.concurrent {
@@ -81,7 +84,7 @@ pub async fn run_with_shutdown(
         let handle = match config.protocol {
             Protocol::Udp => tokio::spawn(sender::run_udp_worker(
                 server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i,
-                cfg.max_outstanding,
+                cfg.max_outstanding, global_in_flight.clone(),
             )),
             Protocol::Tcp => tokio::spawn(sender::run_tcp_worker(
                 server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i,

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-05-18
+
+### Changed
+- **`--max-outstanding` is now a global limit** across all workers (was per-worker
+  in v0.4.1). A single `Arc<AtomicUsize>` is created once in the engine and
+  shared across every UDP worker. The sender increments it on each successful
+  send; the receiver decrements it on each response received **and** on each
+  timeout expiry. The check therefore limits the total number of queries in
+  flight across the entire run, not per worker.
+  With the default `--max-outstanding 100` and 32 workers this is 100 total
+  in-flight instead of the previous 3 200 (32 × 100).
+
+### Performance (vs Runbound 192.168.1.11, 32 workers, 10 s)
+
+| Tool | In-flight total | QPS | Completion | Avg RTT | p999 |
+|---|---|---|---|---|---|
+| dnsperf `-q 100 -c 32` | 3 200 | 65 322 | 100 % | 1.48 ms | ~47 ms |
+| dnsmark `--max-outstanding 100` | 100 | 59 868 | 99.96 % | 3.82 ms | 33 ms |
+
+dnsmark achieves comparable throughput with 32× fewer in-flight slots.
+
 ## [0.4.1] - 2026-05-18
 
 ### Added
@@ -203,6 +224,7 @@ server's absolute packet-processing ceiling.
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.4.2]: https://github.com/redlemonbe/dnsmark/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/redlemonbe/dnsmark/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/redlemonbe/dnsmark/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/redlemonbe/dnsmark/compare/v0.3.1...v0.3.2
