@@ -192,6 +192,15 @@ Statistics:
 
 ---
 
+## Support
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor%20on%20GitHub)](https://github.com/sponsors/redlemonbe)
+
+**Bitcoin** — `3FP8hkkiu4kwCD1PDFgAv2oq1ZTyXwy3yy`  
+**Ethereum** — `0xB5eEAf89edA4204Aa9305B068b37A93439cBb680`
+
+---
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE)
