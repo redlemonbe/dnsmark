@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-18
+
+### Fixed
+- **Ramp mode no longer converges when server responds fast (REFUSED)**: saturation
+  detection was timeout-only. Added two new criteria (OR logic):
+  - effective QPS < 85% of target (sender can't keep up)
+  - p99 > 50 ms (latency degradation)
+  Saturation reason is now printed: `Max sustainable QPS: N (reason)`.
+- **Banner version hardcoded at 0.1.0**: now reads `CARGO_PKG_VERSION` at compile time.
+
 ## [0.2.0] - 2026-05-18
 
 ### Fixed

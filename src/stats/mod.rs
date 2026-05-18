@@ -65,6 +65,10 @@ impl StatsCollector {
         let _ = h.record(rtt_us.max(1));
     }
 
+    pub fn p99_us(&self) -> u64 {
+        self.histogram.lock().value_at_quantile(0.99)
+    }
+
     pub fn snapshot(&self, elapsed_secs: f64) -> StatsSnapshot {
         let sent = self.sent.load(Ordering::Relaxed);
         let completed = self.completed.load(Ordering::Relaxed);

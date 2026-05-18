@@ -9,7 +9,7 @@ pub fn print_result(snap: &StatsSnapshot) {
         if d == 0 { 0.0 } else { n as f64 / d as f64 * 100.0 }
     };
 
-    println!("DNS Performance Testing Tool — dnsmark 0.1.0");
+    println!("DNS Performance Testing Tool — dnsmark {}", env!("CARGO_PKG_VERSION"));
     println!("[DISCLAIMER: authorized testing only]");
     println!();
     println!("Statistics:");
