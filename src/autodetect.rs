@@ -12,6 +12,34 @@ pub fn detect() -> AutoConfig {
     AutoConfig { cpus, mem_mb, xdp_available }
 }
 
+/// Returns the logical CPU IDs of physical cores only — one per physical
+/// core_id, selected by reading /sys topology. HT siblings are excluded.
+///
+/// Falls back to `0..num_cpus::get_physical()` if /sys is unavailable.
+pub fn physical_cores() -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut cores = Vec::new();
+
+    for cpu_id in 0..num_cpus::get() * 2 {
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{}/topology/core_id",
+            cpu_id
+        );
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(core_id) = s.trim().parse::<usize>() {
+                if seen.insert(core_id) {
+                    cores.push(cpu_id);
+                }
+            }
+        }
+    }
+
+    if cores.is_empty() {
+        cores = (0..num_cpus::get_physical()).collect();
+    }
+    cores
+}
+
 fn read_proc_meminfo_avail_mb() -> u64 {
     let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     for line in content.lines() {

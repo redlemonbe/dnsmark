@@ -25,7 +25,7 @@ const DISCLAIMER: &str = "dnsmark is provided for authorized performance testing
 #[derive(Parser)]
 #[command(
     name = "dnsmark",
-    version = "0.2.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "High-performance DNS benchmark — drop-in dnsperf replacement",
     after_help = DISCLAIMER,
 )]
@@ -42,9 +42,9 @@ struct Cli {
     #[arg(short = 'd')]
     query_file: Option<PathBuf>,
 
-    /// Concurrent clients (default: num_cpus * 4)
-    #[arg(short = 'c')]
-    concurrent: Option<usize>,
+    /// Concurrent clients (auto = physical cores, HT excluded; 0 = auto; or integer)
+    #[arg(short = 'c', default_value = "auto")]
+    clients: String,
 
     /// Max QPS target (0 = unlimited)
     #[arg(short = 'Q', default_value_t = 0)]
@@ -152,8 +152,26 @@ fn main() -> anyhow::Result<()> {
     // Auto-detection
     let auto = autodetect::detect();
     let protocol = Protocol::from_str(&cli.protocol)?;
-    let concurrent = cli.concurrent.unwrap_or(auto.cpus * 4).max(1);
+
+    let physical = autodetect::physical_cores();
+    let auto_concurrent = physical.len().max(1);
+    let (concurrent, concurrent_auto) = match cli.clients.as_str() {
+        "auto" | "0" => (auto_concurrent, true),
+        n => (n.parse::<usize>().context("invalid -c value")?.max(1), false),
+    };
+
     let threads = cli.threads.unwrap_or(auto.cpus).max(1);
+
+    if !cli.quiet {
+        if concurrent_auto {
+            println!(
+                "Workers: {} (auto — physical cores, HT excluded)",
+                concurrent
+            );
+        } else {
+            println!("Workers: {} (manual)", concurrent);
+        }
+    }
 
     let config = Arc::new(Config {
         server: cli.server,

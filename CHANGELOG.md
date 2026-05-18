@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-18
+
+### Changed
+- **Physical-core-only CPU affinity**: `pin_to_cpu` now reads
+  `/sys/devices/system/cpu/cpu*/topology/core_id` to build a list of one
+  logical CPU ID per physical core, excluding HT siblings. Workers are pinned
+  to those IDs instead of the full logical CPU range. The list is computed once
+  at first call and cached via `OnceLock`. Falls back to
+  `0..num_cpus::get_physical()` when `/sys` is unavailable.
+- **`-c auto` default**: concurrent workers now default to the physical core
+  count instead of `num_cpus * 4`. Accepted values: `auto` (default), `0`
+  (same as auto), or an explicit integer. At startup dnsmark prints:
+  `Workers: N (auto — physical cores, HT excluded)` or `Workers: N (manual)`.
+- **Version string**: `--version` now reads `CARGO_PKG_VERSION` at compile
+  time instead of the previously hardcoded `0.2.0`.
+
 ## [0.3.0] - 2026-05-18
 
 ### Added
@@ -112,6 +128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.3.1]: https://github.com/redlemonbe/dnsmark/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/redlemonbe/dnsmark/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/redlemonbe/dnsmark/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/redlemonbe/dnsmark/compare/v0.2.3...v0.2.4
