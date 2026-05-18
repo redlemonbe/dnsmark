@@ -39,11 +39,11 @@ pub async fn run_with_shutdown(
 
     // Build query source
     let query_source: Arc<dyn QuerySource> = if config.random {
-        Arc::new(RandomQuerySource::new(&config.random_domain))
+        Arc::new(RandomQuerySource::new(&config.random_domain, config.random_qtype))
     } else if let Some(path) = &config.query_file {
         Arc::new(FileQuerySource::load(path).context("load query file")?)
     } else {
-        Arc::new(RandomQuerySource::new(&config.random_domain))
+        Arc::new(RandomQuerySource::new(&config.random_domain, config.random_qtype))
     };
 
     // Verify server is reachable (quick UDP probe for UDP mode)

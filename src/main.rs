@@ -86,6 +86,10 @@ struct Cli {
     #[arg(long, default_value = "bench.invalid.")]
     random_domain: String,
 
+    /// Record type for --random queries: a or aaaa
+    #[arg(long, default_value = "a")]
+    random_type: String,
+
     /// Compare with a second server (run both in parallel)
     #[arg(long)]
     compare: Option<std::net::IpAddr>,
@@ -166,6 +170,10 @@ fn main() -> anyhow::Result<()> {
         ramp: cli.ramp,
         random: cli.random,
         random_domain: cli.random_domain,
+        random_qtype: match cli.random_type.to_lowercase().as_str() {
+            "aaaa" => 28,
+            _ => 1,
+        },
         compare: cli.compare,
         protocol,
         json_output: cli.json,

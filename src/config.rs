@@ -44,6 +44,7 @@ pub struct Config {
     pub ramp: bool,
     pub random: bool,
     pub random_domain: String,
+    pub random_qtype: u16,
     pub compare: Option<IpAddr>,
     pub protocol: Protocol,
     pub json_output: bool,
