@@ -89,6 +89,8 @@ cargo build --release --features xdp
 
 ## Quick start
 
+> Run dnsmark from a dedicated machine — never from the DNS server you are testing.
+
 ```bash
 # Auto-find your server's max sustainable QPS
 dnsmark -s YOUR_DNS_SERVER --random --ramp
@@ -282,6 +284,34 @@ Statistics:
 | Global in-flight counter (`--max-outstanding`) | `Arc<AtomicUsize>` shared across all workers — no semaphore, no blocking |
 | OOM guard | Background thread monitors `/proc/meminfo`, stops cleanly before the kernel OOM killer intervenes |
 | HDR histogram | Lock-free, pre-allocated, zero allocation in hot path |
+
+---
+
+## Hardware requirements
+
+dnsmark scales horizontally — one worker per physical core.
+Below 4 physical cores, `dnsperf` will produce cleaner results
+with less overhead. Above 4 cores, dnsmark's advantage compounds
+with each additional core.
+
+| Tier | CPU | RAM | Expected max QPS |
+|------|-----|-----|-----------------|
+| Minimum | 4 physical cores | 2 GB | ~30 000 |
+| Recommended | 8+ physical cores | 4 GB | ~60 000 |
+| Optimal | 16+ physical cores | 8 GB | 100 000+ |
+
+> Numbers measured UDP, loopback, against a local resolver.
+> Real-world LAN results depend on network and target server.
+
+**Important:** always run dnsmark on a **dedicated machine**,
+separate from the DNS server under test. Running both on the
+same host invalidates results (CPU contention).
+
+**AF/XDP mode** (`--features xdp`) additionally requires:
+kernel 5.4+, `CAP_NET_ADMIN`, and a NIC with XDP driver support
+(Intel i40e / ixgbe, or Mellanox mlx5).
+
+**Architecture:** x86_64 only. aarch64 support planned.
 
 ---
 
