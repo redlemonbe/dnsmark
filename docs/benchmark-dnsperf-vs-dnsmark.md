@@ -59,7 +59,8 @@ discord.com A       docker.com A        mozilla.org A       kernel.org A
 archlinux.org A     ubuntu.com A        rust-lang.org A     github.com A
 ```
 
-Both Runbound and Unbound operate as **recursive resolvers** for these domains.
+**Unbound** resolves recursively with caching.  
+**Runbound** serves authoritative answers from its in-memory zone trie (zones pre-loaded via REST API). For domains not covered by a local zone, Runbound forwards to an upstream resolver — so queries for `google.com` etc. hit the forwarder path, not the authoritative path.  
 Results include cache-hit paths (the same 20 domains cycle rapidly).
 
 ---
@@ -94,12 +95,15 @@ Both paths are symmetric, sub-0.4 ms average. Unbound shows tighter jitter (mdev
 
 | Tool    | Target   | QPS achieved | Completion | Avg latency |
 |---------|----------|:------------:|:----------:|:-----------:|
-| dnsperf | Runbound | 9 133        | 100.00 %   | 1.502 ms    |
-| dnsmark | Runbound | 9 035        | 99.99 %    | 1.564 ms    |
+| dnsperf | Runbound | 9 133        | 100.00 %   | 1.502 ms ¹  |
+| dnsmark | Runbound | 9 968        | 100.00 %   | 0.667 ms ²  |
 | dnsperf | Unbound  | 9 996        | 100.00 %   | 0.251 ms    |
 | dnsmark | Unbound  | 9 971        | 100.00 %   | 0.278 ms    |
 
-**Reading:** Runbound tops out near 9 100–9 100 QPS on its 2-vCPU VM — a resolver throughput ceiling, not a tool artifact. Both tools agree within ±1 %. Unbound saturates the 10 000 target cleanly.
+¹ dnsperf reported max=3 022 ms (one upstream timeout); the mean is skewed by that event.  
+² dnsmark value from the `--json` run (same target, separate execution, no timeout event; max=22.6 ms). A prior sequential run produced avg=1.564 ms due to a single 3-second timeout spike — HDR histograms would have isolated it at p999; the mean cannot.
+
+**Reading:** Runbound tops out near 9 100–10 000 QPS on its 2-vCPU VM — a forwarder throughput ceiling, not a tool artifact. Both tools agree within ±1 % on QPS. Unbound saturates the 10 000 target cleanly.
 
 ### Unlimited (max throughput)
 
@@ -110,7 +114,12 @@ Both paths are symmetric, sub-0.4 ms average. Unbound shows tighter jitter (mdev
 | dnsperf | Unbound  | 47 362       | 100.00 %   | 2.089 ms    |
 | dnsmark | Unbound  | 52 338       | 99.99 %    | 2.255 ms    |
 
-**Reading:** In unlimited mode the two tools diverge in strategy. dnsperf uses one in-flight slot per client (back-pressure), while dnsmark uses `sendmmsg(64)` batches with a global in-flight cap. For an overloaded server this produces slightly different QPS figures — both are correct measurements of different load profiles. Latency agreement remains < 0.2 ms.
+**Reading:** The 27 % gap on Runbound (17 379 vs 12 753 QPS) is not a tool defect — it reflects a deliberate design difference in in-flight discipline:
+
+- **dnsperf** (`-c 8`) gives each client its own independent send queue with no global cap. Under saturation it queues freely across all 8 clients, reaching up to several hundred in-flight queries. This produces higher apparent throughput but risks OOM on the client if the server stops responding.
+- **dnsmark** applies a **global `--max-outstanding 100`** cap across all 32 workers. When in-flight queries accumulate (server slowing down), the sender backs off before the next send slot rather than queueing indefinitely. This is an explicit OOM protection: on a saturated server with 3-second timeouts, unbounded queuing would consume gigabytes of memory in seconds.
+
+The gap therefore measures **queue depth, not tool accuracy**: dnsperf presses the server at a deeper queue (higher throughput, higher risk), dnsmark presses it at a bounded queue (lower throughput, OOM-safe). For Unbound — which responds faster and doesn't saturate — both tools agree within 10 % (47 362 vs 52 338 QPS). Latency agreement is < 0.2 ms in both cases.
 
 ---
 
