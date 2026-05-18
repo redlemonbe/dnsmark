@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-18
+
+### Changed
+- **UDP architecture: dedicated sender + receiver OS threads** (replaces single
+  tokio async task per worker). Each worker now spawns two `std::thread`s:
+  - *Sender*: tight loop — `std::thread::sleep` (nanosleep) for rate limiting
+    with drift compensation, `sendmmsg(64)` for unlimited mode. RTT timer
+    starts at the actual `send()` call, matching dnsperf behaviour.
+  - *Receiver*: `recvmmsg(MSG_DONTWAIT, batch=16)` in a tight loop, with timeout
+    expiry checked every 10 ms. Responses are recorded under a single
+    `parking_lot::Mutex` lock per batch, released before taking the histogram
+    lock.
+  The tokio runtime is now used only for orchestration, the TUI, and ramp
+  control — the UDP hot path has zero async overhead.
+- **Semaphore removed**: back-pressure via semaphore caused `p999 = timeout`
+  (3 s) when the server was slow. Without the semaphore the sender never
+  blocks; the natural send rate provides back-pressure.
+
+### Fixed
+- `p999 = 3 s` is gone: the old semaphore `timeout_dur` wait manifested as
+  3-second latency spikes in the tail. With the OS-thread model p999 is now
+  in the sub-millisecond range for a responsive server.
+
+### Performance
+| Metric | v0.3.x (tokio select!) | v0.4.0 (OS threads) |
+|---|---|---|
+| `-Q 15000` QPS | 14 970 | 14 951 |
+| `-Q 15000` p999 | ~3 000 ms | 0.2 ms |
+| unlimited completed QPS | ~100k | ~139k |
+| ramp burst QPS | ~107k | ~143k |
+
 ## [0.3.2] - 2026-05-18
 
 ### Fixed
@@ -147,6 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.4.0]: https://github.com/redlemonbe/dnsmark/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/redlemonbe/dnsmark/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/redlemonbe/dnsmark/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/redlemonbe/dnsmark/compare/v0.2.5...v0.3.0
