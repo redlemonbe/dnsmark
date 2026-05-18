@@ -93,12 +93,13 @@ fn sender_thread(
                 last_qps = qps;
             }
 
-            // Back-pressure: pause if global in-flight cap is reached.
+            // Back-pressure: skip this send slot if global cap is reached.
+            // No sleep here — the rate-limiter sleep on the next iteration
+            // naturally yields the CPU while waiting for the receiver to drain.
             if max_outstanding > 0
                 && global_in_flight.load(Ordering::Relaxed) >= max_outstanding
             {
                 next_send = Instant::now() + send_interval;
-                std::thread::sleep(Duration::from_micros(500));
                 continue;
             }
 
@@ -144,7 +145,7 @@ fn sender_thread(
             let batch_cap = if max_outstanding > 0 {
                 let current = global_in_flight.load(Ordering::Relaxed);
                 if current >= max_outstanding {
-                    std::thread::sleep(Duration::from_micros(500));
+                    std::thread::yield_now();
                     last_qps = 0;
                     continue;
                 }

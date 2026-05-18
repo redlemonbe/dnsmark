@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-05-18
+
+### Changed
+- **No blocking sleep when `--max-outstanding` is reached**: removed the 500 µs
+  `sleep` that was introduced in v0.4.2 when the global in-flight cap was hit.
+  - Rate-limited path: the sender simply skips the slot (advances the deadline)
+    and loops back immediately; the rate-limiter sleep on the next iteration
+    naturally yields the CPU while the receiver drains.
+  - Unlimited path: replaced `sleep(500 µs)` with `std::thread::yield_now()`
+    (one OS scheduler quantum, typically < 10 µs).
+  The global `Arc<AtomicUsize>` counter is kept (introduced in v0.4.2).
+
+### Performance (vs Runbound 192.168.1.11, 32 workers, 10 s)
+
+| Tool | In-flight total | QPS | Completion | Avg RTT |
+|---|---|---|---|---|
+| dnsperf `-q 100 -c 32` | 3 200 | 67 020 | 100 % | 1.44 ms |
+| dnsmark `--max-outstanding 100` | 100 | 67 272 | 99.98 % | 1.81 ms |
+
+dnsmark matches dnsperf QPS-for-QPS with 32× fewer in-flight slots.
+
 ## [0.4.2] - 2026-05-18
 
 ### Changed
@@ -224,6 +245,7 @@ server's absolute packet-processing ceiling.
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.4.3]: https://github.com/redlemonbe/dnsmark/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/redlemonbe/dnsmark/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/redlemonbe/dnsmark/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/redlemonbe/dnsmark/compare/v0.3.2...v0.4.0
