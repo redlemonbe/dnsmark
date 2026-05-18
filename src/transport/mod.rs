@@ -1,6 +1,8 @@
 pub mod dot;
 pub mod tcp;
 pub mod udp;
+#[cfg(feature = "xdp")]
+pub mod xdp;
 
 pub use dot::run_dot_worker;
 pub use tcp::run_tcp_worker;

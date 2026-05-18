@@ -1,6 +1,6 @@
 [package]
 name = "dnsmark"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 license = "MIT"
 description = "High-performance DNS benchmark — drop-in dnsperf replacement"
@@ -8,7 +8,7 @@ repository = "https://github.com/redlemonbe/dnsmark"
 rust-version = "1.82"
 
 [features]
-default = []
+default = ["xdp"]
 xdp = ["dep:aya", "dep:aya-ebpf-bindings"]
 
 [dependencies]

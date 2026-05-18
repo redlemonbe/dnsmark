@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-05-18
+
+### Added
+- **AF/XDP receive path** (`--features xdp`, enabled by default): DNS responses (UDP src\_port=53) are captured at the NIC driver level via an eBPF XDP program and delivered to user space through AF_XDP sockets, bypassing the kernel network stack entirely. This eliminates the `recvmmsg` syscall on the response hot path.
+  - One shared XDP receiver thread per NIC RX queue; N sender threads continue using regular UDP sockets.
+  - Automatic `setrlimit(RLIMIT_MEMLOCK, RLIM_INFINITY)` before UMEM allocation (CLI tool — no systemd).
+  - Auto-detects interface via `/proc/net/route`; native zero-copy (DRV mode) on supported drivers, copy mode fallback on virtio/veth.
+  - Graceful fallback to the recvmmsg UDP path if XDP is unavailable or the process lacks capabilities.
+- **`--no-xdp`**: disable AF/XDP at runtime without recompiling.
+- **`--xdp`** (`force_xdp`): error rather than fall back if XDP is unavailable.
+- **Capability hint on XDP failure**: `To enable XDP: sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which dnsmark)`.
+- **`cargo build --release`** now compiles the XDP eBPF program automatically via `build.rs` using `clang -target bpf -O2`. Requires: `apt install clang libbpf-dev`.
+
+### Fixed
+- `StatsCollector` gained `inc_sent_n(usize)` for batch accounting in the XDP sendmmsg path.
+
 ## [0.4.3] - 2026-05-18
 
 ### Fixed

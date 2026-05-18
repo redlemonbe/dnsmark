@@ -44,6 +44,10 @@ impl StatsCollector {
         self.sent.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_sent_n(&self, n: usize) {
+        self.sent.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
     pub fn inc_timeout(&self) {
         self.timeouts.fetch_add(1, Ordering::Relaxed);
     }
