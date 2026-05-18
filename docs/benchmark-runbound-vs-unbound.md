@@ -9,9 +9,9 @@
 ## ⚠️ Bug discovered: `rate-limit: 0` — all Runbound results invalid
 
 After this benchmark was run, a configuration bug was discovered in Runbound v0.4.2:
-the `rate-limit` parameter was set to `0`. In Runbound's implementation, `rate-limit: 0`
-means **refuse all queries** — the server responds `REFUSED` to every incoming DNS query
-regardless of zone membership or query type.
+the `rate-limit` parameter was set to `0`. In Runbound's implementation at the time,
+`rate-limit: 0` meant **refuse all queries** — the server responded `REFUSED` to every
+incoming DNS query regardless of zone membership or query type.
 
 **Impact on this report:**
 
@@ -25,7 +25,9 @@ regardless of zone membership or query type.
   exhausting its internal budget over successive bursts — not by a security feature.
 
 **All Runbound data rows in this document are marked ⚠️ and must be considered invalid.**
-A corrected benchmark will be published once the bug is fixed in Runbound v0.4.3.
+
+> **Fixed in Runbound v0.4.7**: `rate-limit: 0` now disables rate limiting entirely
+> (Unbound-compatible semantics). A corrected benchmark will be published separately.
 
 > Note: Runbound serves its zones via the REST API (zone CRUD, record management).
 > Under correct configuration it is a full authoritative DNS server, not an
