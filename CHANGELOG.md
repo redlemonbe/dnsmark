@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-05-18
+
+### Changed
+- **sendmmsg(2) batch sending in unlimited mode**: in unlimited mode (`-Q 0` / ramp
+  peak measurement), the UDP worker now sends 64 datagrams per `sendmmsg(2)` syscall
+  instead of one per `send()`. This reduces both syscall overhead and tokio yield
+  overhead by 64×. Measured improvement: 58k → 96k+ completed QPS on loopback.
+  Rate-limited mode (`-Q N`) is unchanged and still uses single sends with the
+  `select!`-based receive loop for accurate RTT.
+
 ## [0.2.3] - 2026-05-18
 
 ### Fixed
