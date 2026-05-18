@@ -104,44 +104,28 @@ pub async fn run_with_shutdown(
         let notify = ramp_done.clone();
         Some(tokio::spawn(async move {
             let mut ctrl = ramp::RampController::new();
-            let mut prev_sent = 0u64;
-            let mut prev_timeouts = 0u64;
-            let mut prev_servfail = 0u64;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // 1s burst: unlimited mode (sendmmsg) to probe real achievable completions
+                let burst_start = st.completed.load(Ordering::Relaxed);
+                qps_arc.store(0, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if sd.load(Ordering::Relaxed) { break; }
+                let burst_completions = st.completed.load(Ordering::Relaxed)
+                    .saturating_sub(burst_start);
+
+                // Restore rate limit, let server stabilise for 4s
+                let per_worker = (ctrl.current_qps / concurrent.max(1) as u64).max(1);
+                qps_arc.store(per_worker, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 if sd.load(Ordering::Relaxed) { break; }
 
-                let cur_sent = st.sent.load(Ordering::Relaxed);
-                let cur_timeouts = st.timeouts.load(Ordering::Relaxed);
-                let cur_servfail = st.rcode_servfail.load(Ordering::Relaxed);
-                let p99_us = st.p99_us();
-
-                let delta_sent = cur_sent.saturating_sub(prev_sent);
-                let delta_timeouts = cur_timeouts.saturating_sub(prev_timeouts);
-                let delta_sf = cur_servfail.saturating_sub(prev_servfail);
-
                 let target_qps = ctrl.current_qps;
-                let (new_qps, saturated, max_sustainable) =
-                    ctrl.advance(delta_sent, delta_timeouts, delta_sf, p99_us);
+                let (new_qps, saturated, max_sustainable) = ctrl.advance(burst_completions);
 
                 if saturated {
                     let reported = if max_sustainable == 0 { target_qps } else { max_sustainable };
-                    let timeout_rate = if delta_sent > 0 {
-                        delta_timeouts as f64 / delta_sent as f64
-                    } else {
-                        0.0
-                    };
-                    let sf_rate = if delta_sent > 0 {
-                        delta_sf as f64 / delta_sent as f64
-                    } else {
-                        0.0
-                    };
-                    let reason = if p99_us > 50_000 {
-                        format!("p99 {}ms > 50ms", p99_us / 1000)
-                    } else if timeout_rate > 0.01 {
-                        format!("timeout rate {:.1}%", timeout_rate * 100.0)
-                    } else if sf_rate > 0.05 {
-                        format!("SERVFAIL rate {:.1}%", sf_rate * 100.0)
+                    let reason = if burst_completions < (target_qps as f64 * 0.80) as u64 {
+                        format!("burst {}/s < {}/s target", burst_completions, target_qps)
                     } else {
                         "hard cap (20 doublings)".to_string()
                     };
@@ -151,15 +135,9 @@ pub async fn run_with_shutdown(
                     break;
                 }
 
-                // Update shared QPS (per worker)
-                let per_worker = (new_qps / concurrent.max(1) as u64).max(1);
-                qps_arc.store(per_worker, Ordering::Relaxed);
-                println!("Ramp: target QPS -> {}", new_qps);
-
-                prev_sent = cur_sent;
-                prev_timeouts = cur_timeouts;
-                prev_servfail = cur_servfail;
-
+                let new_per_worker = (new_qps / concurrent.max(1) as u64).max(1);
+                qps_arc.store(new_per_worker, Ordering::Relaxed);
+                println!("Ramp: target QPS -> {} (burst: {}/s)", new_qps, burst_completions);
             }
         }))
     } else {

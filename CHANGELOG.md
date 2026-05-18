@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-05-18
+
+### Changed
+- **Ramp saturation criterion — burst probe**: each 5-second ramp step now starts
+  with a 1-second unlimited burst (sendmmsg) to measure the real maximum achievable
+  completions/s. Saturation is declared when `burst_completions < target × 80%`.
+  This criterion is topology-independent (loopback, LAN, physical) and immune to
+  warm-up and scheduling variance.
+  Timeout/SERVFAIL rates are intentionally excluded from ramp: the burst phase
+  floods in-flight queries whose timeouts expire during the stabilisation window,
+  making those rates unreliable as saturation signals.
+  Each step logs the burst result: `Ramp: target QPS -> N (burst: M/s)`.
+
+### Added
+- **Parameters section in output**: server, protocol, clients, QPS cap, duration,
+  timeout, mode, and source are printed before Statistics for reproducibility.
+  Also included in `--json` output under `"parameters"`.
+
 ## [0.2.4] - 2026-05-18
 
 ### Changed

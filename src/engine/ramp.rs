@@ -11,29 +11,22 @@ impl RampController {
         Self { current_qps: 1_000, last_stable_qps: 0, doublings: 0 }
     }
 
-    /// Called every 5s with window deltas and cumulative p99.
+    /// Called every 5s (1s burst + 4s stabilisation).
     /// Returns (new_target_qps, saturated, max_sustainable_qps).
     ///
-    /// Saturation is declared (OR) when:
-    ///   - p99 > 50 ms  (primary — latency degradation, immune to warm-up variance)
-    ///   - timeout rate > 1%  (secondary)
-    ///   - SERVFAIL rate > 5%  (secondary)
-    ///   - 20 doublings reached without saturation (hard cap)
-    pub fn advance(
-        &mut self,
-        sent: u64,
-        timeouts: u64,
-        servfail: u64,
-        p99_us: u64,
-    ) -> (u64, bool, u64) {
-        if sent == 0 {
-            return (self.current_qps, false, 0);
-        }
+    /// Saturation criteria (OR):
+    ///   - burst_completions < target × 80% — sender/server physically cannot
+    ///     reach the target at full speed; topology-independent
+    ///   - 20 doublings without saturation (hard cap)
+    ///
+    /// Timeout / latency / SERVFAIL are intentionally excluded: the burst
+    /// phase sends far more packets than the server can answer, leaving many
+    /// queries in-flight that expire as timeouts during the stabilisation
+    /// window, making those rates meaningless as saturation signals.
+    pub fn advance(&mut self, burst_completions: u64) -> (u64, bool, u64) {
+        let burst_ok = burst_completions >= (self.current_qps as f64 * 0.80) as u64;
 
-        let timeout_rate = timeouts as f64 / sent as f64;
-        let sf_rate = servfail as f64 / sent as f64;
-
-        if p99_us > 50_000 || timeout_rate > 0.01 || sf_rate > 0.05 {
+        if !burst_ok {
             let stable = self.last_stable_qps;
             return (stable.max(1), true, stable);
         }
