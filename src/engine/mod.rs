@@ -58,13 +58,15 @@ pub async fn run_with_shutdown(
         ))?;
     }
 
-    // QPS per worker
-    let qps_per_worker = if config.qps > 0 {
+    // QPS per worker — ramp starts at 1000 total, normal mode uses -Q (0 = unlimited)
+    let initial_qps_per_worker = if config.ramp {
+        (ramp::RampController::new().current_qps / config.concurrent.max(1) as u64).max(1)
+    } else if config.qps > 0 {
         (config.qps / config.concurrent.max(1) as u64).max(1)
     } else {
         0
     };
-    let shared_qps = Arc::new(AtomicU64::new(qps_per_worker));
+    let shared_qps = Arc::new(AtomicU64::new(initial_qps_per_worker));
 
     // Spawn workers
     let mut handles = Vec::with_capacity(config.concurrent);
@@ -90,12 +92,16 @@ pub async fn run_with_shutdown(
         handles.push(handle);
     }
 
+    // Notify used to wake the main select when ramp saturates
+    let ramp_done = Arc::new(tokio::sync::Notify::new());
+
     // Ramp mode controller
     let ramp_handle = if config.ramp {
         let st = stats.clone();
         let sd = shutdown.clone();
         let qps_arc = shared_qps.clone();
         let concurrent = config.concurrent;
+        let notify = ramp_done.clone();
         Some(tokio::spawn(async move {
             let mut ctrl = ramp::RampController::new();
             let mut prev_sent = 0u64;
@@ -118,8 +124,15 @@ pub async fn run_with_shutdown(
                     ctrl.advance(delta_sent, delta_timeouts, delta_sf);
 
                 if saturated {
-                    println!("\nMax sustainable QPS: {}", max_sustainable);
+                    // If even the first level saturated, report the baseline as the limit
+                    let reported = if max_sustainable == 0 {
+                        ctrl.current_qps
+                    } else {
+                        max_sustainable
+                    };
+                    println!("\nMax sustainable QPS: {}", reported);
                     sd.store(true, Ordering::Relaxed);
+                    notify.notify_one();
                     break;
                 }
 
@@ -152,13 +165,13 @@ pub async fn run_with_shutdown(
 
     let start = Instant::now();
 
-    // Wait for duration or Ctrl-C
+    // Wait for duration, ramp completion, or Ctrl-C
     tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)), if !config.ramp => {
             shutdown.store(true, Ordering::Relaxed);
         }
-        _ = wait_forever(), if config.ramp => {
-            // Ramp mode: the ramp controller sets shutdown when saturated
+        _ = ramp_done.notified(), if config.ramp => {
+            // Ramp controller already set shutdown and printed the result
         }
         _ = tokio::signal::ctrl_c() => {
             shutdown.store(true, Ordering::Relaxed);
@@ -183,8 +196,3 @@ pub async fn run_with_shutdown(
     Ok(stats.snapshot(elapsed))
 }
 
-async fn wait_forever() {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-    }
-}

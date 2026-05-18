@@ -18,8 +18,14 @@ impl RampController {
         let sf_rate = servfail as f64 / sent as f64;
 
         if timeout_rate > 0.01 || sf_rate > 0.05 {
-            // Saturated at current_qps; last stable was previous level
-            return (self.last_stable_qps.max(1000), true, self.last_stable_qps);
+            // Saturated: last stable level, or current if first window
+            let stable = if self.last_stable_qps == 0 {
+                // Saturated even at baseline — report 0 (caller will handle messaging)
+                0
+            } else {
+                self.last_stable_qps
+            };
+            return (stable.max(1), true, stable);
         }
 
         self.last_stable_qps = self.current_qps;
