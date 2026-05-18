@@ -2,6 +2,10 @@
 
 High-performance DNS benchmark — drop-in `dnsperf` replacement.
 
+> **Designed to benchmark [Runbound](https://github.com/redlemonbe/Runbound)**
+> — a hardened Rust DNS server.
+> See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) before use.
+
 **jemalloc · HDR histogram p999 · live TUI · ramp mode · DoT · compare mode**
 
 ## Disclaimer
