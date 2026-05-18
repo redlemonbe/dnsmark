@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-18
+
+### Fixed
+- **Ramp never converges when server responds fast (p99 always < 50ms)**:
+  removed the unstable effective-QPS criterion entirely. Saturation criteria
+  are now p99 > 50ms (primary) and timeout/SERVFAIL rates (secondary).
+- **Hard cap added**: ramp stops after 20 doublings regardless of saturation
+  criteria, reporting the last stable QPS with reason `hard cap (20 doublings)`.
+- **Warm-up split removed**: the 2s+3s split was only needed for the QPS criterion
+  and is gone. Each ramp step is a clean 5s window again.
+- **Saturation reason display**: now correctly identifies p99 / timeout / SERVFAIL /
+  hard-cap and prints the rate or value for each.
+
 ## [0.2.2] - 2026-05-18
 
 ### Fixed
