@@ -45,7 +45,7 @@ On a 32-core Threadripper, one `dnsmark` instance equals **8 parallel
 | OOM protection | ❌ | ✅ |
 | jemalloc allocator | ❌ | ✅ |
 | sendmmsg() batch sending | ❌ | ✅ |
-| AF/XDP kernel-bypass | ❌ | ✅ opt-in |
+| AF/XDP kernel-bypass | ❌ | ✅ default |
 | Static binary (musl, no deps) | ❌ | ✅ |
 | dnsperf CLI compatibility | ✅ | ✅ |
 
@@ -60,7 +60,7 @@ loopback, same DNS server:
 |---|:---:|---|
 | dnsperf 2.14 | 1 | 87 000 |
 | dnsperf 2.14 | 8 | 127 000 |
-| **dnsmark 0.4.3** | **1** | **128 000** |
+| **dnsmark 0.4.4** | **1** | **128 000** |
 
 dnsmark auto-detects physical cores, pins each worker with CPU
 affinity, and uses `sendmmsg()` batch sends — zero manual tuning
@@ -74,17 +74,18 @@ required.
 
 ```bash
 # Static binary — no dependencies, recommended
-# Replace linux-x86_64-musl with linux-aarch64-musl for ARM64,
-# or *-linux-gnu variants for glibc-linked builds.
+# AF/XDP included by default. Replace linux-x86_64-musl with
+# linux-aarch64-musl for ARM64, or *-linux-gnu for glibc builds.
 curl -LO https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-linux-x86_64-musl
 chmod +x dnsmark-linux-x86_64-musl
 sudo mv dnsmark-linux-x86_64-musl /usr/local/bin/dnsmark
 
-# From source
-cargo build --release
+# Optional: grant XDP capabilities so non-root users can use the fast path
+sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip /usr/local/bin/dnsmark
 
-# With AF/XDP kernel-bypass (kernel 5.4+, CAP_NET_ADMIN)
-cargo build --release --features xdp
+# From source (AF/XDP included — requires clang + libbpf-dev at build time)
+apt install clang libbpf-dev   # build deps only, not required at runtime
+cargo build --release
 ```
 
 ## Quick start
@@ -205,8 +206,8 @@ Replay the exact query mix, rate, and duration — with full percentile output t
 | `--json` | — | JSON output on stdout |
 | `--csv <FILE>` | — | Write per-interval CSV |
 | `--no-tui` | — | Disable live dashboard |
-| `--xdp` | — | Force AF/XDP (needs `--features xdp`) |
-| `--no-xdp` | — | Disable XDP |
+| `--xdp` | — | Force AF/XDP (error if unavailable) |
+| `--no-xdp` | — | Disable AF/XDP, use recvmmsg UDP path |
 
 ---
 
@@ -230,7 +231,7 @@ _smtp._tcp.example.com SRV
 > resolver returns NXDOMAIN. Use a query file (`-d queries.txt`) to get NOERROR responses.
 
 ```
-DNS Performance Testing Tool — dnsmark 0.4.3
+DNS Performance Testing Tool — dnsmark 0.4.4
 [DISCLAIMER: authorized testing only]
 
 Parameters:
@@ -281,6 +282,7 @@ Statistics:
 | SO_REUSEPORT | One UDP socket per worker, zero lock contention |
 | CPU affinity | Each worker pinned to a physical core, HT excluded |
 | sendmmsg() | Batch UDP sends, fewer syscalls per second |
+| AF/XDP receive path | DNS responses captured at NIC driver level via eBPF — zero kernel network-stack overhead on the RX hot path. One shared XDP receiver thread per NIC queue; N senders continue using regular UDP sockets. Automatic fallback to recvmmsg on unsupported hardware. |
 | Global in-flight counter (`--max-outstanding`) | `Arc<AtomicUsize>` shared across all workers — no semaphore, no blocking |
 | OOM guard | Background thread monitors `/proc/meminfo`, stops cleanly before the kernel OOM killer intervenes |
 | HDR histogram | Lock-free, pre-allocated, zero allocation in hot path |
@@ -307,19 +309,22 @@ with each additional core.
 separate from the DNS server under test. Running both on the
 same host invalidates results (CPU contention).
 
-**AF/XDP mode** (`--features xdp`) additionally requires:
-kernel 5.4+, `CAP_NET_ADMIN`, and a NIC with XDP driver support
-(Intel i40e / ixgbe, or Mellanox mlx5).
+**AF/XDP mode** (enabled by default) additionally requires:
+kernel 5.10+, `CAP_NET_RAW + CAP_NET_ADMIN + CAP_BPF`, and a NIC with
+XDP driver support (Intel ixgbe / i40e / ice / igc — native zero-copy;
+virtio / veth — copy mode). Without the required capabilities, dnsmark
+prints a hint and falls back to the recvmmsg UDP path automatically.
 
-**Architecture:** x86_64 only. aarch64 support planned.
+**Architecture:** x86_64 and aarch64.
 
 ---
 
 ## Contributing
 
-- `cargo clippy --all-targets` — zero warnings required
+- `cargo clippy --all-targets --features xdp` — zero warnings required
 - `cargo test` — all tests must pass
 - `make lint && make audit` before submitting
+- Build deps for XDP: `apt install clang libbpf-dev`
 
 ---
 

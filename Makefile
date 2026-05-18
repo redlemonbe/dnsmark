@@ -1,13 +1,12 @@
-.PHONY: build build-static build-xdp test test-live lint audit bench bench-ramp
+.PHONY: build build-static test test-live lint audit bench bench-ramp
 
+# AF/XDP is included in default features — requires clang + libbpf-dev at build time.
+# Install build deps: apt install clang libbpf-dev
 build:
 	cargo build --release
 
 build-static:
 	cargo build --release --target x86_64-unknown-linux-musl
-
-build-xdp:
-	cargo build --release --features xdp
 
 test:
 	cargo test
