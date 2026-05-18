@@ -23,6 +23,7 @@ fn make_tls_connector() -> anyhow::Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dot_worker(
     server_addr: SocketAddr,
     query_source: Arc<dyn QuerySource>,
@@ -32,7 +33,10 @@ pub async fn run_dot_worker(
     qps_per_worker: Arc<AtomicU64>,
     verbose: bool,
     server_name: String,
+    worker_id: usize,
+    _max_in_flight: usize,
 ) {
+    super::pin_to_cpu(worker_id);
     let connector = match make_tls_connector() {
         Ok(c) => c,
         Err(e) => {

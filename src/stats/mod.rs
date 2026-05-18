@@ -70,7 +70,7 @@ impl StatsCollector {
         let completed = self.completed.load(Ordering::Relaxed);
         let avg_qps = if elapsed_secs > 0.0 { completed as f64 / elapsed_secs } else { 0.0 };
         let h = self.histogram.lock();
-        let (min_us, avg_us, p50, p95, p99, p999, max_us) = if h.len() > 0 {
+        let (min_us, avg_us, p50, p95, p99, p999, max_us) = if !h.is_empty() {
             (
                 h.min(),
                 h.mean(),

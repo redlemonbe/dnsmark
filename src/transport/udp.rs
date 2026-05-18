@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::dns::{build_query, parse_response};
 use crate::query::QuerySource;
@@ -62,6 +63,7 @@ fn sendmmsg_batch(fd: i32, bufs: &[Vec<u8>]) -> io::Result<usize> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_udp_worker(
     server_addr: SocketAddr,
     query_source: Arc<dyn QuerySource>,
@@ -70,7 +72,11 @@ pub async fn run_udp_worker(
     timeout_ms: u64,
     qps_per_worker: Arc<AtomicU64>,
     verbose: bool,
+    worker_id: usize,
+    max_in_flight: usize,
 ) {
+    super::pin_to_cpu(worker_id);
+
     let socket = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
@@ -84,7 +90,11 @@ pub async fn run_udp_worker(
     }
     let fd = socket.as_raw_fd();
 
-    let mut in_flight: HashMap<u16, Instant> = HashMap::new();
+    // Back-pressure semaphore: limits outstanding queries in rate-limited mode.
+    // Unlimited/burst mode bypasses it (None stored in map).
+    let semaphore = Arc::new(Semaphore::new(max_in_flight));
+
+    let mut in_flight: HashMap<u16, (Instant, Option<OwnedSemaphorePermit>)> = HashMap::new();
     let mut next_id: u16 = rand::random();
     let mut recv_buf = [0u8; 4096];
     let timeout_dur = Duration::from_millis(timeout_ms);
@@ -94,32 +104,27 @@ pub async fn run_udp_worker(
             break;
         }
 
-        // Drain all pending responses (non-blocking)
-        loop {
-            match socket.try_recv(&mut recv_buf) {
-                Ok(n) => {
-                    if let Some(resp) = parse_response(&recv_buf[..n]) {
-                        if let Some(sent_at) = in_flight.remove(&resp.id) {
-                            let rtt_us = sent_at.elapsed().as_micros() as u64;
-                            stats.record_response(resp.rcode, rtt_us);
-                            if verbose {
-                                tracing::debug!(
-                                    id = resp.id,
-                                    rcode = resp.rcode,
-                                    rtt_us,
-                                    "response"
-                                );
-                            }
-                        }
+        // Drain all pending responses (non-blocking); dropping the entry releases the permit.
+        while let Ok(n) = socket.try_recv(&mut recv_buf) {
+            if let Some(resp) = parse_response(&recv_buf[..n]) {
+                if let Some((sent_at, _permit)) = in_flight.remove(&resp.id) {
+                    let rtt_us = sent_at.elapsed().as_micros() as u64;
+                    stats.record_response(resp.rcode, rtt_us);
+                    if verbose {
+                        tracing::debug!(
+                            id = resp.id,
+                            rcode = resp.rcode,
+                            rtt_us,
+                            "response"
+                        );
                     }
                 }
-                Err(_) => break,
             }
         }
 
-        // Expire timeouts
+        // Expire timeouts; dropping the entry releases the permit.
         let now = Instant::now();
-        in_flight.retain(|_, sent_at| {
+        in_flight.retain(|_, (sent_at, _permit)| {
             if now.duration_since(*sent_at) > timeout_dur {
                 stats.inc_timeout();
                 false
@@ -142,7 +147,7 @@ pub async fn run_udp_worker(
                     result = socket.recv(&mut recv_buf) => {
                         if let Ok(n) = result {
                             if let Some(resp) = parse_response(&recv_buf[..n]) {
-                                if let Some(sent_at) = in_flight.remove(&resp.id) {
+                                if let Some((sent_at, _permit)) = in_flight.remove(&resp.id) {
                                     let rtt_us = sent_at.elapsed().as_micros() as u64;
                                     stats.record_response(resp.rcode, rtt_us);
                                     if verbose {
@@ -164,12 +169,25 @@ pub async fn run_udp_worker(
                 break;
             }
 
+            // Acquire an in-flight permit before sending. If all slots are used
+            // (server not keeping up), this blocks naturally providing back-pressure.
+            // Timeout matches query timeout so we don't block indefinitely on shutdown.
+            let permit = match tokio::time::timeout(
+                timeout_dur,
+                semaphore.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => continue,
+            };
+
             // Single send per rate-limit interval
             let entry = query_source.next();
             let qbytes = build_query(next_id, &entry.name, entry.qtype);
             match socket.send(&qbytes).await {
                 Ok(_) => {
-                    in_flight.insert(next_id, Instant::now());
+                    in_flight.insert(next_id, (Instant::now(), Some(permit)));
                     stats.inc_sent();
                     if verbose {
                         tracing::debug!(id = next_id, name = %entry.name, "sent query");
@@ -179,10 +197,12 @@ pub async fn run_udp_worker(
                 Err(e) => {
                     tracing::debug!("UDP send error: {}", e);
                     stats.inc_error();
+                    // permit dropped here — send failed, slot freed immediately
                 }
             }
         } else {
             // Unlimited mode: BATCH_SIZE datagrams per sendmmsg(2) syscall.
+            // No semaphore — burst probes need maximum throughput.
             // try_io integrates with tokio's epoll readiness: if the closure
             // returns WouldBlock, tokio clears the cached ready state and the
             // next writable().await waits for a real EPOLLOUT event.
@@ -209,8 +229,8 @@ pub async fn run_udp_worker(
             };
 
             let send_time = Instant::now();
-            for i in 0..sent {
-                in_flight.insert(batch_ids[i], send_time);
+            for id in batch_ids.iter().take(sent) {
+                in_flight.insert(*id, (send_time, None));
                 stats.inc_sent();
             }
 

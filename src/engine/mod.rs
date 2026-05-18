@@ -68,9 +68,13 @@ pub async fn run_with_shutdown(
     };
     let shared_qps = Arc::new(AtomicU64::new(initial_qps_per_worker));
 
+    // max_in_flight per worker: limits outstanding UDP queries for back-pressure
+    let num_threads = if config.threads > 0 { config.threads } else { num_cpus::get() };
+    let max_in_flight = (config.concurrent / num_threads).max(1);
+
     // Spawn workers
     let mut handles = Vec::with_capacity(config.concurrent);
-    for _ in 0..config.concurrent {
+    for i in 0..config.concurrent {
         let qs = query_source.clone();
         let st = stats.clone();
         let sd = shutdown.clone();
@@ -80,13 +84,13 @@ pub async fn run_with_shutdown(
 
         let handle = match config.protocol {
             Protocol::Udp => tokio::spawn(sender::run_udp_worker(
-                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose,
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i, max_in_flight,
             )),
             Protocol::Tcp => tokio::spawn(sender::run_tcp_worker(
-                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose,
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, i, max_in_flight,
             )),
             Protocol::Dot => tokio::spawn(sender::run_dot_worker(
-                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, sn,
+                server_addr, qs, st, sd, cfg.timeout_ms, qps_arc, cfg.verbose, sn, i, max_in_flight,
             )),
         };
         handles.push(handle);

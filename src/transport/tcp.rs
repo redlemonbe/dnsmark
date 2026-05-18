@@ -13,6 +13,7 @@ use crate::dns::{build_query, parse_response};
 use crate::query::QuerySource;
 use crate::stats::StatsCollector;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tcp_worker(
     server_addr: SocketAddr,
     query_source: Arc<dyn QuerySource>,
@@ -21,7 +22,10 @@ pub async fn run_tcp_worker(
     timeout_ms: u64,
     qps_per_worker: Arc<AtomicU64>,
     verbose: bool,
+    worker_id: usize,
+    _max_in_flight: usize,
 ) {
+    super::pin_to_cpu(worker_id);
     let timeout_dur = std::time::Duration::from_millis(timeout_ms);
     let mut id: u16 = rand::random();
 

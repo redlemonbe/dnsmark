@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-18
+
+### Added
+- **Semaphore in-flight back-pressure (UDP)**: each rate-limited UDP worker now holds
+  a `tokio::sync::Semaphore` with `max_in_flight = max(1, concurrent / threads)` slots.
+  A permit is acquired before each send and released automatically when the response
+  arrives or the query times out. If the server stops answering, the semaphore fills and
+  the sender blocks naturally, bounding the in-flight HashMap and preventing memory runaway.
+  Unlimited/burst mode bypasses the semaphore for maximum throughput.
+- **CPU affinity per worker**: each worker task calls `sched_setaffinity(2)` at startup
+  to pin its OS thread to CPU `worker_id % num_cpus`. This reduces cross-core cache
+  migrations at high QPS. Implemented in `transport/mod.rs::pin_to_cpu`, applied to
+  UDP, TCP, and DoT workers.
+
 ## [0.2.5] - 2026-05-18
 
 ### Changed
@@ -98,5 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Static musl binary (no system dependencies)
 - dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`)
 
+[0.3.0]: https://github.com/redlemonbe/dnsmark/compare/v0.2.5...v0.3.0
+[0.2.5]: https://github.com/redlemonbe/dnsmark/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/redlemonbe/dnsmark/compare/v0.2.3...v0.2.4
+[0.2.3]: https://github.com/redlemonbe/dnsmark/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/redlemonbe/dnsmark/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/redlemonbe/dnsmark/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/redlemonbe/dnsmark/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/redlemonbe/dnsmark/releases/tag/v0.1.0
