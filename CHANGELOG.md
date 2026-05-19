@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-05-19
+
+### Fixed
+
+- **XDP interface selected via `getifaddrs()` on server subnet** — `iface_for_server()`
+  now uses `getifaddrs()` to find the first non-loopback interface whose IPv4 address
+  lies in the same subnet as the target DNS server, instead of relying on the routing
+  table. This eliminates wrong-interface selection on Proxmox hosts where a bridge
+  (`vmbr10`) and a veth (`veth-rb`) share the same `/24` subnet. The routing table is
+  kept as fallback when `getifaddrs()` finds no match. A `DEBUG` log line records which
+  method was used.
+
+- **Virtual interface detection with automatic parent resolution** — `start_xdp_receive_path()`
+  now checks whether the selected interface is virtual (Proxmox bridge / `vmbr*` / veth /
+  ipvlan / macvlan) via `/sys/class/net/<iface>/device` before attaching the XDP program.
+  If a physical parent is detectable (via `lower_*` sysfs entries or the `master` symlink),
+  XDP retries automatically on the parent with a `WARN` log. If no physical parent is
+  found, XDP is disabled and dnsmark falls back to the standard `recvmmsg` UDP receive
+  path — the benchmark continues normally.
+
 ## [0.4.4] - 2026-05-18
 
 ### Added

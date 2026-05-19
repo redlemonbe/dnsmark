@@ -29,6 +29,7 @@ use super::loader::XdpHandle;
 use super::socket::{
     XskSocket, create_xsk_socket, get_rx_queue_count, iface_index,
     iface_for_server, default_interface,
+    is_virtual_interface, parent_interface,
 };
 
 // Ethernet/IP/UDP header sizes (IPv4 with IHL=5 only; packets with options
@@ -291,9 +292,49 @@ fn xdp_sender_thread(
 /// Load the XDP program, create AF_XDP sockets (one per NIC queue),
 /// spawn the XDP receiver thread, and return the XdpHandle (RAII).
 ///
+/// If `iface` is a virtual interface (Proxmox bridge, vmbr*, veth, ipvlan,
+/// macvlan), the function automatically retries on the physical parent. If no
+/// parent is found, XDP is disabled and `Err` is returned so the caller can
+/// fall back to the standard UDP receive path.
+///
 /// The receiver thread exits when `shutdown` is set to true.
 /// The XdpHandle must stay alive for the duration of the test.
 pub fn start_xdp_receive_path(
+    iface:            &str,
+    in_flight:        Arc<Mutex<HashMap<u16, Instant>>>,
+    global_in_flight: Arc<AtomicUsize>,
+    stats:            Arc<StatsCollector>,
+    shutdown:         Arc<AtomicBool>,
+    timeout_dur:      Duration,
+) -> Result<XdpHandle, String> {
+    if is_virtual_interface(iface) {
+        match parent_interface(iface) {
+            Some(ref parent) => {
+                tracing::warn!(
+                    virt = %iface, parent = %parent,
+                    "XDP: '{}' is a virtual interface — retrying on parent '{}'",
+                    iface, parent
+                );
+                return do_start_xdp_receive_path(
+                    parent, in_flight, global_in_flight, stats, shutdown, timeout_dur,
+                );
+            }
+            None => {
+                let msg = format!(
+                    "XDP: '{}' is a virtual interface (Proxmox bridge / vmbr / veth) \
+                     — XDP disabled, falling back to UDP receive. \
+                     For native XDP use the physical NIC directly.",
+                    iface
+                );
+                tracing::warn!("{msg}");
+                return Err(msg);
+            }
+        }
+    }
+    do_start_xdp_receive_path(iface, in_flight, global_in_flight, stats, shutdown, timeout_dur)
+}
+
+fn do_start_xdp_receive_path(
     iface:            &str,
     in_flight:        Arc<Mutex<HashMap<u16, Instant>>>,
     global_in_flight: Arc<AtomicUsize>,

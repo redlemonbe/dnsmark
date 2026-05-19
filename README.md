@@ -315,6 +315,13 @@ XDP driver support (Intel ixgbe / i40e / ice / igc — native zero-copy;
 virtio / veth — copy mode). Without the required capabilities, dnsmark
 prints a hint and falls back to the recvmmsg UDP path automatically.
 
+**Proxmox bare metal:** on Proxmox hosts, XDP requires the physical NIC or
+a VLAN sub-interface directly — not a bridge (`vmbr*`) or veth pair.
+dnsmark auto-detects virtual interfaces and logs a warning before falling
+back to UDP. For best results, bind dnsmark to the physical NIC or follow
+the veth reference architecture in
+[Runbound docs/proxmox.md](https://github.com/redlemonbe/Runbound/blob/main/docs/proxmox.md).
+
 **Architecture:** x86_64 and aarch64.
 
 ---
