@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::dns::{build_query, parse_response};
-use crate::query::QuerySource;
+use crate::dns::parse_response;
+use crate::query::{WireQueryPool, MAX_QUERY};
 use crate::stats::StatsCollector;
 
 /// Datagrams sent per sendmmsg(2) syscall in unlimited mode.
@@ -23,28 +23,27 @@ const MAX_MSG_SIZE: usize = 512;
 
 // ─── sendmmsg helper ────────────────────────────────────────────────────────
 
-fn sendmmsg_batch(fd: i32, bufs: &[Vec<u8>]) -> io::Result<usize> {
-    if bufs.is_empty() {
-        return Ok(0);
+/// Zero-allocation sendmmsg: iovecs and mmsghdr arrays are stack-allocated.
+/// `bufs`: pre-allocated flat send buffers; `lens`: actual length per buffer.
+/// `count` must be <= BATCH_SIZE (64).
+fn sendmmsg_pre_alloc(
+    fd: i32,
+    bufs: &[[u8; MAX_QUERY]],
+    lens: &[usize],
+    count: usize,
+) -> io::Result<usize> {
+    debug_assert!(count <= BATCH_SIZE);
+    // Stack-allocated iovecs + mmsghdr — no heap allocation.
+    let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; BATCH_SIZE];
+    let mut msgs: [libc::mmsghdr; BATCH_SIZE] = unsafe { std::mem::zeroed() };
+    for i in 0..count {
+        iovecs[i].iov_base = bufs[i].as_ptr() as *mut libc::c_void;
+        iovecs[i].iov_len = lens[i];
+        msgs[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+        msgs[i].msg_hdr.msg_iovlen = 1;
     }
-    let mut iovecs: Vec<libc::iovec> = bufs
-        .iter()
-        .map(|b| libc::iovec {
-            iov_base: b.as_ptr() as *mut libc::c_void,
-            iov_len: b.len(),
-        })
-        .collect();
-    let mut msgs: Vec<libc::mmsghdr> = iovecs
-        .iter_mut()
-        .map(|iov| {
-            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
-            m.msg_hdr.msg_iov = iov as *mut libc::iovec;
-            m.msg_hdr.msg_iovlen = 1;
-            m
-        })
-        .collect();
     let ret = unsafe {
-        libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as libc::c_uint, libc::MSG_DONTWAIT as _)
+        libc::sendmmsg(fd, msgs.as_mut_ptr(), count as libc::c_uint, libc::MSG_DONTWAIT as _)
     };
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret as usize) }
 }
@@ -65,7 +64,7 @@ fn sender_thread(
     fd: i32,
     in_flight: Arc<Mutex<HashMap<u16, Instant>>>,
     global_in_flight: Arc<AtomicUsize>,
-    query_source: Arc<dyn QuerySource>,
+    wire_pool: Arc<WireQueryPool>,
     stats: Arc<StatsCollector>,
     shutdown: Arc<AtomicBool>,
     qps_per_worker: Arc<AtomicU64>,
@@ -76,6 +75,12 @@ fn sender_thread(
     let mut next_send = Instant::now();
     let mut last_qps: u64 = 0;
     let mut send_interval = Duration::ZERO;
+
+    // Pre-allocated buffers — reused every iteration, no heap alloc in hot path.
+    let mut single_buf = [0u8; MAX_QUERY];
+    let mut batch_bufs = vec![[0u8; MAX_QUERY]; BATCH_SIZE];
+    let mut batch_lens = vec![0usize; BATCH_SIZE];
+    let mut batch_ids: Vec<u16> = Vec::with_capacity(BATCH_SIZE);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -121,18 +126,17 @@ fn sender_thread(
                 next_send = Instant::now();
             }
 
-            // Build and send; RTT clock starts at actual send() call.
-            let entry = query_source.next();
-            let qbytes = build_query(next_id, &entry.name, entry.qtype);
+            // Build and send from pre-built template; no allocation.
+            let qlen = wire_pool.write_next_with_id(next_id, &mut single_buf);
             let ret = unsafe {
-                libc::send(fd, qbytes.as_ptr() as *const libc::c_void, qbytes.len(), 0)
+                libc::send(fd, single_buf.as_ptr() as *const libc::c_void, qlen, 0)
             };
             if ret >= 0 {
                 in_flight.lock().insert(next_id, Instant::now());
                 global_in_flight.fetch_add(1, Ordering::Relaxed);
                 stats.inc_sent();
                 if verbose {
-                    tracing::debug!(id = next_id, name = %entry.name, "sent query");
+                    tracing::debug!(id = next_id, "sent query");
                 }
                 next_id = next_id.wrapping_add(1);
             } else {
@@ -154,16 +158,15 @@ fn sender_thread(
                 BATCH_SIZE
             };
 
-            let mut batch_bufs: Vec<Vec<u8>> = Vec::with_capacity(batch_cap);
-            let mut batch_ids: Vec<u16> = Vec::with_capacity(batch_cap);
-            for _ in 0..batch_cap {
-                let entry = query_source.next();
-                batch_bufs.push(build_query(next_id, &entry.name, entry.qtype));
+            // Fill pre-allocated batch buffers from wire pool — no allocation.
+            batch_ids.clear();
+            for i in 0..batch_cap {
+                batch_lens[i] = wire_pool.write_next_with_id(next_id, &mut batch_bufs[i]);
                 batch_ids.push(next_id);
                 next_id = next_id.wrapping_add(1);
             }
 
-            let sent = match sendmmsg_batch(fd, &batch_bufs) {
+            let sent = match sendmmsg_pre_alloc(fd, &batch_bufs, &batch_lens, batch_cap) {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_micros(100));
@@ -248,27 +251,28 @@ fn receiver_thread(
         if n > 0 {
             let now = Instant::now();
 
-            // Collect (rcode, rtt_us) pairs under a single in_flight lock,
-            // then release before taking the histogram lock inside record_response.
-            let responses: Vec<(u8, u64)> = {
-                let mut map = in_flight.lock();
-                (0..n as usize)
-                    .filter_map(|i| {
-                        let len = msgs[i].msg_len as usize;
-                        let data = &flat_buf[i * MAX_MSG_SIZE..i * MAX_MSG_SIZE + len];
-                        parse_response(data).and_then(|resp| {
-                            map.remove(&resp.id).map(|sent_at| {
-                                let rtt_us =
-                                    now.duration_since(sent_at).as_micros() as u64;
-                                (resp.rcode, rtt_us)
-                            })
-                        })
-                    })
-                    .collect()
-            }; // in_flight lock released here
+            // Stack-allocated response buffer — no heap alloc per batch.
+            // RECV_BATCH=16 responses max per recvmmsg call.
+            let mut responses = [(0u8, 0u64); RECV_BATCH];
+            let mut resp_count = 0usize;
 
-            let completed = responses.len();
-            for (rcode, rtt_us) in responses {
+            {
+                let mut map = in_flight.lock();
+                for i in 0..n as usize {
+                    let len = msgs[i].msg_len as usize;
+                    let data = &flat_buf[i * MAX_MSG_SIZE..i * MAX_MSG_SIZE + len];
+                    if let Some(r) = parse_response(data) {
+                        if let Some(sent_at) = map.remove(&r.id) {
+                            let rtt_us = now.duration_since(sent_at).as_micros() as u64;
+                            responses[resp_count] = (r.rcode, rtt_us);
+                            resp_count += 1;
+                        }
+                    }
+                }
+            } // in_flight lock released here
+
+            let completed = resp_count;
+            for &(rcode, rtt_us) in &responses[..resp_count] {
                 stats.record_response(rcode, rtt_us);
             }
             // Decrement global counter for each query that left in_flight.
@@ -313,7 +317,7 @@ fn receiver_thread(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_udp_worker(
     server_addr: SocketAddr,
-    query_source: Arc<dyn QuerySource>,
+    wire_pool: Arc<WireQueryPool>,
     stats: Arc<StatsCollector>,
     shutdown: Arc<AtomicBool>,
     timeout_ms: u64,
@@ -354,11 +358,11 @@ pub async fn run_udp_worker(
     let stats_s = stats.clone();
     let sd_s = shutdown.clone();
     let qps_s = qps_per_worker.clone();
-    let qs = query_source.clone();
+    let wp = wire_pool.clone();
     let sender = std::thread::spawn(move || {
         super::pin_to_cpu(worker_id);
         let _sock = socket; // keep fd alive for the lifetime of this thread
-        sender_thread(sender_fd, in_s, gif_s, qs, stats_s, sd_s, qps_s, verbose, max_outstanding);
+        sender_thread(sender_fd, in_s, gif_s, wp, stats_s, sd_s, qps_s, verbose, max_outstanding);
     });
 
     // ── Receiver thread ────────────────────────────────────────────────────
