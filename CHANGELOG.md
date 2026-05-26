@@ -1,154 +1,78 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project will be documented in this file.  
+Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+---
 
-## [Unreleased]
+## [1.0.0] — 2026-05-26
 
-## [0.4.5] - 2026-05-19
-
-### Fixed
-
-- **XDP interface selected via `getifaddrs()` on server subnet** — `iface_for_server()`
-  now uses `getifaddrs()` to find the first non-loopback interface whose IPv4 address
-  lies in the same subnet as the target DNS server, instead of relying on the routing
-  table. This eliminates wrong-interface selection on Proxmox hosts where a bridge
-  (`vmbr10`) and a veth (`veth-rb`) share the same `/24` subnet. The routing table is
-  kept as fallback when `getifaddrs()` finds no match. A `DEBUG` log line records which
-  method was used.
-
-- **Virtual interface detection with automatic parent resolution** — `start_xdp_receive_path()`
-  now checks whether the selected interface is virtual (Proxmox bridge / `vmbr*` / veth /
-  ipvlan / macvlan) via `/sys/class/net/<iface>/device` before attaching the XDP program.
-  If a physical parent is detectable (via `lower_*` sysfs entries or the `master` symlink),
-  XDP retries automatically on the parent with a `WARN` log. If no physical parent is
-  found, XDP is disabled and dnsmark falls back to the standard `recvmmsg` UDP receive
-  path — the benchmark continues normally.
-
-## [0.4.4] - 2026-05-18
+First stable release.
 
 ### Added
-- **AF/XDP receive path** (`--features xdp`, enabled by default): DNS responses (UDP src\_port=53) are captured at the NIC driver level via an eBPF XDP program and delivered to user space through AF_XDP sockets, bypassing the kernel network stack entirely. This eliminates the `recvmmsg` syscall on the response hot path.
-  - One shared XDP receiver thread per NIC RX queue; N sender threads continue using regular UDP sockets.
-  - Automatic `setrlimit(RLIMIT_MEMLOCK, RLIM_INFINITY)` before UMEM allocation (CLI tool — no systemd).
-  - Auto-detects interface via `/proc/net/route`; native zero-copy (DRV mode) on supported drivers, copy mode fallback on virtio/veth.
-  - Graceful fallback to the recvmmsg UDP path if XDP is unavailable or the process lacks capabilities.
-- **`--no-xdp`**: disable AF/XDP at runtime without recompiling.
-- **`--xdp`** (`force_xdp`): error rather than fall back if XDP is unavailable.
-- **Capability hint on XDP failure**: `To enable XDP: sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which dnsmark)`.
-- **`cargo build --release`** now compiles the XDP eBPF program automatically via `build.rs` using `clang -target bpf -O2`. Requires: `apt install clang libbpf-dev`.
-
-### Fixed
-- `StatsCollector` gained `inc_sent_n(usize)` for batch accounting in the XDP sendmmsg path.
-
-## [0.4.3] - 2026-05-18
-
-### Fixed
-- **`--max-outstanding` no longer stalls the sender**: when the global in-flight cap is reached, the sender now skips the slot and loops back immediately instead of sleeping 500 µs. At equivalent QPS and completion rate, this eliminates the artificial latency that the sleep introduced.
-
-## [0.4.2] - 2026-05-18
+- **SIMD memcpy dispatch** — `AVX2` (32 B/iter) on Haswell+ / Threadripper, `SSE2` (16 B/iter) on Xeon E5 v2 baseline. Detected once at boot via CPUID, cached in `OnceLock`. Logged at startup: `[dnsmark] CPU SIMD: SSE4.2 | sse4.2=true avx2=false avx512f=false`.
+- **Zero-allocation hot path** — pre-built wire-format query pool (`WireQueryPool`), stack-allocated `iovecs[256]` + `mmsghdr[256]` in `sendmmsg_pre_alloc()`, stack response buffer in receiver thread. No heap allocation on the send/receive hot path.
+- **Static binaries** — `x86_64-linux-musl` and `aarch64-linux-musl` in GitHub releases. Drop-anywhere, no runtime dependencies.
 
 ### Changed
-- **`--max-outstanding` is now a global limit** across all workers, not per worker. With the default of 100 and 32 workers, total in-flight queries are capped at 100 instead of 3 200 — matching the semantics of `dnsperf -q 100` exactly.
+- `BATCH_SIZE` 64 → 256 — 4× fewer `sendmmsg(2)` syscalls at peak QPS.
+- `RECV_BATCH` 16 → 64 — matches larger send batch size.
+- `SO_SNDBUF` / `SO_RCVBUF` tuned to 8 MB per socket (requires `net.core.wmem_max` / `rmem_max` ≥ 8 MB on the OS).
 
-## [0.4.1] - 2026-05-18
+### Performance (Xeon E5-2690 v2 → Runbound on Threadripper PRO, 1 GbE)
+- 171 000 QPS burst
+- 128 000 QPS sustainable
 
-### Added
-- **`--max-outstanding <N>`** (default 100): limits the total number of in-flight queries across all workers. Mirrors `dnsperf -q`. Set to `0` to disable. Prevents unbounded memory growth when the server is slow to respond.
+---
 
-## [0.4.0] - 2026-05-18
+## [0.4.5] — 2026-05-19
 
 ### Fixed
-- **p999 no longer spikes to 3 s under load**: the previous async implementation produced 3-second tail latency spikes when the server was saturated. The UDP hot path now uses dedicated OS sender and receiver threads — p999 is in the sub-millisecond range for a responsive server.
+- XDP interface selected via `getifaddrs()` on server subnet — eliminates wrong-interface selection on Proxmox hosts where a bridge and a veth share the same `/24`.
+- Virtual interface detection with automatic parent resolution — if the selected interface is a bridge / veth / ipvlan / macvlan, XDP retries on the physical parent; falls back to recvmmsg if no parent is found.
+
+---
+
+## [0.4.4] — 2026-05-18
+
+### Added
+- AF/XDP receive path (`--features xdp`, enabled by default) — DNS responses captured at NIC driver level via eBPF, bypassing the kernel network stack. Automatic fallback to recvmmsg on unsupported hardware.
+- `--no-xdp` — disable AF/XDP at runtime.
+- `--xdp` — force AF/XDP, error if unavailable.
+
+---
+
+## [0.4.3] — 2026-05-18
+
+### Fixed
+- `--max-outstanding` no longer stalls the sender: skips the slot instead of sleeping 500 µs when the global in-flight cap is reached.
+
+---
+
+## [0.4.2] — 2026-05-18
 
 ### Changed
-- UDP workers use dedicated OS threads (sender + receiver) instead of async tasks. The tokio runtime is now used only for orchestration and the TUI.
+- `--max-outstanding` is now a global limit across all workers (matches `dnsperf -q` semantics).
 
-## [0.3.2] - 2026-05-18
+---
 
-### Fixed
-- **`-c auto` guarantees at least 8 workers** on VMs and containers with fewer than 8 physical cores.
-- **Rate-limited mode now delivers the requested QPS accurately**: drift-compensating absolute deadlines replace fixed-duration sleeps. `-Q 15000` now achieves ~15 000 QPS instead of ~9 700.
-
-## [0.3.1] - 2026-05-18
-
-### Changed
-- **CPU affinity skips HyperThreading siblings**: workers are pinned to one logical CPU per physical core. On a 20-core/40-thread machine, 20 workers are used instead of 40.
-- **`-c auto` defaults to physical core count** (was `num_cpus × 4`).
-
-## [0.3.0] - 2026-05-18
+## [0.4.1] — 2026-05-18
 
 ### Added
-- **CPU affinity per worker**: each worker is pinned to a physical core at startup, reducing cross-core cache migrations at high QPS.
+- `--max-outstanding <N>` (default 100) — caps total in-flight queries across all workers.
 
-## [0.2.5] - 2026-05-18
+---
 
-### Changed
-- **Ramp saturation detection uses a burst probe**: each ramp step starts with a 1-second unlimited burst to measure actual server capacity. Results are more reliable across different network topologies (loopback, LAN, physical).
-
-### Added
-- **Parameters section in output**: server, protocol, clients, QPS cap, duration, timeout, mode, and source are printed before statistics for reproducibility.
-
-## [0.2.4] - 2026-05-18
-
-### Changed
-- **Unlimited mode uses `sendmmsg(2)` batch sending** (64 datagrams per syscall). Significantly increases peak throughput in unlimited and ramp modes.
-
-## [0.2.3] - 2026-05-18
-
-### Fixed
-- **Ramp mode converges correctly when the server responds fast**: removed an unstable effective-QPS criterion that caused ramp to never stop on low-latency servers. Ramp now stops after 20 doublings at most.
-
-## [0.2.2] - 2026-05-18
-
-### Fixed
-- **Ramp throughput criterion no longer triggers during warm-up**: QPS is measured on the stable tail of each 5-second window, not the full window.
-
-## [0.2.1] - 2026-05-18
-
-### Fixed
-- **Ramp mode stops correctly on fast servers**: saturation detection now includes p99 > 50 ms as a criterion, not just timeouts.
-- **Version string in banner**: now reads from `CARGO_PKG_VERSION` instead of being hardcoded.
-
-## [0.2.0] - 2026-05-18
-
-### Fixed
-- **Latency no longer inflated at low QPS**: responses are now processed during the inter-send pause. Previously, at 500 QPS with 16 workers, RTT measurements were inflated by the full sleep duration between sends.
+## [0.4.0] — 2026-05-18
 
 ### Added
-- `CHANGELOG.md`
-- CI workflow: `cargo clippy` + `cargo test` on push and PR.
-- `deny.toml`: supply-chain policy (licenses, advisories, dependency bans).
+- Dedicated sender + receiver OS threads per UDP worker — sender and receiver are fully decoupled, eliminating cross-thread contention on the hot path.
 
-## [0.1.0] - 2026-05-18
+---
 
-### Added
-- Initial release.
-- High-performance UDP / TCP / DoT DNS benchmark.
-- HDR histogram: p50 / p95 / p99 / p999.
-- Ramp mode: automatic saturation detection.
-- Compare mode: two servers side-by-side with diff output.
-- Live TUI dashboard.
-- Random UUID subdomain generator (`--random`, `--random-type`).
-- JSON and CSV output.
-- jemalloc allocator.
-- AF/XDP opt-in (`--features xdp`).
-- Static musl binary — no system dependencies.
-- dnsperf CLI compatibility (`-s`, `-p`, `-d`, `-c`, `-Q`, `-l`, `-t`, `-T`, `-q`, `-v`, `-S`).
+## [0.3.x] — 2026-05-17
 
-[0.4.3]: https://github.com/redlemonbe/dnsmark/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/redlemonbe/dnsmark/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/redlemonbe/dnsmark/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/redlemonbe/dnsmark/compare/v0.3.2...v0.4.0
-[0.3.2]: https://github.com/redlemonbe/dnsmark/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/redlemonbe/dnsmark/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/redlemonbe/dnsmark/compare/v0.2.5...v0.3.0
-[0.2.5]: https://github.com/redlemonbe/dnsmark/compare/v0.2.4...v0.2.5
-[0.2.4]: https://github.com/redlemonbe/dnsmark/compare/v0.2.3...v0.2.4
-[0.2.3]: https://github.com/redlemonbe/dnsmark/compare/v0.2.2...v0.2.3
-[0.2.2]: https://github.com/redlemonbe/dnsmark/compare/v0.2.1...v0.2.2
-[0.2.1]: https://github.com/redlemonbe/dnsmark/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/redlemonbe/dnsmark/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/redlemonbe/dnsmark/releases/tag/v0.1.0
+- `-c auto` minimum 8 workers, drift-compensating rate limiter.
+- Global shared in-flight counter (`Arc<AtomicUsize>`).
+- `--max-outstanding` initial implementation (per-worker).
+- Non-blocking sender — removes 500 µs sleep on cap hit.

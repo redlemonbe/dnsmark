@@ -1,28 +1,33 @@
 # Acceptable Use Policy — dnsmark
 
-dnsmark is a high-performance DNS benchmarking tool capable of
-generating very high query loads. This policy defines permitted
-and prohibited uses.
+dnsmark is a DNS benchmarking tool. At full throttle it generates
+hundreds of thousands of queries per second. Pointed at a server
+you do not own, it is a denial-of-service weapon.
 
 ## Permitted use
 
-- Testing DNS infrastructure you own or operate
-- Testing systems for which you have explicit written authorization
-- Academic and security research in controlled environments
-- CI/CD benchmarking of your own DNS resolvers
+- DNS infrastructure you own or operate
+- Systems for which you hold explicit **written** authorization
+- Controlled academic or security research environments
+- CI/CD performance gates on your own resolvers
 
 ## Prohibited use
 
-- Testing any system without explicit prior written authorization
-- Use as part of any denial-of-service or distributed attack
-- Integration into botnets or automated attack frameworks
-- Any use that violates applicable law
+- Any system without prior written authorization from its owner
+- Denial-of-service attacks or amplification attacks
+- Integration into botnets, attack scripts, or automated attack pipelines
+- Any activity that violates applicable local, national, or international law
 
-Violation of this policy voids any liability protection provided
-by the MIT license and may constitute a criminal offense under
-applicable law.
+## Consequences
 
-## Related project
+Unauthorized use voids all liability protections granted by the MIT license
+and constitutes a criminal offense in most jurisdictions, including but not
+limited to violations of the Computer Fraud and Abuse Act (US), the Computer
+Misuse Act (UK), and equivalent legislation worldwide.
 
-dnsmark was designed to benchmark Runbound, a hardened Rust DNS
-server: https://github.com/redlemonbe/Runbound
+The authors bear no responsibility for misuse.
+
+---
+
+*dnsmark is designed to benchmark [Runbound](https://github.com/redlemonbe/Runbound)
+and other RFC 1035-compliant DNS servers in authorized environments.*
