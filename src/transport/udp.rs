@@ -251,27 +251,28 @@ fn receiver_thread(
         if n > 0 {
             let now = Instant::now();
 
-            // Collect (rcode, rtt_us) pairs under a single in_flight lock,
-            // then release before taking the histogram lock inside record_response.
-            let responses: Vec<(u8, u64)> = {
-                let mut map = in_flight.lock();
-                (0..n as usize)
-                    .filter_map(|i| {
-                        let len = msgs[i].msg_len as usize;
-                        let data = &flat_buf[i * MAX_MSG_SIZE..i * MAX_MSG_SIZE + len];
-                        parse_response(data).and_then(|resp| {
-                            map.remove(&resp.id).map(|sent_at| {
-                                let rtt_us =
-                                    now.duration_since(sent_at).as_micros() as u64;
-                                (resp.rcode, rtt_us)
-                            })
-                        })
-                    })
-                    .collect()
-            }; // in_flight lock released here
+            // Stack-allocated response buffer — no heap alloc per batch.
+            // RECV_BATCH=16 responses max per recvmmsg call.
+            let mut responses = [(0u8, 0u64); RECV_BATCH];
+            let mut resp_count = 0usize;
 
-            let completed = responses.len();
-            for (rcode, rtt_us) in responses {
+            {
+                let mut map = in_flight.lock();
+                for i in 0..n as usize {
+                    let len = msgs[i].msg_len as usize;
+                    let data = &flat_buf[i * MAX_MSG_SIZE..i * MAX_MSG_SIZE + len];
+                    if let Some(r) = parse_response(data) {
+                        if let Some(sent_at) = map.remove(&r.id) {
+                            let rtt_us = now.duration_since(sent_at).as_micros() as u64;
+                            responses[resp_count] = (r.rcode, rtt_us);
+                            resp_count += 1;
+                        }
+                    }
+                }
+            } // in_flight lock released here
+
+            let completed = resp_count;
+            for &(rcode, rtt_us) in &responses[..resp_count] {
                 stats.record_response(rcode, rtt_us);
             }
             // Decrement global counter for each query that left in_flight.
