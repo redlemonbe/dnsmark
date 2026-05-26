@@ -1,3 +1,4 @@
+pub mod simd;
 mod autodetect;
 mod config;
 mod dns;
