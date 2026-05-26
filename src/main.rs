@@ -127,6 +127,7 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     simd::log_simd_info();
     let cli = Cli::parse();
+    
 
     // XDP check (feature guard)
     if cli.xdp {
@@ -154,6 +155,8 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
         .init();
+
+    transport::init_cpu_pinning(cli.server);
 
     // Auto-detection
     let auto = autodetect::detect();
