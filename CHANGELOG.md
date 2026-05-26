@@ -19,10 +19,6 @@ First stable release.
 - `RECV_BATCH` 16 → 64 — matches larger send batch size.
 - `SO_SNDBUF` / `SO_RCVBUF` tuned to 8 MB per socket (requires `net.core.wmem_max` / `rmem_max` ≥ 8 MB on the OS).
 
-### Performance (Xeon E5-2690 v2 → Runbound on Threadripper PRO, 1 GbE)
-- 171 000 QPS burst
-- 128 000 QPS sustainable
-
 ---
 
 ## [0.4.5] — 2026-05-19
