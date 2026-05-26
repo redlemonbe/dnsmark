@@ -18,12 +18,15 @@ you do not own, it is a denial-of-service weapon.
 - Integration into botnets, attack scripts, or automated attack pipelines
 - Any activity that violates applicable local, national, or international law
 
-## Consequences
+## License and consequences
 
-Unauthorized use voids all liability protections granted by the MIT license
-and constitutes a criminal offense in most jurisdictions, including but not
-limited to violations of the Computer Fraud and Abuse Act (US), the Computer
-Misuse Act (UK), and equivalent legislation worldwide.
+dnsmark is distributed under the **GNU Affero General Public License v3 (AGPL-3.0-only)**.
+Any use of dnsmark as part of a network service requires making the full source code
+available under the same license.
+
+Unauthorized use voids all liability protections and constitutes a criminal offense
+in most jurisdictions, including but not limited to violations of the Computer Fraud
+and Abuse Act (US), the Computer Misuse Act (UK), and equivalent legislation worldwide.
 
 The authors bear no responsibility for misuse.
 

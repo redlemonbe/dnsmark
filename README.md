@@ -3,7 +3,7 @@
 High-performance DNS benchmark tool.  
 Static binary. No dependencies. Runs anywhere.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/redlemonbe/dnsmark)](https://github.com/redlemonbe/dnsmark/releases/latest)
 
 > **Authorized testing only.**  
@@ -201,7 +201,10 @@ Security issues: redlemonbe@codix.be (private disclosure before opening a public
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+AGPL-3.0-only — see [LICENSE](LICENSE)
+
+Any use of dnsmark as part of a network service requires making the full source code
+available to users of that service, under the same license.
 
 *dnsmark is a companion tool for [Runbound](https://github.com/redlemonbe/Runbound).*  
 Copyright (C) 2026 RedLemonBe
