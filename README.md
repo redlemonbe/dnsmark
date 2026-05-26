@@ -31,12 +31,20 @@
 ## Install
 
 ```bash
-# x86_64
+# x86_64 static (musl — no dependencies)
 curl -Lo dnsmark https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-x86_64-linux-musl
 chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
 
-# aarch64 (Graviton, Raspberry Pi 4/5)
+# x86_64 glibc (servers with glibc >= 2.17)
+curl -Lo dnsmark https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-x86_64-linux-gnu
+chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
+
+# aarch64 static (Graviton, Raspberry Pi 4/5 — musl)
 curl -Lo dnsmark https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-aarch64-linux-musl
+chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
+
+# aarch64 glibc
+curl -Lo dnsmark https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-aarch64-linux-gnu
 chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
 ```
 
