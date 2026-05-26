@@ -125,6 +125,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    simd::log_simd_info();
     let cli = Cli::parse();
 
     // XDP check (feature guard)
