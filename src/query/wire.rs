@@ -43,9 +43,6 @@ impl WireQueryPool {
         len
     }
 
-    pub fn len(&self) -> usize {
-        self.templates.len()
-    }
 }
 
 /// Build a wire-format DNS query with ID = 0x00 0x00.
