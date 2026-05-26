@@ -29,13 +29,15 @@ impl WireQueryPool {
 
     /// Write the next template (round-robin) into `buf`, patch transaction ID,
     /// return the number of bytes written. `buf` must be >= MAX_QUERY bytes.
+    /// Uses SIMD-accelerated copy (AVX2 → SSE2 → scalar, runtime dispatch).
     #[inline]
     pub fn write_next_with_id(&self, id: u16, buf: &mut [u8]) -> usize {
         let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.templates.len();
         let tmpl = &self.templates[idx];
         let len = tmpl.len();
-        // Safety: len <= MAX_QUERY <= buf.len() (caller guarantees buf is >= MAX_QUERY)
-        buf[..len].copy_from_slice(tmpl);
+        // SIMD dispatch: AVX2 (Threadripper) → SSE2 (Xeon v2) → scalar
+        crate::simd::memcpy_dispatch(&mut buf[..len], tmpl);
+        // Patch transaction ID — always 2 scalar bytes regardless of SIMD level
         buf[0] = (id >> 8) as u8;
         buf[1] = id as u8;
         len

@@ -15,9 +15,10 @@ use crate::query::{WireQueryPool, MAX_QUERY};
 use crate::stats::StatsCollector;
 
 /// Datagrams sent per sendmmsg(2) syscall in unlimited mode.
-const BATCH_SIZE: usize = 64;
+/// 256 reduces syscall overhead 4x vs the original 64.
+const BATCH_SIZE: usize = 256;
 /// Datagrams received per recvmmsg(2) syscall.
-const RECV_BATCH: usize = 16;
+const RECV_BATCH: usize = 64;
 /// Maximum DNS-over-UDP packet size we accept.
 const MAX_MSG_SIZE: usize = 512;
 
@@ -337,6 +338,15 @@ pub async fn run_udp_worker(
     if let Err(e) = socket.connect(server_addr) {
         tracing::error!("connect UDP socket to {}: {}", server_addr, e);
         return;
+    }
+    // Tune socket buffers to reduce drops at high QPS.
+    // sysctl net.core.rmem_max / wmem_max must be >= 8 MB on the OS.
+    unsafe {
+        let buf: libc::c_int = 8 * 1024 * 1024;
+        let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let fd = socket.as_raw_fd();
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &buf as *const _ as *const libc::c_void, sz);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &buf as *const _ as *const libc::c_void, sz);
     }
     // dup() — sender and receiver share the same OS socket.
     let recv_socket = match socket.try_clone() {
