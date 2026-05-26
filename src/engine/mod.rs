@@ -15,7 +15,7 @@ use anyhow::Context;
 use parking_lot::Mutex;
 
 use crate::config::{Config, Protocol};
-use crate::query::{file::FileQuerySource, random::RandomQuerySource, QuerySource};
+use crate::query::{file::FileQuerySource, random::RandomQuerySource, QuerySource, WireQueryPool};
 use crate::stats::{oom_guard, StatsCollector, StatsSnapshot};
 
 pub async fn run(config: Arc<Config>) -> anyhow::Result<StatsSnapshot> {
@@ -37,7 +37,7 @@ pub async fn run_with_shutdown(
         tokio::spawn(oom_guard::run(sd));
     }
 
-    // Build query source
+    // Build query source + pre-built wire pool (eliminates per-query allocation)
     let query_source: Arc<dyn QuerySource> = if config.random {
         Arc::new(RandomQuerySource::new(&config.random_domain, config.random_qtype))
     } else if let Some(path) = &config.query_file {
@@ -45,6 +45,9 @@ pub async fn run_with_shutdown(
     } else {
         Arc::new(RandomQuerySource::new(&config.random_domain, config.random_qtype))
     };
+    let pairs = query_source.all_wire_pairs();
+    tracing::debug!(templates = pairs.len(), "pre-building wire query pool");
+    let wire_pool = Arc::new(WireQueryPool::from_pairs(&pairs));
 
     // Verify server reachable (UDP probe)
     let server_addr: SocketAddr = (config.server, config.port).into();
@@ -174,9 +177,10 @@ pub async fn run_with_shutdown(
             let sn  = config.server.to_string();
             let gif = global_in_flight.clone();
 
+            let wp  = wire_pool.clone();
             let handle = match config.protocol {
                 Protocol::Udp => tokio::spawn(sender::run_udp_worker(
-                    server_addr, qs, st, sd, cfg.timeout_ms, qps, cfg.verbose, i,
+                    server_addr, wp, st, sd, cfg.timeout_ms, qps, cfg.verbose, i,
                     cfg.max_outstanding, gif,
                 )),
                 Protocol::Tcp => tokio::spawn(sender::run_tcp_worker(

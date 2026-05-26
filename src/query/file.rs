@@ -38,4 +38,8 @@ impl QuerySource for FileQuerySource {
         let idx = self.index.fetch_add(1, Ordering::Relaxed) % len;
         self.entries[idx].clone()
     }
+
+    fn all_wire_pairs(&self) -> Vec<(String, u16)> {
+        self.entries.iter().map(|e| (e.name.clone(), e.qtype)).collect()
+    }
 }

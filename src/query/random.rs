@@ -18,4 +18,15 @@ impl QuerySource for RandomQuerySource {
         let name = format!("{:032x}.{}", id, self.base_domain);
         QueryEntry { name, qtype: self.qtype }
     }
+
+    fn all_wire_pairs(&self) -> Vec<(String, u16)> {
+        // Sample 4096 random names — sufficient pool for benchmark purposes.
+        (0..4096usize)
+            .map(|_| {
+                let id: u128 = rand::random();
+                let name = format!("{:032x}.{}", id, self.base_domain);
+                (name, self.qtype)
+            })
+            .collect()
+    }
 }
