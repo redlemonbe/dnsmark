@@ -1,14 +1,30 @@
 # dnsmark
 
-High-performance DNS benchmark tool.  
-Static binary. No dependencies. Runs anywhere.
+**The fastest DNS benchmark tool. Static binary. No dependencies. Runs anywhere.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/redlemonbe/dnsmark)](https://github.com/redlemonbe/dnsmark/releases/latest)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
 
 > **Authorized testing only.**  
 > Only use dnsmark against DNS servers you own or have explicit written authorization to test.  
 > Read [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) before use.
+
+---
+
+## What you get
+
+| | dnsperf | flamethrower | dnsmark |
+|---|:---:|:---:|:---:|
+| UDP / TCP | UDP only | UDP / TCP | ✅ UDP / TCP |
+| DNS-over-TLS (DoT) | ❌ | ❌ | ✅ |
+| Auto ramp (find max QPS) | ❌ | ❌ | ✅ `--ramp` |
+| Compare two servers | ❌ | ❌ | ✅ `--compare` |
+| Live TUI dashboard | ❌ | ❌ | ✅ |
+| p50/p95/p99/p999 latency | basic | basic | ✅ full histogram |
+| JSON output | ❌ | ❌ | ✅ `--json` |
+| AF/XDP fast-path (optional) | ❌ | ❌ | ✅ |
+| Static binary, no deps | ❌ requires libssl | ❌ | ✅ musl |
 
 ---
 
@@ -19,7 +35,7 @@ Static binary. No dependencies. Runs anywhere.
 curl -Lo dnsmark https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-x86_64-linux-musl
 chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
 
-# aarch64 (Graviton, Raspberry Pi 4/5, …)
+# aarch64 (Graviton, Raspberry Pi 4/5)
 curl -Lo dnsmark https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-aarch64-linux-musl
 chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
 ```
@@ -31,7 +47,7 @@ chmod +x dnsmark && sudo mv dnsmark /usr/local/bin/
 ## Quick start
 
 ```bash
-# Find max sustainable QPS (automatic saturation search)
+# Find max sustainable QPS (automatic ramp)
 dnsmark -s 192.0.2.1 --random --ramp
 
 # Fixed load — 5 000 QPS for 60 s
@@ -58,7 +74,7 @@ dnsmark -s 192.0.2.1 --random -l 10 -q --json
 dnsmark -s 192.0.2.1 --random --ramp
 ```
 
-Starts at 1 000 QPS, doubles every 5 seconds, stops when the server can no longer keep up. Prints the last stable QPS.
+Starts at 1 000 QPS, doubles every 5 seconds, stops when the server can no longer keep up.
 
 ```
 Ramp: target QPS ->   2000  (burst: 171 017/s)
@@ -67,18 +83,6 @@ Ramp: target QPS ->   4000  (burst: 164 892/s)
 Ramp: target QPS -> 256000  (burst: 153 058/s)
 
 Max sustainable QPS: 128000
-```
-
----
-
-## Query file format
-
-One entry per line — same format as dnsperf:
-
-```
-example.com A
-example.com AAAA
-mail.example.com MX
 ```
 
 ---
@@ -168,6 +172,18 @@ Statistics:
 
 ---
 
+## Query file format
+
+One entry per line — same format as dnsperf:
+
+```
+example.com A
+example.com AAAA
+mail.example.com MX
+```
+
+---
+
 ## Build from source
 
 ```bash
@@ -179,16 +195,22 @@ apt install clang libbpf-dev
 cargo build --release --features xdp
 ```
 
+Requires Rust 1.75+.
+
 ---
 
 ## Contributing
 
-`cargo clippy --all-targets` — zero warnings  
-`cargo test` — all tests must pass
+```bash
+cargo clippy --all-targets   # zero warnings
+cargo test                   # all tests must pass
+```
+
+Pull requests welcome.
 
 ---
 
-## Support
+## Support the project
 
 [![Sponsor](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
 
@@ -201,10 +223,11 @@ Security issues: redlemonbe@codix.be (private disclosure before opening a public
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE)
+AGPL-3.0-only — see [LICENSE](LICENSE).
 
-Any use of dnsmark as part of a network service requires making the full source code
-available to users of that service, under the same license.
+Any use of dnsmark as part of a network service requires making the full source code available to users of that service, under the same license.
 
-*dnsmark is a companion tool for [Runbound](https://github.com/redlemonbe/Runbound).*  
+---
+
+*Part of the [RunSoftware](https://github.com/redlemonbe) stack — [Runbound](https://github.com/redlemonbe/Runbound) · [RunNginx](https://github.com/redlemonbe/RunNginx) · [RunAlexDB](https://github.com/redlemonbe/RunAlexDB)*  
 Copyright (C) 2026 RedLemonBe
