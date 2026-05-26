@@ -99,6 +99,15 @@ pub struct AddrRing {
 unsafe impl Send for AddrRing {}
 
 impl AddrRing {
+    pub fn zeroed() -> Self {
+        AddrRing {
+            _map: ptr::null_mut(), _mapsize: 0,
+            producer: ptr::null_mut(), consumer: ptr::null_mut(),
+            flags: ptr::null_mut(), descs: ptr::null_mut(),
+            size: 0, mask: 0,
+        }
+    }
+
     pub fn enqueue_batch(&self, addrs: &[u64]) -> usize {
         let prod = unsafe { ptr::read_volatile(self.producer) };
         let cons = unsafe { ptr::read_volatile(self.consumer) };
@@ -151,6 +160,32 @@ pub struct DescRing {
 unsafe impl Send for DescRing {}
 
 impl DescRing {
+    pub fn zeroed() -> Self {
+        DescRing {
+            _map: ptr::null_mut(), _mapsize: 0,
+            producer: ptr::null_mut(), consumer: ptr::null_mut(),
+            flags: ptr::null_mut(), descs: ptr::null_mut(),
+            size: 0, mask: 0,
+        }
+    }
+
+    /// Submit descriptors to the TX ring.  Returns number actually enqueued.
+    pub fn produce_tx(&self, descs: &[XdpDesc]) -> usize {
+        let prod = unsafe { ptr::read_volatile(self.producer) };
+        let cons = unsafe { ptr::read_volatile(self.consumer) };
+        let free = self.size.wrapping_sub(prod.wrapping_sub(cons)) as usize;
+        let n = descs.len().min(free);
+        for (i, desc) in descs[..n].iter().enumerate() {
+            let idx = prod.wrapping_add(i as u32) & self.mask;
+            unsafe { ptr::write_volatile(self.descs.add(idx as usize), *desc); }
+        }
+        if n > 0 {
+            fence(Ordering::Release);
+            unsafe { ptr::write_volatile(self.producer, prod.wrapping_add(n as u32)); }
+        }
+        n
+    }
+
     pub fn consume_rx(&self) -> Vec<XdpDesc> {
         fence(Ordering::Acquire);
         let prod = unsafe { ptr::read_volatile(self.producer) };
@@ -184,7 +219,9 @@ pub struct Umem {
 unsafe impl Send for Umem {}
 
 impl Umem {
-    pub unsafe fn new(xsk_fd: RawFd) -> Result<Self, String> {
+    /// Returns (Umem, tx_pool) where tx_pool contains UMEM frame offsets
+    /// for the TX path (frames RING_SIZE..FRAME_COUNT).
+    pub unsafe fn new(xsk_fd: RawFd) -> Result<(Self, Vec<u64>), String> {
         let page = sysconf(_SC_PAGESIZE) as usize;
         let area_len = ((FRAME_COUNT * FRAME_SIZE) as usize + page - 1) & !(page - 1);
 
@@ -241,16 +278,24 @@ impl Umem {
         let comp = mmap_addr_ring(xsk_fd, XDP_UMEM_PGOFF_COMPLETION_RING, &offsets.cr, RING_SIZE)
             .inspect_err(|_| { unsafe { munmap(area as *mut libc::c_void, area_len); } })?;
 
-        // Seed fill ring with all frames for RX
+        // RX fill ring: frames 0..RING_SIZE
         let rx_addrs: Vec<u64> = (0..RING_SIZE).map(|i| (i * FRAME_SIZE) as u64).collect();
         fill.enqueue_batch(&rx_addrs);
+        // TX pool: remaining frames RING_SIZE..FRAME_COUNT (already mmap'd)
+        let tx_pool: Vec<u64> = (RING_SIZE..FRAME_COUNT).map(|i| (i * FRAME_SIZE) as u64).collect();
 
-        Ok(Umem { area, area_len, fill, comp })
+        Ok((Umem { area, area_len, fill, comp }, tx_pool))
     }
 
     pub unsafe fn frame(&self, offset: u64, len: usize) -> &[u8] {
         debug_assert!((offset as usize).saturating_add(len) <= self.area_len);
         slice::from_raw_parts(self.area.add(offset as usize), len)
+    }
+
+    /// Raw mutable pointer into UMEM at `offset`. Used by XDP TX senders to
+    /// write Ethernet frames directly into shared memory.
+    pub fn ptr_at(&self, offset: u64) -> *mut u8 {
+        unsafe { self.area.add(offset as usize) }
     }
 }
 

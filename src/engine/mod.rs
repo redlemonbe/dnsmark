@@ -97,6 +97,8 @@ pub async fn run_with_shutdown(
 
         match xdp::start_xdp_receive_path(
             &iface,
+            config.server,
+            config.port,
             xdp_in_flight.clone(),
             global_in_flight.clone(),
             stats.clone(),

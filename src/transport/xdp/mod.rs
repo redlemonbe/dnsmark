@@ -1,6 +1,7 @@
 mod loader;
 mod umem;
 mod socket;
+pub mod frame;
 mod receiver;
 
 pub use loader::XdpHandle;

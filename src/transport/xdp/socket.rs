@@ -7,7 +7,7 @@
 use std::os::fd::RawFd;
 
 use super::umem::{
-    Umem, DescRing,
+    Umem, DescRing, AddrRing,
     SOL_XDP, XDP_RX_RING, XDP_TX_RING,
     XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING,
     RING_SIZE, SockaddrXdp,
@@ -18,10 +18,23 @@ use super::umem::{
 pub const AF_XDP: libc::c_int = 44;
 
 pub struct XskSocket {
-    pub fd:   RawFd,
-    pub umem: Umem,
-    pub rx:   DescRing,
-    _tx:      DescRing, // required by kernel, unused (send via UDP sockets)
+    pub fd:      RawFd,
+    pub umem:    Umem,
+    pub rx:      DescRing,
+    pub tx:      DescRing,
+    pub tx_pool: Vec<u64>,
+}
+
+impl XskSocket {
+    /// Extract TX ring, completion ring, and frame pool before moving the
+    /// socket into the RX receiver thread.  Leaves zeroed stubs in their
+    /// place so the receiver thread only uses rx + umem.fill.
+    pub fn extract_tx(&mut self) -> (DescRing, AddrRing, Vec<u64>) {
+        let tx   = std::mem::replace(&mut self.tx,       DescRing::zeroed());
+        let comp = std::mem::replace(&mut self.umem.comp, AddrRing::zeroed());
+        let pool = std::mem::take(&mut self.tx_pool);
+        (tx, comp, pool)
+    }
 }
 
 impl Drop for XskSocket {
@@ -42,7 +55,7 @@ pub unsafe fn create_xsk_socket(
         return Err(format!("socket(AF_XDP): {}", std::io::Error::last_os_error()));
     }
 
-    let umem = Umem::new(fd).inspect_err(|_| { libc::close(fd); })?;
+    let (umem, tx_pool) = Umem::new(fd).inspect_err(|_| { libc::close(fd); })?;
 
     for (opt, sz) in [(XDP_RX_RING, RING_SIZE), (XDP_TX_RING, RING_SIZE)] {
         let rc = libc::setsockopt(
@@ -85,7 +98,7 @@ pub unsafe fn create_xsk_socket(
         ));
     }
 
-    Ok(XskSocket { fd, umem, rx, _tx: tx })
+    Ok(XskSocket { fd, umem, rx, tx, tx_pool })
 }
 
 /// Number of RX queues on `iface`.
@@ -287,4 +300,17 @@ fn first_physical_bridge_port(bridge: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Number of TX queues on `iface`.
+pub fn get_tx_queue_count(iface: &str) -> u32 {
+    let path = format!("/sys/class/net/{iface}/queues");
+    std::fs::read_dir(&path)
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("tx-"))
+                .count() as u32
+        })
+        .unwrap_or(1)
+        .max(1)
 }
