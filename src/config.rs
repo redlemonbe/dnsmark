@@ -30,7 +30,11 @@ impl Protocol {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Config {
+    /// Primary target (first -s). Kept for backward-compat with mono-NIC code paths.
     pub server: IpAddr,
+    /// All targets including primary. Multi-NIC: one XDP stack per entry.
+    /// Single entry = legacy mono-NIC behaviour (no code-path change).
+    pub servers: Vec<IpAddr>,
     pub port: u16,
     pub query_file: Option<PathBuf>,
     pub concurrent: usize,
@@ -54,4 +58,6 @@ pub struct Config {
     pub no_xdp: bool,
     /// Max outstanding queries per worker (0 = unlimited). Mirrors dnsperf -q.
     pub max_outstanding: usize,
+    /// Show per-NIC stats breakdown in multi-NIC mode.
+    pub nic_stats: bool,
 }

@@ -31,9 +31,11 @@ const DISCLAIMER: &str = "dnsmark is provided for authorized performance testing
     after_help = DISCLAIMER,
 )]
 struct Cli {
-    /// Target DNS server IP
-    #[arg(short = 's', default_value = "127.0.0.1")]
-    server: std::net::IpAddr,
+    /// Target DNS server IP(s). Repeat -s for multi-NIC flood (one XDP stack per target).
+    /// Each target must be on a distinct subnet routed via a distinct NIC.
+    /// Single -s = legacy mono-NIC behaviour (unchanged).
+    #[arg(short = 's', default_value = "127.0.0.1", action = clap::ArgAction::Append)]
+    server: Vec<std::net::IpAddr>,
 
     /// Target port
     #[arg(short = 'p', default_value_t = 53)]
@@ -122,12 +124,47 @@ struct Cli {
     /// Max outstanding queries total across all workers, 0 = unlimited (mirrors dnsperf -q N×clients)
     #[arg(long, default_value_t = 100)]
     max_outstanding: usize,
+
+    /// Show per-NIC stats breakdown in multi-NIC mode
+    #[arg(long)]
+    nic_stats: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     simd::log_simd_info();
     let cli = Cli::parse();
-    
+
+    // Deduplicate servers; preserve order. At least one is always present (default).
+    let servers: Vec<std::net::IpAddr> = {
+        let mut seen = std::collections::HashSet::new();
+        cli.server.iter().filter(|s| seen.insert(**s)).copied().collect()
+    };
+    let primary = servers[0];
+
+    // Multi-NIC sanity: each target must resolve to a distinct interface.
+    if servers.len() > 1 {
+        let mut ifaces: std::collections::HashMap<String, std::net::IpAddr> =
+            std::collections::HashMap::new();
+        for &srv in &servers {
+            if let Some(iface) = crate::autodetect::iface_for_addr(srv) {
+                if let Some(prev) = ifaces.get(&iface) {
+                    anyhow::bail!(
+                        "Targets {} and {} both route via '{}'. \
+                         Multi-NIC requires distinct NICs per target (no bonding).",
+                        prev, srv, iface
+                    );
+                }
+                ifaces.insert(iface, srv);
+            }
+        }
+        if !cli.quiet {
+            println!(
+                "Multi-NIC mode: {} targets / {} interfaces",
+                servers.len(),
+                ifaces.len()
+            );
+        }
+    }
 
     // XDP check (feature guard)
     if cli.xdp {
@@ -156,7 +193,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    transport::init_cpu_pinning(cli.server);
+    transport::init_cpu_pinning(primary);
 
     // Auto-detection
     let auto = autodetect::detect();
@@ -193,7 +230,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(Config {
-        server: cli.server,
+        server: primary,
+        servers,
         port: cli.port,
         query_file: cli.query_file,
         concurrent,
@@ -219,6 +257,7 @@ fn main() -> anyhow::Result<()> {
         force_xdp: cli.xdp,
         no_xdp: cli.no_xdp,
         max_outstanding: cli.max_outstanding,
+        nic_stats: cli.nic_stats,
     });
 
     // Build tokio runtime
@@ -230,12 +269,16 @@ fn main() -> anyhow::Result<()> {
 
     rt.block_on(async {
         if let Some(secondary) = config.compare {
-            // Compare mode
+            // Compare mode (mono-NIC, uses config.server)
             let result = engine::compare::run_compare(config.clone(), secondary).await?;
             output::print_output(&result.primary, &config)?;
             engine::compare::print_compare(&result);
+        } else if config.servers.len() > 1 {
+            // Multi-NIC mode
+            let snap = engine::run_multi_nic(config.clone()).await?;
+            output::print_output(&snap, &config)?;
         } else {
-            // Normal or ramp mode
+            // Normal or ramp mode (legacy mono-NIC)
             let snap = engine::run(config.clone()).await?;
             output::print_output(&snap, &config)?;
         }
