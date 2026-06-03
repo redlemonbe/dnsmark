@@ -97,6 +97,16 @@ pub async fn run_with_shutdown(
 
         let iface = xdp::iface_for_benchmark(config.server);
 
+        // Enable the unified RX+TX-per-queue datapath (the default). DNSMARK_XDP_TX=0
+        // keeps the legacy split sender/receiver path (sendmmsg fallback).
+        if std::env::var("DNSMARK_XDP_TX").map(|v| v != "0").unwrap_or(true) {
+            xdp::set_unified_cfg(xdp::UnifiedCfg {
+                wire_pool:       wire_pool.clone(),
+                qps_per_worker:  shared_qps.clone(),
+                max_outstanding: config.max_outstanding,
+            });
+        }
+
         match xdp::start_xdp_receive_path(
             &iface,
             config.server,

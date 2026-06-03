@@ -113,7 +113,170 @@ unsafe impl Sync for XdpTxState {}
 /// Sender workers index into this by `worker_id % len`.
 static XDP_TX_STATES: OnceLock<Vec<Arc<XdpTxState>>> = OnceLock::new();
 
+/// True when the unified (RX+TX in one thread per queue) workers are running.
+/// In that mode the engine's sender tasks become no-ops — the unified worker
+/// owns its queue's whole socket, so there is no thread split and no Mutex on
+/// the rings (the HT-contending 2-thread-per-queue model is what capped scaling
+/// to the 8 NIC-local physical cores). This is the Runbound worker model.
+static XDP_UNIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Config the engine hands to the unified workers (set before start_xdp_receive_path).
+pub struct UnifiedCfg {
+    pub wire_pool:       Arc<WireQueryPool>,
+    pub qps_per_worker:  Arc<AtomicU64>,
+    pub max_outstanding: usize,
+}
+static UNIFIED_CFG: OnceLock<UnifiedCfg> = OnceLock::new();
+
+/// Called by the engine before `start_xdp_receive_path` to enable the unified
+/// (RX+TX, one thread per queue/core) datapath. Without it, the legacy split
+/// sender/receiver path is used.
+pub fn set_unified_cfg(cfg: UnifiedCfg) {
+    let _ = UNIFIED_CFG.set(cfg);
+}
+
 const TX_BATCH: usize = 64;
+
+/// One worker per NIC queue, pinned to one NIC-local physical core, owning the
+/// entire AF_XDP socket: it generates+TXes queries, reclaims TX completions, drains
+/// RX responses and records stats — all in a single loop, no shared per-packet state,
+/// no Mutex on the rings, no second thread stealing the physical core via HT.
+#[allow(clippy::too_many_arguments)]
+fn xdp_unified_worker(
+    mut sock:         XskSocket,
+    hdr:              FrameHeader,
+    sa:               SockaddrXdp,
+    wire_pool:        Arc<WireQueryPool>,
+    in_flight:        Arc<InFlight>,
+    global_in_flight: Arc<AtomicUsize>,
+    stats:            Arc<StatsCollector>,
+    shutdown:         Arc<AtomicBool>,
+    qps_per_worker:   Arc<AtomicU64>,
+    worker_id:        usize,
+    num_workers:      usize,
+    max_outstanding:  usize,
+    timeout_dur:      Duration,
+) {
+    let area = sock.umem.ptr_at(0);
+    let fd   = sock.fd;
+    let nw      = num_workers.max(1);
+    let id_span = (65536usize / nw).max(1);
+    let id_base = ((worker_id % nw) * id_span) as u16;
+    let mut id_ctr:   usize = 0;
+    let mut tmpl_idx: usize = worker_id;
+    const FLUSH_N: usize = 1024;
+    let mut local_sent: usize = 0;
+
+    let mut descs:    Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
+    let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
+    let mut last_timeout = Instant::now();
+
+    // qps pacing (per-worker rate limit); 0 = unlimited flood.
+    let mut next_send     = Instant::now();
+    let mut last_qps: u64 = 0;
+    let mut send_interval = Duration::ZERO;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) { break; }
+
+        // 1) Reclaim TX completions → recycle frames to the local pool.
+        let done = sock.umem.comp.dequeue_all();
+        if !done.is_empty() { sock.tx_pool.extend_from_slice(&done); }
+
+        // 2) Decide how many to TX this iteration (rate / backpressure gate).
+        let qps = qps_per_worker.load(Ordering::Relaxed);
+        let mut headroom = if qps > 0 {
+            if qps != last_qps {
+                send_interval = Duration::from_secs_f64(1.0 / qps as f64);
+                next_send = Instant::now();
+                last_qps = qps;
+            }
+            let now = Instant::now();
+            if now < next_send { 0 } else { next_send += send_interval; 1 }
+        } else {
+            TX_BATCH
+        };
+        if max_outstanding > 0 {
+            let cur = global_in_flight.load(Ordering::Relaxed);
+            headroom = headroom.min(max_outstanding.saturating_sub(cur));
+        }
+
+        // 3) TX a batch straight into UMEM (one SIMD copy, one produce_tx, one kick).
+        if headroom > 0 {
+            descs.clear();
+            let take = headroom.min(sock.tx_pool.len());
+            for _ in 0..take {
+                if let Some(addr) = sock.tx_pool.pop() {
+                    let id = id_base.wrapping_add((id_ctr % id_span) as u16); id_ctr += 1;
+                    // SAFETY: addr is a frame offset from this worker's own pool; the
+                    //         UMEM slice is mapped and owned solely by this thread.
+                    let buf = unsafe {
+                        std::slice::from_raw_parts_mut(area.add(addr as usize), FRAME_SIZE as usize)
+                    };
+                    let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
+                    tmpl_idx += 1;
+                    let total = hdr.write_header(buf, dns_len);
+                    descs.push(XdpDesc { addr, len: total as u32, options: 0 });
+                    in_flight.insert(id);
+                }
+            }
+            if !descs.is_empty() {
+                let enq = sock.tx.produce_tx(&descs);
+                if enq < descs.len() {
+                    for d in &descs[enq..] { sock.tx_pool.push(d.addr); }
+                }
+                if enq > 0 {
+                    // Always kick: no RX-driven NAPI on a generator (see xdp_tx_batch_inline).
+                    unsafe {
+                        libc::sendto(
+                            fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
+                            &sa as *const SockaddrXdp as *const libc::sockaddr,
+                            std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+                        );
+                    }
+                    local_sent += enq;
+                    if local_sent >= FLUSH_N {
+                        stats.inc_sent_n(local_sent);
+                        if max_outstanding > 0 { global_in_flight.fetch_add(local_sent, Ordering::Relaxed); }
+                        local_sent = 0;
+                    }
+                }
+            }
+        }
+
+        // 4) Drain RX responses → match in_flight → stats → refill the fill ring.
+        let rxds = sock.rx.consume_rx();
+        if !rxds.is_empty() {
+            rx_addrs.clear();
+            let mut completed = 0usize;
+            for desc in &rxds {
+                let frame = unsafe { sock.umem.frame(desc.addr, desc.len as usize) };
+                if let Some((id, rcode)) = parse_dns_from_frame(frame) {
+                    if let Some(rtt_us) = in_flight.take(id) { stats.record_response(rcode, rtt_us); completed += 1; }
+                }
+                rx_addrs.push(desc.addr);
+            }
+            sock.umem.fill.enqueue_batch(&rx_addrs);
+            if completed > 0 && max_outstanding > 0 {
+                global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(completed))).ok();
+            }
+        } else if sock.umem.fill.needs_wakeup() {
+            unsafe {
+                libc::recvfrom(fd, std::ptr::null_mut(), 0, libc::MSG_DONTWAIT,
+                    std::ptr::null_mut(), std::ptr::null_mut());
+            }
+        }
+
+        // 5) Expire timed-out queries every 10 ms.
+        let now = Instant::now();
+        if now.duration_since(last_timeout) >= Duration::from_millis(10) {
+            let expired = in_flight.sweep(timeout_dur);
+            if expired > 0 { for _ in 0..expired { stats.inc_timeout(); } }
+            last_timeout = now;
+        }
+    }
+    if local_sent > 0 { stats.inc_sent_n(local_sent); }
+}
 
 // ── Frame parser ──────────────────────────────────────────────────────────
 
@@ -789,8 +952,45 @@ fn do_start_xdp_receive_path(
 
         handle.register_socket(q, sock.fd)?;
 
-        // Extract TX ring, completion ring, and frame pool before moving
-        // the socket into the receiver thread (which only uses rx + fill).
+        let ifl = in_flight.clone();
+        let gif = global_in_flight.clone();
+        let st  = stats.clone();
+        let sd  = shutdown.clone();
+
+        // ── Unified path (default when the engine set the config + IPv4 frame hdr) ──
+        // One thread per queue owns the WHOLE socket and does RX+TX in one loop,
+        // pinned to one NIC-local PHYSICAL core (lower half of local_cpus, 32-39).
+        // No thread split, no Mutex, no HT sibling stealing the core.
+        if let (Some(cfg), Some(hdr)) = (UNIFIED_CFG.get(), frame_hdr_opt.clone()) {
+            let sa = SockaddrXdp {
+                sxdp_family:         AF_XDP as u16,
+                sxdp_flags:          0,
+                sxdp_ifindex:        ifidx,
+                sxdp_queue_id:       q,
+                sxdp_shared_umem_fd: 0,
+            };
+            let core = if local_cpus.is_empty() {
+                None
+            } else {
+                let half = (local_cpus.len() / 2).max(1); // physical cores in lower half
+                Some(local_cpus[(q as usize) % half])
+            };
+            let wp  = cfg.wire_pool.clone();
+            let qps = cfg.qps_per_worker.clone();
+            let mo  = cfg.max_outstanding;
+            let qc  = queue_count;
+            XDP_UNIFIED.store(true, Ordering::Relaxed);
+            std::thread::Builder::new()
+                .name(format!("xdp-worker-q{q}"))
+                .spawn(move || {
+                    if let Some(c) = core { pin_thread_to(c); }
+                    xdp_unified_worker(sock, hdr, sa, wp, ifl, gif, st, sd, qps, q as usize, qc, mo, timeout_dur);
+                })
+                .map_err(|e| format!("thread spawn: {e}"))?;
+            continue;
+        }
+
+        // ── Legacy split path (no unified cfg, or IPv6): extract TX, RX-only recv ──
         if let Some(ref hdr) = frame_hdr_opt {
             let area = sock.umem.ptr_at(0);
             let fd   = sock.fd;
@@ -813,14 +1013,7 @@ fn do_start_xdp_receive_path(
             }));
         }
 
-        let ifl = in_flight.clone();
-        let gif = global_in_flight.clone();
-        let st  = stats.clone();
-        let sd  = shutdown.clone();
-
-        // Pin the receiver to a NIC-local HT sibling (upper half of local_cpus, e.g.
-        // 96-103) so the busy-poll RX loop never floats onto a remote node and never
-        // steals the sender's physical core (the sender owns the lower half, 32-39).
+        // Pin the receiver to a NIC-local HT sibling (upper half of local_cpus).
         let recv_cpu = if local_cpus.len() >= 2 {
             let half = local_cpus.len() / 2;
             Some(local_cpus[half + (q as usize % half)])
@@ -837,7 +1030,7 @@ fn do_start_xdp_receive_path(
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
-    // Store TX states globally for sender workers to access.
+    // Store TX states globally for sender workers to access (legacy path only).
     if !tx_states.is_empty() {
         XDP_TX_STATES.set(tx_states).ok();
         tracing::info!("[XDP TX] TX ring active on {} queue(s)", queue_count);
@@ -873,6 +1066,12 @@ pub async fn run_xdp_sender_worker(
     wire_pool:        Arc<WireQueryPool>,
     num_workers:      usize,
 ) {
+    // Unified workers (spawned in start_xdp_receive_path, one per queue/core) own
+    // the whole datapath. This engine task then has nothing to do — return.
+    if XDP_UNIFIED.load(Ordering::Relaxed) {
+        return;
+    }
+
     let _ = timeout_ms;
     let _ = &query_source;
     let _ = &global_id;
