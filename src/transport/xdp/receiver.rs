@@ -166,6 +166,12 @@ fn xdp_unified_worker(
     const FLUSH_N: usize = 1024;
     let mut local_sent: usize = 0;
 
+    // Vary the UDP source port per packet (default) so the receiver's NIC RSS
+    // spreads the flow across its RX queues/cores. A fixed src port pins the whole
+    // flood to one RX queue → one core. DNSMARK_FIXED_SPORT=1 keeps it fixed.
+    let vary_sport = std::env::var("DNSMARK_FIXED_SPORT").is_err();
+    let mut port_ctr: u32 = (worker_id as u32).wrapping_mul(40_009);
+
     let mut descs:    Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
     let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
     let mut last_timeout = Instant::now();
@@ -217,6 +223,11 @@ fn xdp_unified_worker(
                     let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
                     tmpl_idx += 1;
                     let total = hdr.write_header(buf, dns_len);
+                    if vary_sport {
+                        let sport = 2048u16.wrapping_add((port_ctr % 60_000) as u16);
+                        port_ctr = port_ctr.wrapping_add(1);
+                        frame::set_src_port(buf, sport);
+                    }
                     descs.push(XdpDesc { addr, len: total as u32, options: 0 });
                     in_flight.insert(id);
                 }

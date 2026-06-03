@@ -86,6 +86,18 @@ impl FrameHeader {
     }
 }
 
+/// Patch the UDP source port in an already-stamped frame. Varying it per packet
+/// makes the receiver's NIC RSS spread the flow across its RX queues/cores — a
+/// fixed source port hashes to a single queue → a single core (measured: a 12M
+/// pps flood landed entirely on one RX queue / one core of a 40-core resolver).
+/// The UDP checksum is 0 (disabled for IPv4 UDP) so no recomputation is needed,
+/// and the IP checksum does not cover the UDP header.
+#[inline]
+pub fn set_src_port(out: &mut [u8], port: u16) {
+    out[ETH_HDR + IPV4_HDR]     = (port >> 8) as u8;
+    out[ETH_HDR + IPV4_HDR + 1] = port as u8;
+}
+
 #[inline]
 fn ipv4_checksum(hdr: &[u8]) -> u16 {
     let mut sum: u32 = 0;
