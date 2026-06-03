@@ -73,6 +73,9 @@ fn sender_thread(
     max_outstanding: usize,
 ) {
     let mut next_id: u16 = rand::random();
+    // Per-worker round-robin cursor into the wire-query pool — replaces the
+    // shared AtomicUsize index (cross-core contention killed scaling past ~4 cores).
+    let mut tmpl_idx: usize = rand::random();
     let mut next_send = Instant::now();
     let mut last_qps: u64 = 0;
     let mut send_interval = Duration::ZERO;
@@ -128,7 +131,8 @@ fn sender_thread(
             }
 
             // Build and send from pre-built template; no allocation.
-            let qlen = wire_pool.write_next_with_id(next_id, &mut single_buf);
+            let qlen = wire_pool.write_with_index(tmpl_idx, next_id, &mut single_buf);
+            tmpl_idx = tmpl_idx.wrapping_add(1);
             let ret = unsafe {
                 libc::send(fd, single_buf.as_ptr() as *const libc::c_void, qlen, 0)
             };
@@ -162,7 +166,8 @@ fn sender_thread(
             // Fill pre-allocated batch buffers from wire pool — no allocation.
             batch_ids.clear();
             for i in 0..batch_cap {
-                batch_lens[i] = wire_pool.write_next_with_id(next_id, &mut batch_bufs[i]);
+                batch_lens[i] = wire_pool.write_with_index(tmpl_idx, next_id, &mut batch_bufs[i]);
+                tmpl_idx = tmpl_idx.wrapping_add(1);
                 batch_ids.push(next_id);
                 next_id = next_id.wrapping_add(1);
             }
@@ -181,11 +186,13 @@ fn sender_thread(
 
             if sent > 0 {
                 let send_time = Instant::now();
-                let mut map = in_flight.lock();
-                for id in batch_ids.iter().take(sent) {
-                    map.insert(*id, send_time);
-                    stats.inc_sent();
+                {
+                    let mut map = in_flight.lock();
+                    for id in batch_ids.iter().take(sent) {
+                        map.insert(*id, send_time);
+                    }
                 }
+                stats.inc_sent_n(sent);
                 global_in_flight.fetch_add(sent, Ordering::Relaxed);
             }
 

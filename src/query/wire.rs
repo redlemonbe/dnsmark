@@ -43,6 +43,20 @@ impl WireQueryPool {
         len
     }
 
+    /// Same as `write_next_with_id` but the round-robin cursor is **caller-owned**
+    /// (a per-worker local counter) instead of the shared `AtomicUsize`. Removes
+    /// the cross-core cache-line contention that collapsed throughput past ~4
+    /// workers. `templates` stays shared read-only.
+    #[inline]
+    pub fn write_with_index(&self, local_idx: usize, id: u16, buf: &mut [u8]) -> usize {
+        let idx = local_idx % self.templates.len();
+        let tmpl = &self.templates[idx];
+        let len = tmpl.len();
+        crate::simd::memcpy_dispatch(&mut buf[..len], tmpl);
+        buf[0] = (id >> 8) as u8;
+        buf[1] = id as u8;
+        len
+    }
 }
 
 /// Build a wire-format DNS query with ID = 0x00 0x00.
