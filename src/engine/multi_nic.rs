@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn merge_single_is_identity() {
         let s = make_snap(1000, 950, 95.0, 300, 10.0);
-        let m = merge_snapshots(&[s.clone()]);
+        let m = merge_snapshots(std::slice::from_ref(&s));
         assert_eq!(m.queries_sent, 1000);
         assert_eq!(m.queries_completed, 950);
         assert_eq!(m.queries_lost, 50);
