@@ -15,9 +15,9 @@ use libc::{
 
 // ── Frame configuration ────────────────────────────────────────────────────
 
-pub const FRAME_SIZE: u32 = 4096;
-pub const FRAME_COUNT: u32 = 4096;
-pub const RING_SIZE: u32 = 2048;
+pub const FRAME_SIZE: u32 = 2048;
+pub const FRAME_COUNT: u32 = 16384;
+pub const RING_SIZE: u32 = 4096;
 
 // ── Kernel constants (from <linux/if_xdp.h>) ──────────────────────────────
 
