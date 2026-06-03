@@ -76,6 +76,64 @@ dnsmark -s 192.0.2.1 --random -l 10 -q --json
 
 ---
 
+## AF_XDP zero-copy — 10G line-rate generation
+
+With `--xdp`, dnsmark builds DNS query frames straight into the NIC's UMEM and
+transmits them zero-copy (no kernel, no per-packet syscall). One independent
+worker runs per NIC-local physical core; each owns its own queue, UMEM and rings
+— no shared per-packet state. On an Intel X520 (82599) this **saturates a 10 GbE
+link (~12 M qps)** and scales per core, ~30× a kernel-socket generator.
+
+```bash
+# grant capabilities once (or run as root)
+sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which dnsmark)
+
+# zero-copy flood, all NIC-local cores
+dnsmark -s 10.0.0.2 -d queries.txt --xdp -c 8 --max-outstanding 0
+```
+
+**Requirements to reach line rate (all matter):**
+
+1. **Physical NIC only.** XDP binds a physical interface + queue. It **cannot**
+   bind a virtual interface (bond, bridge/`vmbr*`, `veth`, `macvlan`) — dnsmark
+   detects these and refuses / retries the physical parent.
+2. **Disable flow control on the sender NIC.** Otherwise 802.3x PAUSE frames from
+   the receiver throttle TX (we measured a hard ~1.36 M pps cap that vanished once
+   flow control was off, jumping to 12 M):
+   ```bash
+   ethtool -A <nic> rx off tx off
+   ```
+3. **The server's MAC must be ARP-resolvable.** If dnsmark cannot resolve it, it
+   logs a loud warning and **falls back to `sendmmsg`** (kernel path, not
+   zero-copy). Pin it if needed:
+   ```bash
+   ip neigh replace 10.0.0.2 lladdr <server-mac> dev <nic> nud permanent
+   ```
+
+### Link bonding is not supported (XDP limitation)
+
+AF_XDP cannot transmit over a Linux **bond** — a bond is a virtual interface, and
+the kernel XDP layer binds a physical NIC + queue, so it has no way to spread
+frames across bond members (the second member becomes a black hole).
+
+**Workaround — saturate 2×10G with two independent paths:** take each port out of
+the bond, give each its own subnet, and run **one dnsmark instance per physical
+port**:
+
+```bash
+# port A
+ethtool -A enp1s0f0 rx off tx off
+dnsmark -s 10.0.0.2 -d queries.txt --xdp --max-outstanding 0   # uses enp1s0f0
+# port B (second terminal / host)
+ethtool -A enp1s0f1 rx off tx off
+dnsmark -s 10.1.0.2 -d queries.txt --xdp --max-outstanding 0   # uses enp1s0f1
+```
+
+A native multi-NIC mode (one process driving several physical ports) is on the
+roadmap — see the issues.
+
+---
+
 ## Ramp mode
 
 ```bash
