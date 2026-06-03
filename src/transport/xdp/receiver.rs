@@ -476,6 +476,14 @@ fn xdp_tx_sender_thread(
     let mut tmpl_idx: usize = worker_id;        // private template cursor (no shared atomic)
     let mut single_buf = vec![0u8; MAX_QUERY];
 
+    // Sharded counters: accumulate locally, flush to the shared atomics only every
+    // FLUSH_N sends. A per-batch fetch_add on stats.sent / global_in_flight bounces
+    // ONE cache line across every core (cross-CCX on the Threadripper) → that is the
+    // anti-scaling (500k/worker @ c=2 collapsing to 81k/worker @ c=8). Flushing rarely
+    // keeps the hot path per-core, zero shared per-packet state (the Runbound model).
+    const FLUSH_N: usize = 1024;
+    let mut local_sent: usize = 0;
+
     let mut next_send    = Instant::now();
     let mut last_qps: u64 = 0;
     let mut send_interval = Duration::ZERO;
@@ -515,8 +523,12 @@ fn xdp_tx_sender_thread(
             let len = wire_pool.write_with_index(tmpl_idx, id, &mut single_buf); tmpl_idx += 1;
             if xdp_tx_one(&state, &single_buf[..len]) {
                 in_flight.insert(id);
-                global_in_flight.fetch_add(1, Ordering::Relaxed);
-                stats.inc_sent();
+                local_sent += 1;
+                if local_sent >= FLUSH_N {
+                    stats.inc_sent_n(local_sent);
+                    if max_outstanding > 0 { global_in_flight.fetch_add(local_sent, Ordering::Relaxed); }
+                    local_sent = 0;
+                }
                 if verbose { tracing::debug!(id, "XDP TX sent query"); }
             }
         } else {
@@ -548,13 +560,23 @@ fn xdp_tx_sender_thread(
             let sent = xdp_tx_batch(&state, &dns_batch);
             if sent > 0 {
                 for &id in ids.iter().take(sent) { in_flight.insert(id); }
-                global_in_flight.fetch_add(sent, Ordering::Relaxed);
-                stats.inc_sent_n(sent);
+                local_sent += sent;
+                if local_sent >= FLUSH_N {
+                    stats.inc_sent_n(local_sent);
+                    if max_outstanding > 0 { global_in_flight.fetch_add(local_sent, Ordering::Relaxed); }
+                    local_sent = 0;
+                }
             } else {
                 std::thread::yield_now();
             }
             last_qps = 0;
         }
+    }
+
+    // Flush any remaining locally-counted sends so the final stats are exact.
+    if local_sent > 0 {
+        stats.inc_sent_n(local_sent);
+        if max_outstanding > 0 { global_in_flight.fetch_add(local_sent, Ordering::Relaxed); }
     }
 }
 
