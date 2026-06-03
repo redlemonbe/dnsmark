@@ -1,4 +1,6 @@
 pub mod compare;
+pub mod multi_nic;
+pub use multi_nic::run_multi_nic;
 pub mod ramp;
 pub mod receiver;
 pub mod sender;
