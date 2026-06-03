@@ -132,6 +132,24 @@ dnsmark -s 10.1.0.2 -d queries.txt --xdp --max-outstanding 0   # uses enp1s0f1
 A native multi-NIC mode (one process driving several physical ports) is on the
 roadmap — see the issues.
 
+### Benchmarking a DNS server (spread across its cores)
+
+dnsmark varies the UDP **source port** per packet by default so the server's NIC
+RSS can spread the load across its RX queues/cores. For that to work the **server's
+NIC must hash UDP on L4 ports** — most NICs default to hashing IPs only, which pins
+the whole single-source flood to one queue → one core:
+
+```bash
+# on the SERVER under test
+ethtool -N <nic> rx-flow-hash udp4 sdfn   # hash src/dst IP + src/dst port
+ethtool -A <nic> rx off tx off            # no PAUSE-frame throttling
+```
+
+Measured impact: an Intel X520 resolver went from **1 core / 448k qps** to **16
+cores / 4.77M qps** just by enabling `udp4 sdfn` + the per-packet source-port
+variation (the 82599's RSS caps at 16 rings). Use `DNSMARK_FIXED_SPORT=1` to pin
+the source port (single-flow / single-core testing).
+
 ---
 
 ## Ramp mode
