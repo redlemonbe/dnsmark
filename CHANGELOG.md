@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic V
 
 ---
 
+## [1.3.0] — 2026-06-03
+
+### Added
+
+- **Multi-NIC AF_XDP flood** — generate across N independent NICs in parallel to aggregate beyond a single 10 GbE link. AF_XDP does not support bonding, so each NIC is an **independent XSK interface** with its own rings, workers, and target. Specify multiple targets with repeated `-s` (e.g. `-s 10.10.10.2 -s 10.10.20.2`), each on a distinct subnet routed via a distinct NIC; workers are split across NICs. `--nic-stats` prints a per-NIC throughput breakdown alongside the aggregate. A single `-s` is unchanged (mono-NIC). A NIC that fails XDP attach warns and is skipped without taking down the others.
+  - Measured: **19.4M qps aggregate** across two X520 10 GbE fibre links (8.6M + 10.8M) — past the single-link ~11.3M line-rate.
+- **Benchmarking methodology guide** (`docs/benchmarking.md`) — how to measure a receiver's true throughput at its NIC counters (not the generator's round-trip, which under-counts when the receiver out-paces the generator's RX), NIC/host tuning (flow control, RSS, governor), the 10 GbE line-rate ceiling, and gotchas (silent TX fallback < 1.2.1, corrupted-NIC reset, the poll-model myth).
+
+---
+
 ## [1.0.0] — 2026-05-26
 
 First stable release.
