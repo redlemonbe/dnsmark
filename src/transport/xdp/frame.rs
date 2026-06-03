@@ -126,9 +126,10 @@ pub fn local_ipv4(iface: &str) -> Option<Ipv4Addr> {
 /// Resolve server MAC via /proc/net/arp; triggers ARP ping if not cached.
 pub fn resolve_server_mac(server: Ipv4Addr) -> Option<[u8; 6]> {
     if let Some(m) = lookup_arp(server) { return Some(m); }
-    trigger_arp(server);
-    for _ in 0..5 {
-        std::thread::sleep(std::time::Duration::from_millis(60));
+    // Retry for ~2s, re-triggering ARP each round (a fresh link may have no entry).
+    for i in 0..40 {
+        if i % 8 == 0 { trigger_arp(server); }
+        std::thread::sleep(std::time::Duration::from_millis(50));
         if let Some(m) = lookup_arp(server) { return Some(m); }
     }
     None
@@ -150,8 +151,12 @@ fn lookup_arp(server: Ipv4Addr) -> Option<[u8; 6]> {
 }
 
 fn trigger_arp(server: Ipv4Addr) {
+    // connect() alone does not emit a packet; send a byte so the kernel actually
+    // resolves the route and emits an ARP request for the neighbour.
     if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        let _ = s.connect(std::net::SocketAddr::from((server, 53)));
+        if s.connect(std::net::SocketAddr::from((server, 9))).is_ok() {
+            let _ = s.send(&[0u8]);
+        }
     }
 }
 

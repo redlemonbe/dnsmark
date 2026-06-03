@@ -911,10 +911,29 @@ fn do_start_xdp_receive_path(
 
     // Build Ethernet frame header for XDP TX (IPv4 only; IPv6 falls back to sendmmsg).
     let frame_hdr_opt: Option<FrameHeader> = (|| {
-        let IpAddr::V4(dst_ip) = server else { return None; };
-        let src_ip  = frame::local_ipv4(iface)?;
-        let src_mac = frame::local_mac(iface)?;
-        let dst_mac = frame::resolve_server_mac(dst_ip)?;
+        let IpAddr::V4(dst_ip) = server else {
+            tracing::warn!("[XDP TX] server is IPv6 — AF_XDP TX unavailable, using sendmmsg");
+            return None;
+        };
+        let src_ip = match frame::local_ipv4(iface) {
+            Some(v) => v,
+            None => { tracing::warn!("[XDP TX] no IPv4 on {} — using sendmmsg", iface); return None; }
+        };
+        let src_mac = match frame::local_mac(iface) {
+            Some(v) => v,
+            None => { tracing::warn!("[XDP TX] no MAC on {} — using sendmmsg", iface); return None; }
+        };
+        let dst_mac = match frame::resolve_server_mac(dst_ip) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "[XDP TX] could not resolve MAC of {} (ARP) — FALLING BACK TO sendmmsg \
+                     (NOT zero-copy XDP TX!). Populate ARP: `ip neigh replace {} lladdr <mac> dev {} nud permanent`",
+                    dst_ip, dst_ip, iface
+                );
+                return None;
+            }
+        };
         tracing::info!(
             "[XDP TX] frame header: src={} dst={} sport=12345 dport={}",
             src_ip, dst_ip, server_port
