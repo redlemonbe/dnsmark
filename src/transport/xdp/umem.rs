@@ -218,6 +218,31 @@ pub struct Umem {
 
 unsafe impl Send for Umem {}
 
+/// Migrate the UMEM pages to NUMA `node` (the NIC's node). MAP_POPULATE faults the
+/// pages on the allocating thread's node, which is usually REMOTE to the NIC — then
+/// every DMA and every worker access crosses the interconnect (measured: the X520 on
+/// node 4 while workers ran on node 0 capped per-core throughput). Binding with
+/// MPOL_MF_MOVE migrates the already-faulted pages to the NIC's local node.
+pub fn mbind_to_node(area: *mut u8, len: usize, node: usize) -> bool {
+    const MPOL_BIND: libc::c_long = 2;
+    const MPOL_MF_MOVE: libc::c_long = 1 << 1;
+    let mut nodemask: [u64; 16] = [0; 16]; // up to 1024 NUMA nodes
+    if node / 64 >= nodemask.len() { return false; }
+    nodemask[node / 64] = 1u64 << (node % 64);
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            area as usize as libc::c_long,
+            len as libc::c_long,
+            MPOL_BIND,
+            nodemask.as_ptr() as libc::c_long,
+            1024i64, // maxnode (bits in the mask)
+            MPOL_MF_MOVE,
+        )
+    };
+    rc == 0
+}
+
 impl Umem {
     /// Returns (Umem, tx_pool) where tx_pool contains UMEM frame offsets
     /// for the TX path (frames RING_SIZE..FRAME_COUNT).

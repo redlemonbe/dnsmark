@@ -32,7 +32,7 @@ use super::socket::{
     iface_for_server, default_interface,
     is_virtual_interface, parent_interface,
 };
-use super::umem::{XdpDesc, FRAME_SIZE, SockaddrXdp};
+use super::umem::{XdpDesc, FRAME_SIZE, SockaddrXdp, mbind_to_node};
 use super::socket::AF_XDP;
 
 // Ethernet/IP/UDP header sizes (IPv4 with IHL=5 only; packets with options
@@ -703,6 +703,34 @@ pub fn start_xdp_receive_path(
     do_start_xdp_receive_path(iface, server, server_port, in_flight, global_in_flight, stats, shutdown, timeout_dur)
 }
 
+/// Parse the NIC's NUMA-local logical CPUs from /sys (e.g. "32-39,96-103").
+/// Lower half = physical cores, upper half = their HT siblings (same node).
+fn nic_local_logical_cpus(iface: &str) -> Vec<usize> {
+    let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/device/local_cpulist"))
+        .unwrap_or_default();
+    let mut v = Vec::new();
+    for part in s.trim().split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                v.extend(a..=b);
+            }
+        } else if let Ok(a) = part.trim().parse::<usize>() {
+            v.push(a);
+        }
+    }
+    v
+}
+
+/// Pin the calling thread to a specific logical CPU id.
+fn pin_thread_to(cpu: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 fn do_start_xdp_receive_path(
     iface:            &str,
     server:           IpAddr,
@@ -734,6 +762,16 @@ fn do_start_xdp_receive_path(
     let queue_count = get_rx_queue_count(iface);
     let mut tx_states: Vec<Arc<XdpTxState>> = Vec::new();
 
+    // NIC-local NUMA node + logical CPUs. The UMEM is bound here and the receiver
+    // threads are pinned to local HT siblings so neither the DMA nor the response
+    // parsing ever crosses to a remote node (measured: NIC on node 4, receivers
+    // floating onto remote cpus 18/31/83/95 → cross-NUMA, per-core throughput cap).
+    let nic_node = crate::autodetect::numa_node_for_iface(iface);
+    let local_cpus = nic_local_logical_cpus(iface);
+    if let Some(node) = nic_node {
+        tracing::info!("[XDP] NIC node {}, local cpus {:?}", node, local_cpus);
+    }
+
     for q in 0..queue_count {
         let mut sock = match unsafe { create_xsk_socket(ifidx, q, true) } {
             Ok(s) => { tracing::info!(queue = q, "AF_XDP bound ZERO-COPY"); s }
@@ -742,6 +780,12 @@ fn do_start_xdp_receive_path(
                 Err(e) => return Err(format!("AF_XDP socket q={q}: {e}")),
             },
         };
+
+        // Migrate this queue's UMEM to the NIC's local node (MAP_POPULATE faulted it
+        // on the main thread, usually remote). Zero-copy DMA then stays NUMA-local.
+        if let Some(node) = nic_node {
+            mbind_to_node(sock.umem.area, sock.umem.area_len, node);
+        }
 
         handle.register_socket(q, sock.fd)?;
 
@@ -774,9 +818,22 @@ fn do_start_xdp_receive_path(
         let st  = stats.clone();
         let sd  = shutdown.clone();
 
+        // Pin the receiver to a NIC-local HT sibling (upper half of local_cpus, e.g.
+        // 96-103) so the busy-poll RX loop never floats onto a remote node and never
+        // steals the sender's physical core (the sender owns the lower half, 32-39).
+        let recv_cpu = if local_cpus.len() >= 2 {
+            let half = local_cpus.len() / 2;
+            Some(local_cpus[half + (q as usize % half)])
+        } else {
+            None
+        };
+
         std::thread::Builder::new()
             .name(format!("xdp-recv-q{q}"))
-            .spawn(move || xdp_receiver_thread(sock, ifl, gif, st, sd, timeout_dur))
+            .spawn(move || {
+                if let Some(c) = recv_cpu { pin_thread_to(c); }
+                xdp_receiver_thread(sock, ifl, gif, st, sd, timeout_dur)
+            })
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
