@@ -978,7 +978,7 @@ fn do_start_xdp_receive_path(
             let wp  = cfg.wire_pool.clone();
             let qps = cfg.qps_per_worker.clone();
             let mo  = cfg.max_outstanding;
-            let qc  = queue_count;
+            let qc  = queue_count as usize;
             XDP_UNIFIED.store(true, Ordering::Relaxed);
             std::thread::Builder::new()
                 .name(format!("xdp-worker-q{q}"))
