@@ -109,27 +109,54 @@ fn xdp_receiver_thread(
     timeout_dur:     Duration,
 ) {
     let mut last_timeout_check = Instant::now();
+    let mut idle_spins: u32 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) { break; }
 
-        // poll() with 100 ms timeout so we check shutdown and timeouts regularly.
-        let mut pfd = libc::pollfd {
-            fd:      sock.fd,
-            events:  libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pfd, 1, 100) };
-
-        if ready < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
-            break; // socket closed or fatal error
-        }
-
-        // Drain RX ring.
+        // Drain RX ring (busy-poll — no 100 ms poll() that would stall the hot path).
         let descs = sock.rx.consume_rx();
-        if !descs.is_empty() {
+
+        if descs.is_empty() {
+            // No RX descriptors: kick the driver to consume the fill ring and
+            // produce RX (required under XDP_USE_NEED_WAKEUP), then back off briefly.
+            if sock.umem.fill.needs_wakeup() {
+                unsafe {
+                    libc::recvfrom(
+                        sock.fd, std::ptr::null_mut(), 0, libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(), std::ptr::null_mut(),
+                    );
+                }
+            }
+            idle_spins += 1;
+            if idle_spins >= 1024 {
+                // Long idle: sleep on poll so we don't burn a core for nothing,
+                // but stay responsive (1 ms) for shutdown + timeout sweeps.
+                let mut pfd = libc::pollfd { fd: sock.fd, events: libc::POLLIN, revents: 0 };
+                unsafe { libc::poll(&mut pfd, 1, 1); }
+                idle_spins = 0;
+            } else {
+                std::hint::spin_loop();
+            }
+            // Timeout sweep while idle.
+            let now = Instant::now();
+            if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
+                let mut expired = 0usize;
+                let mut map = in_flight.lock();
+                map.retain(|_, sent_at| {
+                    if now.duration_since(*sent_at) > timeout_dur { stats.inc_timeout(); expired += 1; false } else { true }
+                });
+                drop(map);
+                if expired > 0 {
+                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(expired))).ok();
+                }
+                last_timeout_check = now;
+            }
+            continue;
+        }
+        idle_spins = 0;
+
+        {
             let now = Instant::now();
             let mut completed = 0usize;
 
@@ -611,8 +638,12 @@ pub async fn run_xdp_sender_worker(
 ) {
     let _ = timeout_ms;
 
-    // If XDP TX is active, use the TX ring instead of sendmmsg.
-    if let Some(states) = XDP_TX_STATES.get() {
+    // AF_XDP TX path: opt-in via DNSMARK_XDP_TX=1. It currently regresses to
+    // ~1k QPS (see dnsmark issue #3 — TX ring/wakeup/outstanding stall), so the
+    // DEFAULT is sendmmsg TX + AF_XDP RX — the hybrid that saturates the NIC.
+    let use_xdp_tx = std::env::var("DNSMARK_XDP_TX").map(|v| v == "1").unwrap_or(false);
+    if use_xdp_tx {
+      if let Some(states) = XDP_TX_STATES.get() {
         if !states.is_empty() {
             let state = states[worker_id % states.len()].clone();
             let ifl   = xdp_in_flight;
@@ -629,9 +660,10 @@ pub async fn run_xdp_sender_worker(
             tokio::task::spawn_blocking(move || { sender.join().ok(); }).await.ok();
             return;
         }
+      }
     }
 
-    // Fallback: regular UDP socket + sendmmsg.
+    // Fallback (default): regular UDP socket + sendmmsg TX, AF_XDP RX stays active.
     let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => { tracing::error!("XDP sender bind: {e}"); return; }
