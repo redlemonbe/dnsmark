@@ -53,24 +53,35 @@ impl FrameHeader {
     /// Returns total frame length. `out` must be >= OUTER_HDR + dns.len().
     #[inline]
     pub fn write_frame(&self, out: &mut [u8], dns: &[u8]) -> usize {
-        let total   = OUTER_HDR + dns.len();
-        let udp_len = (UDP_HDR + dns.len()) as u16;
+        let total = OUTER_HDR + dns.len();
+        debug_assert!(out.len() >= total);
+        // DNS payload
+        out[OUTER_HDR..total].copy_from_slice(dns);
+        self.write_header(out, dns.len())
+    }
+
+    /// Patch the Eth+IP+UDP header for a payload of `dns_len` bytes that the
+    /// caller has ALREADY written at `out[OUTER_HDR..OUTER_HDR + dns_len]`.
+    /// Zero-copy hot path: the DNS query is written straight into the UMEM frame
+    /// by the wire pool, then this stamps the headers — no intermediate buffer,
+    /// no double copy (the Runbound model).
+    #[inline]
+    pub fn write_header(&self, out: &mut [u8], dns_len: usize) -> usize {
+        let total   = OUTER_HDR + dns_len;
+        let udp_len = (UDP_HDR + dns_len) as u16;
         let ip_tot  = (IPV4_HDR as u16) + udp_len;
 
-        debug_assert!(out.len() >= total);
         out[..OUTER_HDR].copy_from_slice(&self.tpl);
         // IP total length
         out[ETH_HDR + 2] = (ip_tot >> 8) as u8;
         out[ETH_HDR + 3] = ip_tot as u8;
-        // IP checksum (header bytes [10..12] still 0 from template copy)
+        // IP checksum (header bytes [10..12] are 0 from the template copy)
         let cksum = ipv4_checksum(&out[ETH_HDR..ETH_HDR + IPV4_HDR]);
         out[ETH_HDR + 10] = (cksum >> 8) as u8;
         out[ETH_HDR + 11] = cksum as u8;
         // UDP length
         out[ETH_HDR + IPV4_HDR + 4] = (udp_len >> 8) as u8;
         out[ETH_HDR + IPV4_HDR + 5] = udp_len as u8;
-        // DNS payload
-        out[OUTER_HDR..total].copy_from_slice(dns);
         total
     }
 }

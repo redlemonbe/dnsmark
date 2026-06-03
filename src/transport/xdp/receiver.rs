@@ -453,6 +453,75 @@ fn xdp_tx_batch(state: &XdpTxState, dns_list: &[Vec<u8>]) -> usize {
     enqueued
 }
 
+/// Zero-alloc batched TX (the line-rate hot path). Pops up to `count` frames from
+/// the per-queue pool, writes each DNS query DIRECTLY into its UMEM frame via the
+/// wire pool (one SIMD copy, no intermediate Vec, no double copy), stamps the
+/// Eth/IP/UDP header, submits ALL descriptors in one produce_tx and kicks once.
+/// `descs`, `out_ids`, `addrs` are caller-owned reused scratch (no per-batch alloc).
+/// Generates ids from the worker's disjoint range. Returns the count placed on the ring.
+#[allow(clippy::too_many_arguments)]
+fn xdp_tx_batch_inline(
+    state:     &XdpTxState,
+    wire_pool: &WireQueryPool,
+    id_base:   u16,
+    id_span:   usize,
+    id_ctr:    &mut usize,
+    tmpl_idx:  &mut usize,
+    count:     usize,
+    descs:     &mut Vec<XdpDesc>,
+    out_ids:   &mut Vec<u16>,
+    addrs:     &mut Vec<u64>,
+) -> usize {
+    descs.clear();
+    out_ids.clear();
+    addrs.clear();
+    {
+        let mut pool = state.pool.lock();
+        let take = count.min(pool.len());
+        for _ in 0..take {
+            if let Some(a) = pool.pop() { addrs.push(a); }
+        }
+    }
+    if addrs.is_empty() { return 0; }
+
+    for &addr in addrs.iter() {
+        let id = id_base.wrapping_add((*id_ctr % id_span) as u16); *id_ctr += 1;
+        // SAFETY: addr is a valid frame offset popped from this queue's own pool;
+        //         the UMEM region [addr, addr+FRAME_SIZE) is mapped and owned solely
+        //         by this worker until it is recycled via the completion ring.
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(state.area.add(addr as usize), FRAME_SIZE as usize)
+        };
+        // Wire pool writes the DNS query straight into the frame payload region
+        // (after the 42-byte Eth/IP/UDP header) — no scratch buffer, no realloc.
+        let dns_len = wire_pool.write_with_index(*tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
+        *tmpl_idx += 1;
+        let total = state.hdr.write_header(buf, dns_len);
+        descs.push(XdpDesc { addr, len: total as u32, options: 0 });
+        out_ids.push(id);
+    }
+
+    let (enqueued, kick) = {
+        let tx = state.tx.lock();
+        let n = tx.produce_tx(descs);
+        (n, tx.needs_wakeup())
+    };
+    if enqueued < addrs.len() {
+        let mut pool = state.pool.lock();
+        for &a in &addrs[enqueued..] { pool.push(a); }
+    }
+    if enqueued > 0 && kick {
+        unsafe {
+            libc::sendto(
+                state.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
+                &state.sa as *const SockaddrXdp as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+            );
+        }
+    }
+    enqueued
+}
+
 #[allow(clippy::too_many_arguments)]
 fn xdp_tx_sender_thread(
     state:            Arc<XdpTxState>,
@@ -475,6 +544,12 @@ fn xdp_tx_sender_thread(
     let mut id_ctr: usize = 0;
     let mut tmpl_idx: usize = worker_id;        // private template cursor (no shared atomic)
     let mut single_buf = vec![0u8; MAX_QUERY];
+    // Reused per-worker scratch for the batched TX path — zero allocation in the hot
+    // loop. The old per-packet `vec![0u8; MAX_QUERY]` hammered the global allocator
+    // across cores and flat-lined throughput at ~700k regardless of core count.
+    let mut descs_scratch: Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
+    let mut ids_scratch:   Vec<u16>     = Vec::with_capacity(TX_BATCH);
+    let mut addrs_scratch: Vec<u64>     = Vec::with_capacity(TX_BATCH);
 
     // Sharded counters: accumulate locally, flush to the shared atomics only every
     // FLUSH_N sends. A per-batch fetch_add on stats.sent / global_in_flight bounces
@@ -545,21 +620,15 @@ fn xdp_tx_sender_thread(
                 TX_BATCH
             };
 
-            // Build the batch from the zero-alloc wire pool (SIMD copy, no String
-            // clone, no shared atomic), submit all at once (one ring submit, one kick).
-            let mut dns_batch: Vec<Vec<u8>> = Vec::with_capacity(headroom);
-            let mut ids: Vec<u16> = Vec::with_capacity(headroom);
-            for _ in 0..headroom {
-                let id  = id_base.wrapping_add((id_ctr % id_span) as u16); id_ctr += 1;
-                let mut b = vec![0u8; MAX_QUERY];
-                let len = wire_pool.write_with_index(tmpl_idx, id, &mut b); tmpl_idx += 1;
-                b.truncate(len);
-                dns_batch.push(b);
-                ids.push(id);
-            }
-            let sent = xdp_tx_batch(&state, &dns_batch);
+            // Zero-alloc batched TX: DNS written straight into the UMEM frames via
+            // the wire pool, reused scratch, one produce_tx + one kick. No per-packet
+            // allocation (the allocator contention that flat-lined the per-core scaling).
+            let sent = xdp_tx_batch_inline(
+                &state, &wire_pool, id_base, id_span, &mut id_ctr, &mut tmpl_idx,
+                headroom, &mut descs_scratch, &mut ids_scratch, &mut addrs_scratch,
+            );
             if sent > 0 {
-                for &id in ids.iter().take(sent) { in_flight.insert(id); }
+                for &id in ids_scratch.iter().take(sent) { in_flight.insert(id); }
                 local_sent += sent;
                 if local_sent >= FLUSH_N {
                     stats.inc_sent_n(local_sent);
