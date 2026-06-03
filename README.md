@@ -150,6 +150,12 @@ cores / 4.77M qps** just by enabling `udp4 sdfn` + the per-packet source-port
 variation (the 82599's RSS caps at 16 rings). Use `DNSMARK_FIXED_SPORT=1` to pin
 the source port (single-flow / single-core testing).
 
+> 📖 **Full 10G benchmarking methodology** — NIC tuning checklist, how to read NIC
+> counters correctly (AF_XDP ZC TX bypasses standard `tx_packets`), CPU-bound vs.
+> fill-ring bottleneck diagnosis, gotchas and a reference result (8.83 M qps on a
+> 2013 dual-Xeon):  
+> **[docs/benchmarking.md](docs/benchmarking.md)**
+
 ---
 
 ## Ramp mode
@@ -214,104 +220,3 @@ Statistics:
 
   Run time: 30.001 s
 ```
-
-> `--random` generates random UUID subdomain queries against `bench.invalid.` — NXDOMAIN is the expected response from a correct resolver. Use `-d queries.txt` to get NOERROR responses.
-
----
-
-## Flags
-
-### Core (dnsperf-compatible)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-s <IP>` | `127.0.0.1` | Target DNS server |
-| `-p <PORT>` | `53` | Target port |
-| `-d <FILE>` | — | Query file (`domain type` per line) |
-| `-c <N\|auto>` | `auto` | Workers (auto = physical cores, HT excluded) |
-| `-Q <QPS>` | `0` (unlimited) | Max QPS cap |
-| `-l <SEC>` | `30` | Test duration |
-| `-t <MS>` | `3000` | Query timeout |
-| `-q` | — | Quiet — no TUI, final result only |
-| `-v` | — | Verbose — log each query |
-
-### Extensions
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--ramp` | — | Auto ramp-up until saturation |
-| `--random` | — | Infinite random UUID subdomain queries |
-| `--random-domain <FQDN>` | `bench.invalid.` | Base domain for `--random` |
-| `--random-type a\|aaaa` | `a` | Record type for `--random` |
-| `--compare <IP>` | — | Parallel bench against a second server |
-| `--protocol udp\|tcp\|dot` | `udp` | Transport protocol |
-| `--json` | — | JSON output on stdout |
-| `--csv <FILE>` | — | Write per-interval CSV |
-| `--no-tui` | — | Disable live TUI dashboard |
-| `--max-outstanding <N>` | `100` | Max in-flight queries across all workers |
-| `--xdp` | — | Force AF/XDP (error if unavailable) |
-| `--no-xdp` | — | Disable AF/XDP |
-| `-S <SEC>` | `1` | Stats print interval |
-| `-T <N>` | num_cpus | Tokio worker threads |
-
----
-
-## Query file format
-
-One entry per line — same format as dnsperf:
-
-```
-example.com A
-example.com AAAA
-mail.example.com MX
-```
-
----
-
-## Build from source
-
-```bash
-# Standard build (no XDP)
-cargo build --release
-
-# With AF/XDP support (requires clang + libbpf-dev at build time only)
-apt install clang libbpf-dev
-cargo build --release --features xdp
-```
-
-Requires Rust 1.75+.
-
----
-
-## Contributing
-
-```bash
-cargo clippy --all-targets   # zero warnings
-cargo test                   # all tests must pass
-```
-
-Pull requests welcome.
-
----
-
-## Support the project
-
-[![Sponsor](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
-
-**Bitcoin** — `3FP8hkkiu4kwCD1PDFgAv2oq1ZTyXwy3yy`  
-**Ethereum** — `0xB5eEAf89edA4204Aa9305B068b37A93439cBb680`
-
-Security issues: redlemonbe@codix.be (private disclosure before opening a public issue)
-
----
-
-## License
-
-AGPL-3.0-only — see [LICENSE](LICENSE).
-
-Any use of dnsmark as part of a network service requires making the full source code available to users of that service, under the same license.
-
----
-
-*Part of the [RunSoftware](https://github.com/redlemonbe) stack — [Runbound](https://github.com/redlemonbe/Runbound) · [RunNginx](https://github.com/redlemonbe/RunNginx) · [RunAlexDB](https://github.com/redlemonbe/RunAlexDB)*  
-Copyright (C) 2026 RedLemonBe
