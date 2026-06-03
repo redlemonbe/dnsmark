@@ -236,10 +236,13 @@ fn xdp_unified_worker(
                             std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
                         );
                     }
+                    // global_in_flight gates max_outstanding: it MUST be accurate, so
+                    // increment per batch (not sharded). It is skipped entirely in flood
+                    // mode (max_outstanding==0). stats.sent stays sharded (no gate role).
+                    if max_outstanding > 0 { global_in_flight.fetch_add(enq, Ordering::Relaxed); }
                     local_sent += enq;
                     if local_sent >= FLUSH_N {
                         stats.inc_sent_n(local_sent);
-                        if max_outstanding > 0 { global_in_flight.fetch_add(local_sent, Ordering::Relaxed); }
                         local_sent = 0;
                     }
                 }
