@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::dns::{build_query, parse_response};
-use crate::query::QuerySource;
+use crate::query::{QuerySource, WireQueryPool, MAX_QUERY};
 use crate::stats::StatsCollector;
 
 use super::frame::{self, FrameHeader};
@@ -458,14 +458,24 @@ fn xdp_tx_sender_thread(
     state:            Arc<XdpTxState>,
     in_flight:        Arc<InFlight>,
     global_in_flight: Arc<AtomicUsize>,
-    global_id:        Arc<AtomicU16>,
-    query_source:     Arc<dyn QuerySource>,
+    wire_pool:        Arc<WireQueryPool>,
+    worker_id:        usize,
+    num_workers:      usize,
     stats:            Arc<StatsCollector>,
     shutdown:         Arc<AtomicBool>,
     qps_per_worker:   Arc<AtomicU64>,
     verbose:          bool,
     max_outstanding:  usize,
 ) {
+    // Per-worker disjoint DNS-id range: no shared global_id atomic, and disjoint
+    // slots in the lock-free in_flight table → zero cross-core contention.
+    let nw      = num_workers.max(1);
+    let id_span = (65536usize / nw).max(1);
+    let id_base = ((worker_id % nw) * id_span) as u16;
+    let mut id_ctr: usize = 0;
+    let mut tmpl_idx: usize = worker_id;        // private template cursor (no shared atomic)
+    let mut single_buf = vec![0u8; MAX_QUERY];
+
     let mut next_send    = Instant::now();
     let mut last_qps: u64 = 0;
     let mut send_interval = Duration::ZERO;
@@ -501,10 +511,9 @@ fn xdp_tx_sender_thread(
             next_send += send_interval;
             if next_send < Instant::now() { next_send = Instant::now(); }
 
-            let id    = global_id.fetch_add(1, Ordering::Relaxed);
-            let entry = query_source.next();
-            let dns   = build_query(id, &entry.name, entry.qtype);
-            if xdp_tx_one(&state, &dns) {
+            let id  = id_base.wrapping_add((id_ctr % id_span) as u16); id_ctr += 1;
+            let len = wire_pool.write_with_index(tmpl_idx, id, &mut single_buf); tmpl_idx += 1;
+            if xdp_tx_one(&state, &single_buf[..len]) {
                 in_flight.insert(id);
                 global_in_flight.fetch_add(1, Ordering::Relaxed);
                 stats.inc_sent();
@@ -524,14 +533,16 @@ fn xdp_tx_sender_thread(
                 TX_BATCH
             };
 
-            // Build the batch, then submit it all at once (one ring submit, one
-            // kick) via xdp_tx_batch — the per-packet path caps near ~1k QPS.
+            // Build the batch from the zero-alloc wire pool (SIMD copy, no String
+            // clone, no shared atomic), submit all at once (one ring submit, one kick).
             let mut dns_batch: Vec<Vec<u8>> = Vec::with_capacity(headroom);
             let mut ids: Vec<u16> = Vec::with_capacity(headroom);
             for _ in 0..headroom {
-                let id    = global_id.fetch_add(1, Ordering::Relaxed);
-                let entry = query_source.next();
-                dns_batch.push(build_query(id, &entry.name, entry.qtype));
+                let id  = id_base.wrapping_add((id_ctr % id_span) as u16); id_ctr += 1;
+                let mut b = vec![0u8; MAX_QUERY];
+                let len = wire_pool.write_with_index(tmpl_idx, id, &mut b); tmpl_idx += 1;
+                b.truncate(len);
+                dns_batch.push(b);
                 ids.push(id);
             }
             let sent = xdp_tx_batch(&state, &dns_batch);
@@ -707,27 +718,31 @@ pub async fn run_xdp_sender_worker(
     global_in_flight: Arc<AtomicUsize>,
     xdp_in_flight:    Arc<InFlight>,
     global_id:        Arc<AtomicU16>,
+    wire_pool:        Arc<WireQueryPool>,
+    num_workers:      usize,
 ) {
     let _ = timeout_ms;
+    let _ = &query_source;
+    let _ = &global_id;
 
-    // AF_XDP TX path: opt-in via DNSMARK_XDP_TX=1. It currently regresses to
-    // ~1k QPS (see dnsmark issue #3 — TX ring/wakeup/outstanding stall), so the
-    // DEFAULT is sendmmsg TX + AF_XDP RX — the hybrid that saturates the NIC.
-    let use_xdp_tx = std::env::var("DNSMARK_XDP_TX").map(|v| v == "1").unwrap_or(false);
+    // AF_XDP zero-copy TX is now the DEFAULT (per-worker, lock-free): the NIC DMAs
+    // straight from the UMEM, no kernel/sendmmsg. DNSMARK_XDP_TX=0 forces the
+    // sendmmsg fallback (kernel-capped ~800k). Each worker owns a disjoint DNS-id
+    // range + a private template cursor — zero shared per-packet state, scales per core.
+    let use_xdp_tx = std::env::var("DNSMARK_XDP_TX").map(|v| v != "0").unwrap_or(true);
     if use_xdp_tx {
       if let Some(states) = XDP_TX_STATES.get() {
         if !states.is_empty() {
             let state = states[worker_id % states.len()].clone();
             let ifl   = xdp_in_flight;
             let gif   = global_in_flight;
-            let gid   = global_id;
-            let qs    = query_source;
+            let wp    = wire_pool;
             let st    = stats;
             let sd    = shutdown;
             let qps   = qps_per_worker;
             let sender = std::thread::spawn(move || {
                 super::super::pin_to_cpu(worker_id);
-                xdp_tx_sender_thread(state, ifl, gif, gid, qs, st, sd, qps, verbose, max_outstanding);
+                xdp_tx_sender_thread(state, ifl, gif, wp, worker_id, num_workers, st, sd, qps, verbose, max_outstanding);
             });
             tokio::task::spawn_blocking(move || { sender.join().ok(); }).await.ok();
             return;

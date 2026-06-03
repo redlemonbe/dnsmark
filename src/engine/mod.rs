@@ -162,10 +162,12 @@ pub async fn run_with_shutdown(
             let gif = global_in_flight.clone();
             let xif = xdp_in_flight.clone();
             let xid = xdp_global_id.clone();
+            let wp  = wire_pool.clone();
+            let nw  = config.concurrent;
 
             handles.push(tokio::spawn(crate::transport::xdp::run_xdp_sender_worker(
                 server_addr, qs, st, sd, cfg.timeout_ms, qps, cfg.verbose, i,
-                cfg.max_outstanding, gif, xif, xid,
+                cfg.max_outstanding, gif, xif, xid, wp, nw,
             )));
         }
     }
