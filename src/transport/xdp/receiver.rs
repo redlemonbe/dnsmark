@@ -46,6 +46,53 @@ const ETH_P_IP:   u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const PROTO_UDP:   u8 = 17;
 
+// ── Lock-free in-flight table ──────────────────────────────────────────────
+//
+// Indexed directly by the 16-bit DNS transaction id (65536 slots). Replaces the
+// shared `Mutex<HashMap>` whose lock was hammered by every worker on every
+// packet (the contention that collapsed throughput). Each slot is an AtomicU64
+// holding the send time in ns since `base` (0 = free). Senders store, the
+// receiver swaps-to-0 and computes the RTT — fully lock-free, no per-packet lock.
+pub struct InFlight {
+    base:  Instant,
+    slots: Box<[AtomicU64]>, // len = 65536
+}
+
+impl InFlight {
+    pub fn new() -> Self {
+        let slots = (0..65536).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice();
+        InFlight { base: Instant::now(), slots }
+    }
+    #[inline]
+    pub fn insert(&self, id: u16) {
+        let t = (self.base.elapsed().as_nanos() as u64).max(1); // never 0 when occupied
+        self.slots[id as usize].store(t, Ordering::Relaxed);
+    }
+    /// Mark `id` received; returns RTT in microseconds if it was outstanding.
+    #[inline]
+    pub fn take(&self, id: u16) -> Option<u64> {
+        let prev = self.slots[id as usize].swap(0, Ordering::Relaxed);
+        if prev == 0 { return None; }
+        let now = self.base.elapsed().as_nanos() as u64;
+        Some(now.saturating_sub(prev) / 1000)
+    }
+    /// Expire slots older than `timeout`; returns the count expired.
+    pub fn sweep(&self, timeout: Duration) -> usize {
+        let now = self.base.elapsed().as_nanos() as u64;
+        let to  = timeout.as_nanos() as u64;
+        let mut n = 0;
+        for s in self.slots.iter() {
+            let v = s.load(Ordering::Relaxed);
+            if v != 0 && now.saturating_sub(v) > to
+                && s.compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
 // ── XDP TX state ─────────────────────────────────────────────────────────
 
 /// Per-NIC-queue TX state shared by sender workers assigned to that queue.
@@ -102,7 +149,7 @@ fn parse_dns_from_frame(frame: &[u8]) -> Option<(u16, u8)> {
 
 fn xdp_receiver_thread(
     sock:            XskSocket,
-    in_flight:       Arc<Mutex<HashMap<u16, Instant>>>,
+    in_flight:       Arc<InFlight>,
     global_in_flight: Arc<AtomicUsize>,
     stats:           Arc<StatsCollector>,
     shutdown:        Arc<AtomicBool>,
@@ -141,13 +188,9 @@ fn xdp_receiver_thread(
             // Timeout sweep while idle.
             let now = Instant::now();
             if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-                let mut expired = 0usize;
-                let mut map = in_flight.lock();
-                map.retain(|_, sent_at| {
-                    if now.duration_since(*sent_at) > timeout_dur { stats.inc_timeout(); expired += 1; false } else { true }
-                });
-                drop(map);
+                let expired = in_flight.sweep(timeout_dur);
                 if expired > 0 {
+                    for _ in 0..expired { stats.inc_timeout(); }
                     global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(expired))).ok();
                 }
                 last_timeout_check = now;
@@ -157,18 +200,15 @@ fn xdp_receiver_thread(
         idle_spins = 0;
 
         {
-            let now = Instant::now();
             let mut completed = 0usize;
 
             {
-                let mut map = in_flight.lock();
                 let mut recycle: Vec<u64> = Vec::with_capacity(descs.len());
 
                 for desc in &descs {
                     let frame = unsafe { sock.umem.frame(desc.addr, desc.len as usize) };
                     if let Some((id, rcode)) = parse_dns_from_frame(frame) {
-                        if let Some(sent_at) = map.remove(&id) {
-                            let rtt_us = now.duration_since(sent_at).as_micros() as u64;
+                        if let Some(rtt_us) = in_flight.take(id) {
                             stats.record_response(rcode, rtt_us);
                             completed += 1;
                         }
@@ -192,18 +232,9 @@ fn xdp_receiver_thread(
         // Expire timed-out queries every 10 ms.
         let now = Instant::now();
         if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-            let mut expired = 0usize;
-            let mut map = in_flight.lock();
-            map.retain(|_, sent_at| {
-                if now.duration_since(*sent_at) > timeout_dur {
-                    stats.inc_timeout();
-                    expired += 1;
-                    false
-                } else {
-                    true
-                }
-            });
+            let expired = in_flight.sweep(timeout_dur);
             if expired > 0 {
+                for _ in 0..expired { stats.inc_timeout(); }
                 global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
                     Some(x.saturating_sub(expired))
                 }).ok();
@@ -222,7 +253,7 @@ fn xdp_receiver_thread(
 #[allow(clippy::too_many_arguments)]
 fn xdp_sender_thread(
     fd:               i32,
-    in_flight:        Arc<Mutex<HashMap<u16, Instant>>>,
+    in_flight:        Arc<InFlight>,
     global_in_flight: Arc<AtomicUsize>,
     global_id:        Arc<AtomicU16>,
     query_source:     Arc<dyn QuerySource>,
@@ -270,7 +301,7 @@ fn xdp_sender_thread(
                 libc::send(fd, qbytes.as_ptr() as *const libc::c_void, qbytes.len(), 0)
             };
             if ret >= 0 {
-                in_flight.lock().insert(id, Instant::now());
+                in_flight.insert(id);
                 global_in_flight.fetch_add(1, Ordering::Relaxed);
                 stats.inc_sent();
                 if verbose {
@@ -324,10 +355,8 @@ fn xdp_sender_thread(
             let sent = if sent < 0 { 0usize } else { sent as usize };
 
             if sent > 0 {
-                let send_time = Instant::now();
-                let mut map = in_flight.lock();
                 for &id in ids.iter().take(sent) {
-                    map.insert(id, send_time);
+                    in_flight.insert(id);
                 }
                 global_in_flight.fetch_add(sent, Ordering::Relaxed);
                 stats.inc_sent_n(sent);
@@ -381,10 +410,53 @@ fn xdp_tx_one(state: &XdpTxState, dns: &[u8]) -> bool {
     true
 }
 
+/// Batched XDP TX: pop up to `dns_list.len()` frames in one lock, write each
+/// query as a full Ethernet frame, submit ALL descriptors in ONE produce_tx(),
+/// and kick the driver ONCE. Returns how many queries were placed on the ring.
+/// The per-packet path (xdp_tx_one) caps near ~1k QPS; this is the line-rate path.
+fn xdp_tx_batch(state: &XdpTxState, dns_list: &[Vec<u8>]) -> usize {
+    let mut addrs: Vec<u64> = {
+        let mut pool = state.pool.lock();
+        let take = dns_list.len().min(pool.len());
+        let start = pool.len() - take;
+        pool.split_off(start)
+    };
+    if addrs.is_empty() { return 0; }
+
+    let mut descs: Vec<XdpDesc> = Vec::with_capacity(addrs.len());
+    for (i, &addr) in addrs.iter().enumerate() {
+        let frame_len = unsafe {
+            let buf = std::slice::from_raw_parts_mut(state.area.add(addr as usize), FRAME_SIZE as usize);
+            state.hdr.write_frame(buf, &dns_list[i])
+        };
+        descs.push(XdpDesc { addr, len: frame_len as u32, options: 0 });
+    }
+
+    let (enqueued, kick) = {
+        let tx = state.tx.lock();
+        let n = tx.produce_tx(&descs);
+        (n, tx.needs_wakeup())
+    };
+    if enqueued < addrs.len() {
+        let mut pool = state.pool.lock();
+        for &a in &addrs[enqueued..] { pool.push(a); }
+    }
+    if enqueued > 0 && kick {
+        unsafe {
+            libc::sendto(
+                state.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
+                &state.sa as *const SockaddrXdp as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+            );
+        }
+    }
+    enqueued
+}
+
 #[allow(clippy::too_many_arguments)]
 fn xdp_tx_sender_thread(
     state:            Arc<XdpTxState>,
-    in_flight:        Arc<Mutex<HashMap<u16, Instant>>>,
+    in_flight:        Arc<InFlight>,
     global_in_flight: Arc<AtomicUsize>,
     global_id:        Arc<AtomicU16>,
     query_source:     Arc<dyn QuerySource>,
@@ -433,7 +505,7 @@ fn xdp_tx_sender_thread(
             let entry = query_source.next();
             let dns   = build_query(id, &entry.name, entry.qtype);
             if xdp_tx_one(&state, &dns) {
-                in_flight.lock().insert(id, Instant::now());
+                in_flight.insert(id);
                 global_in_flight.fetch_add(1, Ordering::Relaxed);
                 stats.inc_sent();
                 if verbose { tracing::debug!(id, "XDP TX sent query"); }
@@ -452,23 +524,19 @@ fn xdp_tx_sender_thread(
                 TX_BATCH
             };
 
-            let send_time = Instant::now();
-            let mut sent  = 0usize;
-            {
-                let mut map = in_flight.lock();
-                for _ in 0..headroom {
-                    let id    = global_id.fetch_add(1, Ordering::Relaxed);
-                    let entry = query_source.next();
-                    let dns   = build_query(id, &entry.name, entry.qtype);
-                    if xdp_tx_one(&state, &dns) {
-                        map.insert(id, send_time);
-                        sent += 1;
-                    } else {
-                        break; // pool empty
-                    }
-                }
+            // Build the batch, then submit it all at once (one ring submit, one
+            // kick) via xdp_tx_batch — the per-packet path caps near ~1k QPS.
+            let mut dns_batch: Vec<Vec<u8>> = Vec::with_capacity(headroom);
+            let mut ids: Vec<u16> = Vec::with_capacity(headroom);
+            for _ in 0..headroom {
+                let id    = global_id.fetch_add(1, Ordering::Relaxed);
+                let entry = query_source.next();
+                dns_batch.push(build_query(id, &entry.name, entry.qtype));
+                ids.push(id);
             }
+            let sent = xdp_tx_batch(&state, &dns_batch);
             if sent > 0 {
+                for &id in ids.iter().take(sent) { in_flight.insert(id); }
                 global_in_flight.fetch_add(sent, Ordering::Relaxed);
                 stats.inc_sent_n(sent);
             } else {
@@ -495,7 +563,7 @@ pub fn start_xdp_receive_path(
     iface:            &str,
     server:           IpAddr,
     server_port:      u16,
-    in_flight:        Arc<Mutex<HashMap<u16, Instant>>>,
+    in_flight:        Arc<InFlight>,
     global_in_flight: Arc<AtomicUsize>,
     stats:            Arc<StatsCollector>,
     shutdown:         Arc<AtomicBool>,
@@ -533,7 +601,7 @@ fn do_start_xdp_receive_path(
     iface:            &str,
     server:           IpAddr,
     server_port:      u16,
-    in_flight:        Arc<Mutex<HashMap<u16, Instant>>>,
+    in_flight:        Arc<InFlight>,
     global_in_flight: Arc<AtomicUsize>,
     stats:            Arc<StatsCollector>,
     shutdown:         Arc<AtomicBool>,
@@ -561,9 +629,13 @@ fn do_start_xdp_receive_path(
     let mut tx_states: Vec<Arc<XdpTxState>> = Vec::new();
 
     for q in 0..queue_count {
-        let mut sock = unsafe { create_xsk_socket(ifidx, q, true) }
-            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
-            .map_err(|e| format!("AF_XDP socket q={q}: {e}"))?;
+        let mut sock = match unsafe { create_xsk_socket(ifidx, q, true) } {
+            Ok(s) => { tracing::info!(queue = q, "AF_XDP bound ZERO-COPY"); s }
+            Err(zc_err) => match unsafe { create_xsk_socket(ifidx, q, false) } {
+                Ok(s) => { tracing::warn!(queue = q, %zc_err, "AF_XDP zero-copy FAILED — fell back to COPY mode (slow)"); s }
+                Err(e) => return Err(format!("AF_XDP socket q={q}: {e}")),
+            },
+        };
 
         handle.register_socket(q, sock.fd)?;
 
@@ -633,7 +705,7 @@ pub async fn run_xdp_sender_worker(
     worker_id:        usize,
     max_outstanding:  usize,
     global_in_flight: Arc<AtomicUsize>,
-    xdp_in_flight:    Arc<Mutex<HashMap<u16, Instant>>>,
+    xdp_in_flight:    Arc<InFlight>,
     global_id:        Arc<AtomicU16>,
 ) {
     let _ = timeout_ms;

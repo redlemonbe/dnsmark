@@ -79,9 +79,11 @@ pub async fn run_with_shutdown(
     // Keeping it alive until the function returns ensures the XDP program
     // stays attached for the entire benchmark run.
 
-    // Shared in_flight and global ID counter — used only when XDP is active.
+    // Lock-free in-flight table + global ID counter — used only when XDP is active.
     // Declared here so they outlive the spawn loop.
-    let xdp_in_flight: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    #[cfg(feature = "xdp")]
+    let xdp_in_flight = Arc::new(crate::transport::xdp::InFlight::new());
+    #[cfg(feature = "xdp")]
     let xdp_global_id = Arc::new(AtomicU16::new(rand::random::<u16>()));
 
     // xdp_active = Some(XdpHandle) when XDP is running, None otherwise.
