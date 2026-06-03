@@ -171,10 +171,12 @@ fn xdp_unified_worker(
     let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
     let mut last_timeout = Instant::now();
 
-    // qps pacing (per-worker rate limit); 0 = unlimited flood.
-    let mut next_send     = Instant::now();
-    let mut last_qps: u64 = 0;
-    let mut send_interval = Duration::ZERO;
+    // qps pacing as a token bucket (0 = unlimited flood). Tokens accrue at the
+    // target rate independently of how fast this loop spins, so the send rate is
+    // exact even though the worker also drains RX every iteration (a fixed
+    // "1 packet when due" cadence collapsed to the loop's iteration rate).
+    let mut tokens: f64 = 0.0;
+    let mut last_refill = Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) { break; }
@@ -186,13 +188,13 @@ fn xdp_unified_worker(
         // 2) Decide how many to TX this iteration (rate / backpressure gate).
         let qps = qps_per_worker.load(Ordering::Relaxed);
         let mut headroom = if qps > 0 {
-            if qps != last_qps {
-                send_interval = Duration::from_secs_f64(1.0 / qps as f64);
-                next_send = Instant::now();
-                last_qps = qps;
-            }
             let now = Instant::now();
-            if now < next_send { 0 } else { next_send += send_interval; 1 }
+            tokens = (tokens + now.duration_since(last_refill).as_secs_f64() * qps as f64)
+                .min(TX_BATCH as f64);
+            last_refill = now;
+            let n = tokens.floor();
+            tokens -= n;
+            n as usize
         } else {
             TX_BATCH
         };
