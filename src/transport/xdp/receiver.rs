@@ -501,16 +501,20 @@ fn xdp_tx_batch_inline(
         out_ids.push(id);
     }
 
-    let (enqueued, kick) = {
+    let enqueued = {
         let tx = state.tx.lock();
-        let n = tx.produce_tx(descs);
-        (n, tx.needs_wakeup())
+        tx.produce_tx(descs)
     };
     if enqueued < addrs.len() {
         let mut pool = state.pool.lock();
         for &a in &addrs[enqueued..] { pool.push(a); }
     }
-    if enqueued > 0 && kick {
+    // ALWAYS kick on a TX-only flood. NEED_WAKEUP can report "no wakeup needed"
+    // while no NAPI is running (there is no RX traffic to trigger the softirq on a
+    // pure generator), so frames would sit unsent in the TX ring → throughput
+    // plateaus and turns noisy. An unconditional sendto kick guarantees the driver
+    // services the queue every batch.
+    if enqueued > 0 {
         unsafe {
             libc::sendto(
                 state.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
