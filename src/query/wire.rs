@@ -4,16 +4,14 @@
 // pre-built template (~30–60 bytes) and patches 2 bytes (the transaction ID).
 // No heap allocation, no String parsing, no label-splitting in the hot path.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 /// Maximum DNS query wire length we support (standard 512-byte UDP limit).
 pub const MAX_QUERY: usize = 512;
 
-/// Round-robin pool of pre-built DNS wire queries (transaction ID = 0x00 0x00).
-/// Thread-safe: `index` uses relaxed atomics — drift is fine for a benchmark.
+/// Pool of pre-built DNS wire queries (transaction ID = 0x00 0x00). The round-robin
+/// cursor is **caller-owned** (a per-worker local counter), so worker threads share
+/// only the read-only `templates` — no shared atomic, no cross-core cache-line bounce.
 pub struct WireQueryPool {
     templates: Vec<Box<[u8]>>,
-    index: AtomicUsize,
 }
 
 impl WireQueryPool {
@@ -24,29 +22,12 @@ impl WireQueryPool {
             .iter()
             .map(|(name, qtype)| build_wire_template(name, *qtype))
             .collect();
-        Self { templates, index: AtomicUsize::new(0) }
+        Self { templates }
     }
 
-    /// Write the next template (round-robin) into `buf`, patch transaction ID,
-    /// return the number of bytes written. `buf` must be >= MAX_QUERY bytes.
-    /// Uses SIMD-accelerated copy (AVX2 → SSE2 → scalar, runtime dispatch).
-    #[inline]
-    pub fn write_next_with_id(&self, id: u16, buf: &mut [u8]) -> usize {
-        let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.templates.len();
-        let tmpl = &self.templates[idx];
-        let len = tmpl.len();
-        // SIMD dispatch: AVX2 (Threadripper) → SSE2 (Xeon v2) → scalar
-        crate::simd::memcpy_dispatch(&mut buf[..len], tmpl);
-        // Patch transaction ID — always 2 scalar bytes regardless of SIMD level
-        buf[0] = (id >> 8) as u8;
-        buf[1] = id as u8;
-        len
-    }
-
-    /// Same as `write_next_with_id` but the round-robin cursor is **caller-owned**
-    /// (a per-worker local counter) instead of the shared `AtomicUsize`. Removes
-    /// the cross-core cache-line contention that collapsed throughput past ~4
-    /// workers. `templates` stays shared read-only.
+    /// Write the template at caller-owned cursor `local_idx` (mod len) into `buf`,
+    /// patch the transaction ID, return the bytes written. `buf` must be >= the
+    /// template length. SIMD-accelerated copy (AVX2 → SSE2 → scalar, runtime dispatch).
     #[inline]
     pub fn write_with_index(&self, local_idx: usize, id: u16, buf: &mut [u8]) -> usize {
         let idx = local_idx % self.templates.len();
@@ -90,7 +71,7 @@ mod tests {
     fn roundtrip_id_patch() {
         let pool = WireQueryPool::from_pairs(&[("example.com".to_string(), 1)]);
         let mut buf = [0u8; MAX_QUERY];
-        let len = pool.write_next_with_id(0xBEEF, &mut buf);
+        let len = pool.write_with_index(0, 0xBEEF, &mut buf);
         assert_eq!(buf[0], 0xBE);
         assert_eq!(buf[1], 0xEF);
         assert!(len > 12); // at least header + qname + qtype + qclass
@@ -103,11 +84,11 @@ mod tests {
             ("b.com".to_string(), 1),
         ]);
         let mut buf = [0u8; MAX_QUERY];
-        let l1 = pool.write_next_with_id(1, &mut buf);
+        let l1 = pool.write_with_index(0, 1, &mut buf);
         let mut b1 = [0u8; MAX_QUERY];
         b1[..l1].copy_from_slice(&buf[..l1]);
-        let _l2 = pool.write_next_with_id(2, &mut buf);
-        let l3 = pool.write_next_with_id(3, &mut buf);
+        let _l2 = pool.write_with_index(1, 2, &mut buf);
+        let l3 = pool.write_with_index(2, 3, &mut buf);
         // Third call should match first (same length)
         assert_eq!(l3, l1);
     }
@@ -116,7 +97,7 @@ mod tests {
     fn wire_format_structure() {
         let pool = WireQueryPool::from_pairs(&[("www.example.com".to_string(), 1)]);
         let mut buf = [0u8; MAX_QUERY];
-        let len = pool.write_next_with_id(0x0042, &mut buf);
+        let len = pool.write_with_index(0, 0x0042, &mut buf);
         // Header: ID + flags + counts = 12 bytes
         assert!(len >= 12);
         // QR=0 (query), RD=1

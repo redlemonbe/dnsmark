@@ -3,7 +3,6 @@ pub mod ramp;
 pub mod receiver;
 pub mod sender;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
@@ -12,7 +11,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use parking_lot::Mutex;
 
 use crate::config::{Config, Protocol};
 use crate::query::{file::FileQuerySource, random::RandomQuerySource, QuerySource, WireQueryPool};

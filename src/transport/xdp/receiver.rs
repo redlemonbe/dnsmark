@@ -11,7 +11,6 @@
 // at the NIC driver level and redirects them into the AF_XDP ring buffer,
 // bypassing the kernel network stack entirely.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
@@ -578,49 +577,6 @@ fn xdp_tx_one(state: &XdpTxState, dns: &[u8]) -> bool {
     true
 }
 
-/// Batched XDP TX: pop up to `dns_list.len()` frames in one lock, write each
-/// query as a full Ethernet frame, submit ALL descriptors in ONE produce_tx(),
-/// and kick the driver ONCE. Returns how many queries were placed on the ring.
-/// The per-packet path (xdp_tx_one) caps near ~1k QPS; this is the line-rate path.
-fn xdp_tx_batch(state: &XdpTxState, dns_list: &[Vec<u8>]) -> usize {
-    let mut addrs: Vec<u64> = {
-        let mut pool = state.pool.lock();
-        let take = dns_list.len().min(pool.len());
-        let start = pool.len() - take;
-        pool.split_off(start)
-    };
-    if addrs.is_empty() { return 0; }
-
-    let mut descs: Vec<XdpDesc> = Vec::with_capacity(addrs.len());
-    for (i, &addr) in addrs.iter().enumerate() {
-        let frame_len = unsafe {
-            let buf = std::slice::from_raw_parts_mut(state.area.add(addr as usize), FRAME_SIZE as usize);
-            state.hdr.write_frame(buf, &dns_list[i])
-        };
-        descs.push(XdpDesc { addr, len: frame_len as u32, options: 0 });
-    }
-
-    let (enqueued, kick) = {
-        let tx = state.tx.lock();
-        let n = tx.produce_tx(&descs);
-        (n, tx.needs_wakeup())
-    };
-    if enqueued < addrs.len() {
-        let mut pool = state.pool.lock();
-        for &a in &addrs[enqueued..] { pool.push(a); }
-    }
-    if enqueued > 0 && kick {
-        unsafe {
-            libc::sendto(
-                state.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
-                &state.sa as *const SockaddrXdp as *const libc::sockaddr,
-                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
-            );
-        }
-    }
-    enqueued
-}
-
 /// Zero-alloc batched TX (the line-rate hot path). Pops up to `count` frames from
 /// the per-queue pool, writes each DNS query DIRECTLY into its UMEM frame via the
 /// wire pool (one SIMD copy, no intermediate Vec, no double copy), stamps the
@@ -833,6 +789,7 @@ fn xdp_tx_sender_thread(
 ///
 /// The receiver thread exits when `shutdown` is set to true.
 /// The XdpHandle must stay alive for the duration of the test.
+#[allow(clippy::too_many_arguments)]
 pub fn start_xdp_receive_path(
     iface:            &str,
     server:           IpAddr,
@@ -899,6 +856,7 @@ fn pin_thread_to(cpu: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_start_xdp_receive_path(
     iface:            &str,
     server:           IpAddr,

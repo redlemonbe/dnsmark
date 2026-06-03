@@ -95,8 +95,8 @@ pub fn numa_node_for_cpu(cpu_id: usize) -> Option<usize> {
     for entry in std::fs::read_dir(&dir).ok()? {
         let name = entry.ok()?.file_name();
         let s = name.to_string_lossy();
-        if s.starts_with("node") {
-            if let Ok(n) = s[4..].parse::<usize>() {
+        if let Some(rest) = s.strip_prefix("node") {
+            if let Ok(n) = rest.parse::<usize>() {
                 return Some(n);
             }
         }
