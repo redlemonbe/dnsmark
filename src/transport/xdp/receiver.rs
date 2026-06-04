@@ -152,6 +152,7 @@ pub struct UnifiedCfg {
     pub wire_pool:       Arc<WireQueryPool>,
     pub qps_per_worker:  Arc<AtomicU64>,
     pub max_outstanding: usize,
+    pub total_qps:       u64,   // used to recalibrate per-worker rate after spawn
 }
 static UNIFIED_CFG: OnceLock<UnifiedCfg> = OnceLock::new();
 
@@ -975,6 +976,7 @@ fn do_start_xdp_receive_path(
 
     let queue_count = get_rx_queue_count(iface);
     let mut tx_states: Vec<Arc<XdpTxState>> = Vec::new();
+    let mut n_unified: usize = 0;
 
     // NIC-local NUMA node + logical CPUs. The UMEM is bound here and the receiver
     // threads are pinned to local HT siblings so neither the DMA nor the response
@@ -1031,6 +1033,7 @@ fn do_start_xdp_receive_path(
             let mo  = cfg.max_outstanding;
             let qc  = queue_count as usize;
             XDP_UNIFIED.store(true, Ordering::Relaxed);
+            n_unified += 1;
             std::thread::Builder::new()
                 .name(format!("xdp-worker-q{q}"))
                 .spawn(move || {
@@ -1085,6 +1088,23 @@ fn do_start_xdp_receive_path(
     if !tx_states.is_empty() {
         XDP_TX_STATES.set(tx_states).ok();
         tracing::info!("[XDP TX] TX ring active on {} queue(s)", queue_count);
+    }
+
+    // Recalibrate qps_per_worker based on the number of workers actually spawned.
+    // engine/mod.rs computed initial_qps_per_worker = total_qps / concurrent, but
+    // queue_count may be < concurrent (e.g. 1-queue virtio-net with -c 8 gives 1
+    // worker instead of 8 → each worker should get total_qps/1, not total_qps/8).
+    if n_unified > 0 {
+        if let Some(cfg) = UNIFIED_CFG.get() {
+            let total = cfg.total_qps;
+            if total > 0 {
+                let per_worker = (total / n_unified as u64).max(1);
+                cfg.qps_per_worker.store(per_worker, Ordering::Relaxed);
+                tracing::info!(
+                    "qps_per_worker recalibrated: {total}/{n_unified}={per_worker}"
+                );
+            }
+        }
     }
 
     Ok(handle)

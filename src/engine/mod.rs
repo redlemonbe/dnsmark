@@ -104,6 +104,7 @@ pub async fn run_with_shutdown(
                 wire_pool:       wire_pool.clone(),
                 qps_per_worker:  shared_qps.clone(),
                 max_outstanding: config.max_outstanding,
+                total_qps:       config.qps,
             });
         }
 
