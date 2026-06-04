@@ -33,9 +33,10 @@ the hot path except one atomic counter for the global outstanding gate; each own
 own socket, its own in-flight table, and its own send/receive loop.
 
 - For UDP/TCP/DoT, N = `--clients` (`-c`).
-- For AF_XDP, N is **auto-detected** from the NIC: one worker per RX queue, capped to
-  the NIC-local physical cores (`get_rx_queue_count`, `numa_node_for_iface`), pinned to
-  the lower-half (physical, non-HT) cores of the NIC's NUMA node.
+- For AF_XDP, N is **auto-detected** from the NIC: one worker per RX queue
+  (`get_rx_queue_count`), each pinned to a **physical** core on the NIC's NUMA node
+  (`numa_node_for_iface`) — the lower half of that node's logical CPUs, never an HT
+  sibling; if there are more queues than physical cores the pinning wraps.
 
 The target rate is divided by the number of **actually spawned** workers, not by
 `--clients`, so a low-queue NIC still drives the full target
