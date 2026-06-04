@@ -287,19 +287,25 @@ tool's self-reported RTT to it.
 
 **Results** (identical settings per row; `dnsmark` = default UDP):
 
-| Bench | Server | Wire (tcpdump) | dnsmark | dnsperf |
+| Bench | Generator → Server | Wire (tcpdump) | dnsmark | dnsperf |
 |---|---|---:|---:|---:|
-| virtio VM, controlled | Unbound | 19 µs | 62 µs | 90 µs |
-| virtio VM, controlled | BIND | 35 µs | 83 µs | 104 µs |
-| **X520 10 GbE bare-metal**, 100k qps | Unbound | **17 µs** | **44 µs** | **103 µs** |
+| virtio VM, controlled | — → Unbound | 19 µs | 62 µs | 90 µs |
+| virtio VM, controlled | — → BIND | 35 µs | 83 µs | 104 µs |
+| **X520 10 GbE bare-metal**, 100k qps | Threadripper → Unbound (Xeon) | **17 µs** | **44 µs** | **103 µs** |
+| **X520 10 GbE bare-metal**, 100k qps | Xeon → Unbound (Threadripper) | **10 µs** | **56 µs** | **77 µs** |
 
-**Reading it:** each tool adds a roughly **constant** generator overhead — dnsmark
-~25–45 µs, dnsperf ~70–86 µs — independent of the server. dnsmark sits consistently
-closer to the wire on every server and every rig, so its **absolute** latency is more
-accurate. Because the offset is constant, both tools **rank** servers identically (it
-cancels in a comparison). On a fast generator (Threadripper) over real 10 GbE,
-dnsperf's overhead dominates: it reports 103 µs where the server actually answers in
-17 µs and a lean generator measures 44 µs.
+**Reading it:** in every case dnsmark **and** dnsperf report *more* than the wire — as
+they must, the RTT includes the server's processing — and dnsmark sits **closer to the
+wire** on every server, every rig, and in **both directions** (generator/receiver
+swapped). Neither tool under-measures; dnsmark is simply leaner, so its **absolute**
+latency is more faithful.
+
+**The gap is generator-dependent, not a universal constant.** dnsperf−dnsmark is ~59 µs
+when the *generator* is the fast Threadripper but only ~21 µs when it is the older Xeon:
+dnsmark's tight loop benefits fully from a fast CPU (overhead drops to ~27 µs), dnsperf's
+does not. However, for a **fixed generator** the offset is stable *across servers* (VM:
+constant ~28 µs over Unbound and BIND), so server **rankings** are preserved. Practical
+rule: **use one fixed generator per campaign, and anchor latency on the wire capture.**
 
 **Conclusion:** anchor latency claims on the wire capture; use dnsperf as a *relative*
 cross-check, not an absolute reference. dnsmark is the more faithful absolute meter.
