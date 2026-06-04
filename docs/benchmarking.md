@@ -268,6 +268,49 @@ hardware would require tuning the AF_XDP buffer pipeline, not the DNS logic.
 
 ---
 
+## 7. Latency accuracy — validated against the wire
+
+A load generator's *reported* latency is **server processing time + the generator's
+own client-side overhead**. Two different tools add different overhead, so their
+**absolute** latency is not directly comparable — and neither tool is ground truth.
+The only ground truth is the **wire**: a `tcpdump` capture **on the server**, pairing
+each query with its response by DNS transaction id, gives the server's true
+processing time, independent of any tool.
+
+dnsmark's default transport is the UDP kernel socket (same datapath as dnsperf), so
+its latency is comparable to dnsperf — but we validate it against the wire, not
+against dnsperf.
+
+**Method:** `tcpdump -i <iface> -tt -nn udp port 53` on the receiver during the run;
+pair `query`→`response` by txid; the delta is server-side processing. Compare each
+tool's self-reported RTT to it.
+
+**Results** (identical settings per row; `dnsmark` = default UDP):
+
+| Bench | Server | Wire (tcpdump) | dnsmark | dnsperf |
+|---|---|---:|---:|---:|
+| virtio VM, controlled | Unbound | 19 µs | 62 µs | 90 µs |
+| virtio VM, controlled | BIND | 35 µs | 83 µs | 104 µs |
+| **X520 10 GbE bare-metal**, 100k qps | Unbound | **17 µs** | **44 µs** | **103 µs** |
+
+**Reading it:** each tool adds a roughly **constant** generator overhead — dnsmark
+~25–45 µs, dnsperf ~70–86 µs — independent of the server. dnsmark sits consistently
+closer to the wire on every server and every rig, so its **absolute** latency is more
+accurate. Because the offset is constant, both tools **rank** servers identically (it
+cancels in a comparison). On a fast generator (Threadripper) over real 10 GbE,
+dnsperf's overhead dominates: it reports 103 µs where the server actually answers in
+17 µs and a lean generator measures 44 µs.
+
+**Conclusion:** anchor latency claims on the wire capture; use dnsperf as a *relative*
+cross-check, not an absolute reference. dnsmark is the more faithful absolute meter.
+
+> **txid caveat:** the wire pairing uses the 16-bit DNS id, which recycles at high
+> qps (~9× over 600k queries), so the wire **tail** (p99/p999) is noisy from
+> mispairing — anchor on the wire **p50**, which is robust. Each tool's own tail is
+> reliable (matched by internal per-query state, not by sniffing).
+
+---
+
 *This document was compiled from observed measurements. All figures are deltas
 from NIC hardware counters (`ethtool -S`) over timed windows, not application-level
 counters.*
