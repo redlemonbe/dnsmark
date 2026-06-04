@@ -146,8 +146,6 @@ fn xdp_unified_worker(
     hdr:              FrameHeader,
     sa:               SockaddrXdp,
     wire_pool:        Arc<WireQueryPool>,
-    in_flight:        Arc<InFlight>,
-    global_in_flight: Arc<AtomicUsize>,
     stats:            Arc<StatsCollector>,
     shutdown:         Arc<AtomicBool>,
     qps_per_worker:   Arc<AtomicU64>,
@@ -161,16 +159,18 @@ fn xdp_unified_worker(
     let nw      = num_workers.max(1);
     let id_span = (65536usize / nw).max(1);
     let id_base = ((worker_id % nw) * id_span) as u16;
+    // Per-worker local in-flight table — zero shared state, zero aliasing inter-worker.
+    let in_flight = InFlight::new();
+    let mut local_in_flight: usize = 0;
     let mut id_ctr:   usize = 0;
     let mut tmpl_idx: usize = worker_id;
     const FLUSH_N: usize = 1024;
     let mut local_sent: usize = 0;
 
-    // Vary the UDP source port per packet (default) so the receiver's NIC RSS
-    // spreads the flow across its RX queues/cores. A fixed src port pins the whole
-    // flood to one RX queue → one core. DNSMARK_FIXED_SPORT=1 keeps it fixed.
-    let vary_sport = std::env::var("DNSMARK_FIXED_SPORT").is_err();
-    let mut port_ctr: u32 = (worker_id as u32).wrapping_mul(40_009);
+    // Fixed src port per worker: RSS on the receiver hashes (src_ip, dst_ip, sport, dport=53)
+    // → each worker's responses land on one RX queue of the receiver, which maps back
+    // to this worker's XSK via symmetric RSS. Zero cross-worker aliasing.
+    let sport: u16 = 2048u16.wrapping_add(worker_id as u16);
 
     let mut descs:    Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
     let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
@@ -204,8 +204,7 @@ fn xdp_unified_worker(
             TX_BATCH
         };
         if max_outstanding > 0 {
-            let cur = global_in_flight.load(Ordering::Relaxed);
-            headroom = headroom.min(max_outstanding.saturating_sub(cur));
+            headroom = headroom.min(max_outstanding.saturating_sub(local_in_flight));
         }
 
         // 3) TX a batch straight into UMEM (one SIMD copy, one produce_tx, one kick).
@@ -223,11 +222,7 @@ fn xdp_unified_worker(
                     let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
                     tmpl_idx += 1;
                     let total = hdr.write_header(buf, dns_len);
-                    if vary_sport {
-                        let sport = 2048u16.wrapping_add((port_ctr % 60_000) as u16);
-                        port_ctr = port_ctr.wrapping_add(1);
-                        frame::set_src_port(buf, sport);
-                    }
+                    frame::set_src_port(buf, sport);
                     descs.push(XdpDesc { addr, len: total as u32, options: 0 });
                     in_flight.insert(id);
                 }
@@ -249,7 +244,7 @@ fn xdp_unified_worker(
                     // global_in_flight gates max_outstanding: it MUST be accurate, so
                     // increment per batch (not sharded). It is skipped entirely in flood
                     // mode (max_outstanding==0). stats.sent stays sharded (no gate role).
-                    if max_outstanding > 0 { global_in_flight.fetch_add(enq, Ordering::Relaxed); }
+                    if max_outstanding > 0 { local_in_flight += enq; }
                     local_sent += enq;
                     if local_sent >= FLUSH_N {
                         stats.inc_sent_n(local_sent);
@@ -273,7 +268,7 @@ fn xdp_unified_worker(
             }
             sock.umem.fill.enqueue_batch(&rx_addrs);
             if completed > 0 && max_outstanding > 0 {
-                global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(completed))).ok();
+                local_in_flight = local_in_flight.saturating_sub(completed);
             }
         } else if sock.umem.fill.needs_wakeup() {
             unsafe {
@@ -977,7 +972,7 @@ fn do_start_xdp_receive_path(
                 .name(format!("xdp-worker-q{q}"))
                 .spawn(move || {
                     if let Some(c) = core { pin_thread_to(c); }
-                    xdp_unified_worker(sock, hdr, sa, wp, ifl, gif, st, sd, qps, q as usize, qc, mo, timeout_dur);
+                    xdp_unified_worker(sock, hdr, sa, wp, st, sd, qps, q as usize, qc, mo, timeout_dur);
                 })
                 .map_err(|e| format!("thread spawn: {e}"))?;
             continue;
