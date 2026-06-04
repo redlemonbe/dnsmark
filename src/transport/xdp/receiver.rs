@@ -90,6 +90,34 @@ impl InFlight {
         }
         n
     }
+    /// Expire slots older than `timeout`; returns ages in µs for each expired slot.
+    /// Used to record timed-out queries into the latency histogram (honest tail).
+    pub fn sweep_with_ages(&self, timeout: Duration) -> Vec<u64> {
+        let now = self.base.elapsed().as_nanos() as u64;
+        let to  = timeout.as_nanos() as u64;
+        let mut ages = Vec::new();
+        for s in self.slots.iter() {
+            let v = s.load(Ordering::Relaxed);
+            if v != 0 && now.saturating_sub(v) > to
+                && s.compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                ages.push(now.saturating_sub(v) / 1000); // µs
+            }
+        }
+        ages
+    }
+    /// Drain ALL non-zero slots (end-of-run). Returns ages in µs.
+    pub fn drain_all(&self) -> Vec<u64> {
+        let now = self.base.elapsed().as_nanos() as u64;
+        let mut ages = Vec::new();
+        for s in self.slots.iter() {
+            let v = s.swap(0, Ordering::Relaxed);
+            if v != 0 {
+                ages.push(now.saturating_sub(v) / 1000);
+            }
+        }
+        ages
+    }
 }
 
 // ── XDP TX state ─────────────────────────────────────────────────────────
@@ -124,6 +152,7 @@ pub struct UnifiedCfg {
     pub wire_pool:       Arc<WireQueryPool>,
     pub qps_per_worker:  Arc<AtomicU64>,
     pub max_outstanding: usize,
+    pub total_qps:       u64,   // used to recalibrate per-worker rate after spawn
 }
 static UNIFIED_CFG: OnceLock<UnifiedCfg> = OnceLock::new();
 
@@ -146,8 +175,6 @@ fn xdp_unified_worker(
     hdr:              FrameHeader,
     sa:               SockaddrXdp,
     wire_pool:        Arc<WireQueryPool>,
-    in_flight:        Arc<InFlight>,
-    global_in_flight: Arc<AtomicUsize>,
     stats:            Arc<StatsCollector>,
     shutdown:         Arc<AtomicBool>,
     qps_per_worker:   Arc<AtomicU64>,
@@ -161,18 +188,21 @@ fn xdp_unified_worker(
     let nw      = num_workers.max(1);
     let id_span = (65536usize / nw).max(1);
     let id_base = ((worker_id % nw) * id_span) as u16;
+    // Per-worker local in-flight table — zero shared state, zero aliasing inter-worker.
+    let in_flight = InFlight::new();
+    let mut local_in_flight: usize = 0;
     let mut id_ctr:   usize = 0;
     let mut tmpl_idx: usize = worker_id;
     const FLUSH_N: usize = 1024;
     let mut local_sent: usize = 0;
 
-    // Vary the UDP source port per packet (default) so the receiver's NIC RSS
-    // spreads the flow across its RX queues/cores. A fixed src port pins the whole
-    // flood to one RX queue → one core. DNSMARK_FIXED_SPORT=1 keeps it fixed.
-    let vary_sport = std::env::var("DNSMARK_FIXED_SPORT").is_err();
-    let mut port_ctr: u32 = (worker_id as u32).wrapping_mul(40_009);
+    // Fixed src port per worker: RSS on the receiver hashes (src_ip, dst_ip, sport, dport=53)
+    // → each worker's responses land on one RX queue of the receiver, which maps back
+    // to this worker's XSK via symmetric RSS. Zero cross-worker aliasing.
+    let sport: u16 = 2048u16.wrapping_add(worker_id as u16);
 
     let mut descs:    Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
+    let mut ids_to_register: Vec<u16> = Vec::with_capacity(TX_BATCH);
     let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
     let mut last_timeout = Instant::now();
 
@@ -204,13 +234,13 @@ fn xdp_unified_worker(
             TX_BATCH
         };
         if max_outstanding > 0 {
-            let cur = global_in_flight.load(Ordering::Relaxed);
-            headroom = headroom.min(max_outstanding.saturating_sub(cur));
+            headroom = headroom.min(max_outstanding.saturating_sub(local_in_flight));
         }
 
         // 3) TX a batch straight into UMEM (one SIMD copy, one produce_tx, one kick).
         if headroom > 0 {
             descs.clear();
+            ids_to_register.clear();
             let take = headroom.min(sock.tx_pool.len());
             for _ in 0..take {
                 if let Some(addr) = sock.tx_pool.pop() {
@@ -223,13 +253,9 @@ fn xdp_unified_worker(
                     let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
                     tmpl_idx += 1;
                     let total = hdr.write_header(buf, dns_len);
-                    if vary_sport {
-                        let sport = 2048u16.wrapping_add((port_ctr % 60_000) as u16);
-                        port_ctr = port_ctr.wrapping_add(1);
-                        frame::set_src_port(buf, sport);
-                    }
+                    frame::set_src_port(buf, sport);
                     descs.push(XdpDesc { addr, len: total as u32, options: 0 });
-                    in_flight.insert(id);
+                    ids_to_register.push(id);
                 }
             }
             if !descs.is_empty() {
@@ -249,7 +275,15 @@ fn xdp_unified_worker(
                     // global_in_flight gates max_outstanding: it MUST be accurate, so
                     // increment per batch (not sharded). It is skipped entirely in flood
                     // mode (max_outstanding==0). stats.sent stays sharded (no gate role).
-                    if max_outstanding > 0 { global_in_flight.fetch_add(enq, Ordering::Relaxed); }
+                    // Timestamp AFTER the kick: comparable to dnsperf which timestamps
+                    // at sendmsg(), not at buffer preparation.
+                    for &id in ids_to_register.iter().take(enq) {
+                        in_flight.insert(id);
+                    }
+                    if max_outstanding > 0 {
+                        local_in_flight += enq;
+                        stats.record_inflight(local_in_flight);
+                    }
                     local_sent += enq;
                     if local_sent >= FLUSH_N {
                         stats.inc_sent_n(local_sent);
@@ -273,7 +307,7 @@ fn xdp_unified_worker(
             }
             sock.umem.fill.enqueue_batch(&rx_addrs);
             if completed > 0 && max_outstanding > 0 {
-                global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(completed))).ok();
+                local_in_flight = local_in_flight.saturating_sub(completed);
             }
         } else if sock.umem.fill.needs_wakeup() {
             unsafe {
@@ -283,14 +317,35 @@ fn xdp_unified_worker(
         }
 
         // 5) Expire timed-out queries every 10 ms.
+        // Expired queries are recorded in the latency histogram at their real age
+        // (honest tail: p99/p999 includes the slowest queries, not just the ones
+        // that got a response in time).
         let now = Instant::now();
         if now.duration_since(last_timeout) >= Duration::from_millis(10) {
-            let expired = in_flight.sweep(timeout_dur);
-            if expired > 0 { for _ in 0..expired { stats.inc_timeout(); } }
+            let ages = in_flight.sweep_with_ages(timeout_dur);
+            if !ages.is_empty() {
+                for &age_us in &ages {
+                    stats.record_response(0xff, age_us); // rcode=0xff = timeout sentinel
+                    stats.inc_timeout();
+                }
+                if max_outstanding > 0 {
+                    local_in_flight = local_in_flight.saturating_sub(ages.len());
+                }
+            }
             last_timeout = now;
         }
     }
-    if local_sent > 0 { stats.inc_sent_n(local_sent); }
+    // End-of-run: drain remaining in-flight queries into the histogram as losses.
+    // They will not have a real RTT — record them at their current age so the
+    // histogram is honest (no silent truncation of slow queries).
+    {
+        let remaining = in_flight.drain_all();
+        for &age_us in &remaining {
+            stats.record_response(0xff, age_us); // timeout sentinel
+            stats.inc_timeout();
+        }
+        if local_sent > 0 { stats.inc_sent_n(local_sent); }
+    }
 }
 
 // ── Frame parser ──────────────────────────────────────────────────────────
@@ -366,10 +421,13 @@ fn xdp_receiver_thread(
             // Timeout sweep while idle.
             let now = Instant::now();
             if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-                let expired = in_flight.sweep(timeout_dur);
-                if expired > 0 {
-                    for _ in 0..expired { stats.inc_timeout(); }
-                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(expired))).ok();
+                let ages = in_flight.sweep_with_ages(timeout_dur);
+                if !ages.is_empty() {
+                    for &age_us in &ages {
+                        stats.record_response(0xff, age_us);
+                        stats.inc_timeout();
+                    }
+                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(ages.len()))).ok();
                 }
                 last_timeout_check = now;
             }
@@ -410,7 +468,8 @@ fn xdp_receiver_thread(
         // Expire timed-out queries every 10 ms.
         let now = Instant::now();
         if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-            let expired = in_flight.sweep(timeout_dur);
+            let _ages_legacy = in_flight.sweep_with_ages(timeout_dur); let expired = _ages_legacy.len();
+            if !_ages_legacy.is_empty() { for &age_us in &_ages_legacy { stats.record_response(0xff, age_us); } }
             if expired > 0 {
                 for _ in 0..expired { stats.inc_timeout(); }
                 global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
@@ -917,6 +976,7 @@ fn do_start_xdp_receive_path(
 
     let queue_count = get_rx_queue_count(iface);
     let mut tx_states: Vec<Arc<XdpTxState>> = Vec::new();
+    let mut n_unified: usize = 0;
 
     // NIC-local NUMA node + logical CPUs. The UMEM is bound here and the receiver
     // threads are pinned to local HT siblings so neither the DMA nor the response
@@ -973,11 +1033,12 @@ fn do_start_xdp_receive_path(
             let mo  = cfg.max_outstanding;
             let qc  = queue_count as usize;
             XDP_UNIFIED.store(true, Ordering::Relaxed);
+            n_unified += 1;
             std::thread::Builder::new()
                 .name(format!("xdp-worker-q{q}"))
                 .spawn(move || {
                     if let Some(c) = core { pin_thread_to(c); }
-                    xdp_unified_worker(sock, hdr, sa, wp, ifl, gif, st, sd, qps, q as usize, qc, mo, timeout_dur);
+                    xdp_unified_worker(sock, hdr, sa, wp, st, sd, qps, q as usize, qc, mo, timeout_dur);
                 })
                 .map_err(|e| format!("thread spawn: {e}"))?;
             continue;
@@ -1027,6 +1088,23 @@ fn do_start_xdp_receive_path(
     if !tx_states.is_empty() {
         XDP_TX_STATES.set(tx_states).ok();
         tracing::info!("[XDP TX] TX ring active on {} queue(s)", queue_count);
+    }
+
+    // Recalibrate qps_per_worker based on the number of workers actually spawned.
+    // engine/mod.rs computed initial_qps_per_worker = total_qps / concurrent, but
+    // queue_count may be < concurrent (e.g. 1-queue virtio-net with -c 8 gives 1
+    // worker instead of 8 → each worker should get total_qps/1, not total_qps/8).
+    if n_unified > 0 {
+        if let Some(cfg) = UNIFIED_CFG.get() {
+            let total = cfg.total_qps;
+            if total > 0 {
+                let per_worker = (total / n_unified as u64).max(1);
+                cfg.qps_per_worker.store(per_worker, Ordering::Relaxed);
+                tracing::info!(
+                    "qps_per_worker recalibrated: {total}/{n_unified}={per_worker}"
+                );
+            }
+        }
     }
 
     Ok(handle)

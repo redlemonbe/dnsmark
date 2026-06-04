@@ -28,6 +28,23 @@
 
 ---
 
+## Measurement accuracy & transport
+
+dnsmark sends over a **UDP kernel socket by default** — the same datapath as dnsperf — so latency is directly comparable. `--xdp` is **opt-in** and changes the datapath: only use it when the server under test is itself AF_XDP (a symmetric **XDP-vs-XDP** measurement) or for raw saturation throughput. **Never compare an XDP generator against a kernel server** — that is asymmetric and not publishable. The rule is simple: *the generator's datapath must match the server's.*
+
+Latency is validated against the **wire** — a `tcpdump` capture on the server — not against another tool. No benchmark tool is ground truth; the wire is. On a controlled-load run (identical settings, latency cross-checked against a server-side capture):
+
+| server | wire (tcpdump) | dnsmark UDP | dnsperf |
+|---|---:|---:|---:|
+| Unbound | 19 µs | 62 µs | 90 µs |
+| BIND    | 35 µs | 83 µs | 104 µs |
+
+Each tool adds a roughly **constant** generator overhead — dnsmark ~45 µs, dnsperf ~70 µs — independent of the server. dnsmark sits ~25 µs closer to the wire on *every* server, so its **absolute** latency is more accurate; both tools **rank** servers identically (a constant offset cancels in comparisons). Treat dnsperf as a relative cross-check, not an absolute reference.
+
+*(Numbers above are one controlled-load run on a virtio-net VM pair — absolute values are rig-dependent; the methodology and the relative generator overheads are the point.)*
+
+---
+
 ## Install
 
 ```bash
@@ -83,6 +100,11 @@ transmits them zero-copy (no kernel, no per-packet syscall). One independent
 worker runs per NIC-local physical core; each owns its own queue, UMEM and rings
 — no shared per-packet state. On an Intel X520 (82599) this **saturates a 10 GbE
 link (~12 M qps)** and scales per core, ~30× a kernel-socket generator.
+
+> **`--xdp` is opt-in.** The default transport is the UDP kernel socket (comparable to
+> dnsperf). Use `--xdp` only against a server that is *itself* AF_XDP (symmetric
+> measurement) or for raw saturation throughput — never an XDP generator against a
+> kernel server. For latency comparisons against unbound/BIND, use the default UDP path.
 
 ```bash
 # grant capabilities once (or run as root)

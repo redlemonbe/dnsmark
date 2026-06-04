@@ -92,7 +92,7 @@ pub async fn run_with_shutdown(
     let _xdp_handle: Option<crate::transport::xdp::XdpHandle>;
 
     #[cfg(feature = "xdp")]
-    let use_xdp = if config.protocol == Protocol::Udp && !config.no_xdp {
+    let use_xdp = if config.force_xdp && config.protocol == Protocol::Udp {
         use crate::transport::xdp;
 
         let iface = xdp::iface_for_benchmark(config.server);
@@ -104,6 +104,7 @@ pub async fn run_with_shutdown(
                 wire_pool:       wire_pool.clone(),
                 qps_per_worker:  shared_qps.clone(),
                 max_outstanding: config.max_outstanding,
+                total_qps:       config.qps,
             });
         }
 
@@ -147,8 +148,8 @@ pub async fn run_with_shutdown(
         }
     } else {
         _xdp_handle = None;
-        if !config.quiet && config.no_xdp {
-            println!("XDP disabled (--no-xdp) — using UDP receive path");
+        if !config.quiet {
+            println!("XDP disabled — using UDP receive path (use --xdp to enable)");
         }
         false
     };

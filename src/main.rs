@@ -113,11 +113,13 @@ struct Cli {
     #[arg(long)]
     no_tui: bool,
 
-    /// Force AF_XDP (error if unsupported)
+    /// Enable AF_XDP datapath (XDP mode, for benchmarking AF_XDP servers like Runbound).
+    /// Default transport is UDP kernel socket (comparable to dnsperf).
+    /// Use --xdp only for symmetric XDP-vs-XDP measurements; never mix transports.
     #[arg(long)]
     xdp: bool,
 
-    /// Disable AF_XDP even if available
+    /// Disable AF_XDP (default: AF_XDP is already disabled unless --xdp is set)
     #[arg(long)]
     no_xdp: bool,
 

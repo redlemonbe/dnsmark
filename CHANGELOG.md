@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic V
 
 ---
 
+## [2.0.0] — 2026-06-05
+
+### Changed
+
+- **UDP kernel socket is now the default transport; AF_XDP is opt-in via `--xdp`.** dnsmark no longer auto-enables XDP. The generator's datapath must match the server's: use the default UDP path against kernel servers (unbound, BIND, Runbound kernel path) for latency comparable to dnsperf, and `--xdp` only against AF_XDP servers (symmetric XDP-vs-XDP) or for saturation throughput. Mixing transports across a comparison is rejected as non-publishable.
+- **Unified UDP worker** — send and receive now run in the *same* OS thread per worker (loop modelled on dnsperf: send → `poll` until next-send-or-response → `recvmmsg` drain → timeout sweep). Removes the previous sender/receiver thread split that added ~34 µs of context-switch latency to every measured RTT.
+
+### Fixed
+
+- **Honest latency tail** — queries expired by the timeout sweep, and queries still in flight at end-of-run, are now recorded in the latency histogram (at their real age) instead of being silently dropped. p99/p999 no longer hide the slowest responses.
+- **Per-worker rate calibration** — target QPS is divided by the number of *actually spawned* workers (one per NIC RX queue), not by `--clients`. Previously a low-queue NIC under-drove the target (e.g. 50k → 6.25k on a single-queue interface).
+- Removed `SCHED_FIFO` real-time scheduling on worker threads — on bare metal it starved per-core kernel softirqs and could take down host networking. Workers run `SCHED_OTHER`, pinned to NIC-local physical cores.
+
+### Validation
+
+- Latency cross-checked against `tcpdump` wire capture on two servers (Unbound, BIND): dnsmark's generator overhead is ~constant (~45 µs) and ~25 µs lower than dnsperf's, i.e. closer to the wire truth. Both tools rank servers identically.
+
+---
+
 ## [1.3.0] — 2026-06-03
 
 ### Added
