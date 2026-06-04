@@ -226,6 +226,28 @@ schema is stable and is the recommended interface for automated comparison.
   `CAP_NET_RAW`/`CAP_BPF` (or root) and flow control disabled on the sender to reach line
   rate (see benchmarking.md).
 
+### Known caveats (write them down rather than hide them)
+
+- **In-flight table sizing.** Each worker's in-flight table is a power-of-two slot array
+  indexed by DNS id. With sequentially-issued ids and the table sized to ≥ the
+  outstanding window it is collision-free in controlled-rate mode. In **unlimited/flood**
+  mode (`--max-outstanding 0`) the number in flight can exceed the table; a colliding id
+  is then overwritten and later counted as a timeout — a small, bounded perturbation,
+  consistent with the honest-tail accounting. Quote latency from **controlled-rate** runs.
+- **`--compare` shares one async runtime.** The two servers run as concurrent tasks in
+  the same runtime, so a side-by-side compare is fair at controlled rates but not a clean
+  isolation at saturation (the tasks contend for the runtime). For saturation
+  comparisons, run each server separately on the same rig.
+- **`--ramp` is a doubling search.** It can overshoot the true maximum by up to one step
+  before the loss criterion trips; read the reported max as the top of the last
+  *sustained* step, and narrow with a fixed-rate sweep if you need a tight figure.
+- **IPv6 + `--xdp`.** NUMA-local pinning is derived from the IPv4 route; an IPv6 target
+  skips it — workers still run, just without NUMA pinning.
+- **The XDP capability probe is advisory.** A successful `AF_XDP` socket open means the
+  kernel supports the family, not that attach will succeed (containers, missing BPF
+  privileges, virtual interfaces). dnsmark falls back if attach fails; treat the
+  capability flag as a hint, not a guarantee.
+
 ---
 
 *This document describes the implementation as of v2.0.0. Mechanisms are referenced to

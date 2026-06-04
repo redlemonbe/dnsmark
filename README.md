@@ -1,6 +1,6 @@
 # dnsmark
 
-**The fastest DNS benchmark tool. Static binary. No dependencies. Runs anywhere.**
+**A DNS benchmark tool built for honest measurement and line-rate generation. Static binary, no dependencies.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/redlemonbe/dnsmark)](https://github.com/redlemonbe/dnsmark/releases/latest)
@@ -9,6 +9,22 @@
 > **Authorized testing only.**  
 > Only use dnsmark against DNS servers you own or have explicit written authorization to test.  
 > Read [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) before use.
+
+---
+
+## Why dnsmark for high-performance DNS?
+
+- **Line-rate generation.** An optional zero-copy AF_XDP datapath drives a NIC at line
+  rate when you need to saturate a fast server — beyond what a kernel-socket generator
+  reaches.
+- **Honest latency.** The slow tail is counted (timeouts and end-of-run in-flight go
+  into the histogram), and absolute latency is validated against a wire capture rather
+  than assumed.
+- **Deterministic placement.** Workers pin to NIC-local **physical** cores (no HT, no
+  real-time scheduling) for repeatable results.
+
+The trade-offs and exact measurement methodology are written down, not glossed over —
+see the [whitepaper](docs/WHITEPAPER.md).
 
 ---
 
@@ -108,7 +124,8 @@ With `--xdp`, dnsmark builds DNS query frames straight into the NIC's UMEM and
 transmits them zero-copy (no kernel, no per-packet syscall). One independent
 worker runs per NIC-local physical core; each owns its own queue, UMEM and rings
 — no shared per-packet state. On an Intel X520 (82599) this **saturates a 10 GbE
-link (~12 M qps)** and scales per core, ~30× a kernel-socket generator.
+link (~12 M qps measured — see the [benchmarking guide](docs/benchmarking.md))** and
+scales per core, well beyond a kernel-socket generator.
 
 > **`--xdp` is opt-in.** The default transport is the UDP kernel socket (comparable to
 > dnsperf). Use `--xdp` only against a server that is *itself* AF_XDP (symmetric
