@@ -90,6 +90,34 @@ impl InFlight {
         }
         n
     }
+    /// Expire slots older than `timeout`; returns ages in µs for each expired slot.
+    /// Used to record timed-out queries into the latency histogram (honest tail).
+    pub fn sweep_with_ages(&self, timeout: Duration) -> Vec<u64> {
+        let now = self.base.elapsed().as_nanos() as u64;
+        let to  = timeout.as_nanos() as u64;
+        let mut ages = Vec::new();
+        for s in self.slots.iter() {
+            let v = s.load(Ordering::Relaxed);
+            if v != 0 && now.saturating_sub(v) > to
+                && s.compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                ages.push(now.saturating_sub(v) / 1000); // µs
+            }
+        }
+        ages
+    }
+    /// Drain ALL non-zero slots (end-of-run). Returns ages in µs.
+    pub fn drain_all(&self) -> Vec<u64> {
+        let now = self.base.elapsed().as_nanos() as u64;
+        let mut ages = Vec::new();
+        for s in self.slots.iter() {
+            let v = s.swap(0, Ordering::Relaxed);
+            if v != 0 {
+                ages.push(now.saturating_sub(v) / 1000);
+            }
+        }
+        ages
+    }
 }
 
 // ── XDP TX state ─────────────────────────────────────────────────────────
@@ -173,6 +201,7 @@ fn xdp_unified_worker(
     let sport: u16 = 2048u16.wrapping_add(worker_id as u16);
 
     let mut descs:    Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
+    let mut ids_to_register: Vec<u16> = Vec::with_capacity(TX_BATCH);
     let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
     let mut last_timeout = Instant::now();
 
@@ -210,6 +239,7 @@ fn xdp_unified_worker(
         // 3) TX a batch straight into UMEM (one SIMD copy, one produce_tx, one kick).
         if headroom > 0 {
             descs.clear();
+            ids_to_register.clear();
             let take = headroom.min(sock.tx_pool.len());
             for _ in 0..take {
                 if let Some(addr) = sock.tx_pool.pop() {
@@ -224,7 +254,7 @@ fn xdp_unified_worker(
                     let total = hdr.write_header(buf, dns_len);
                     frame::set_src_port(buf, sport);
                     descs.push(XdpDesc { addr, len: total as u32, options: 0 });
-                    in_flight.insert(id);
+                    ids_to_register.push(id);
                 }
             }
             if !descs.is_empty() {
@@ -244,7 +274,15 @@ fn xdp_unified_worker(
                     // global_in_flight gates max_outstanding: it MUST be accurate, so
                     // increment per batch (not sharded). It is skipped entirely in flood
                     // mode (max_outstanding==0). stats.sent stays sharded (no gate role).
-                    if max_outstanding > 0 { local_in_flight += enq; }
+                    // Timestamp AFTER the kick: comparable to dnsperf which timestamps
+                    // at sendmsg(), not at buffer preparation.
+                    for &id in ids_to_register.iter().take(enq) {
+                        in_flight.insert(id);
+                    }
+                    if max_outstanding > 0 {
+                        local_in_flight += enq;
+                        stats.record_inflight(local_in_flight);
+                    }
                     local_sent += enq;
                     if local_sent >= FLUSH_N {
                         stats.inc_sent_n(local_sent);
@@ -278,14 +316,35 @@ fn xdp_unified_worker(
         }
 
         // 5) Expire timed-out queries every 10 ms.
+        // Expired queries are recorded in the latency histogram at their real age
+        // (honest tail: p99/p999 includes the slowest queries, not just the ones
+        // that got a response in time).
         let now = Instant::now();
         if now.duration_since(last_timeout) >= Duration::from_millis(10) {
-            let expired = in_flight.sweep(timeout_dur);
-            if expired > 0 { for _ in 0..expired { stats.inc_timeout(); } }
+            let ages = in_flight.sweep_with_ages(timeout_dur);
+            if !ages.is_empty() {
+                for &age_us in &ages {
+                    stats.record_response(0xff, age_us); // rcode=0xff = timeout sentinel
+                    stats.inc_timeout();
+                }
+                if max_outstanding > 0 {
+                    local_in_flight = local_in_flight.saturating_sub(ages.len());
+                }
+            }
             last_timeout = now;
         }
     }
-    if local_sent > 0 { stats.inc_sent_n(local_sent); }
+    // End-of-run: drain remaining in-flight queries into the histogram as losses.
+    // They will not have a real RTT — record them at their current age so the
+    // histogram is honest (no silent truncation of slow queries).
+    {
+        let remaining = in_flight.drain_all();
+        for &age_us in &remaining {
+            stats.record_response(0xff, age_us); // timeout sentinel
+            stats.inc_timeout();
+        }
+        if local_sent > 0 { stats.inc_sent_n(local_sent); }
+    }
 }
 
 // ── Frame parser ──────────────────────────────────────────────────────────
@@ -361,10 +420,13 @@ fn xdp_receiver_thread(
             // Timeout sweep while idle.
             let now = Instant::now();
             if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-                let expired = in_flight.sweep(timeout_dur);
-                if expired > 0 {
-                    for _ in 0..expired { stats.inc_timeout(); }
-                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(expired))).ok();
+                let ages = in_flight.sweep_with_ages(timeout_dur);
+                if !ages.is_empty() {
+                    for &age_us in &ages {
+                        stats.record_response(0xff, age_us);
+                        stats.inc_timeout();
+                    }
+                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(ages.len()))).ok();
                 }
                 last_timeout_check = now;
             }
@@ -405,7 +467,8 @@ fn xdp_receiver_thread(
         // Expire timed-out queries every 10 ms.
         let now = Instant::now();
         if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-            let expired = in_flight.sweep(timeout_dur);
+            let _ages_legacy = in_flight.sweep_with_ages(timeout_dur); let expired = _ages_legacy.len();
+            if !_ages_legacy.is_empty() { for &age_us in &_ages_legacy { stats.record_response(0xff, age_us); } }
             if expired > 0 {
                 for _ in 0..expired { stats.inc_timeout(); }
                 global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {

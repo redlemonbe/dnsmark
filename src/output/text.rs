@@ -68,6 +68,11 @@ pub fn print_result(snap: &StatsSnapshot, config: &Config) {
     println!("    p99:       {:.3} ms", snap.p99_us  as f64 / 1000.0);
     println!("    p999:      {:.3} ms", snap.p999_us as f64 / 1000.0);
     println!("    max:       {:.3} ms", snap.max_us  as f64 / 1000.0);
+    if snap.inflight_max > 0 {
+        println!("  outstanding:");
+        println!("    mean:      {:.1}", snap.inflight_mean);
+        println!("    max:       {}", snap.inflight_max);
+    }
     println!();
     println!("  Run time: {:.3} s", snap.run_time_s);
 }

@@ -50,6 +50,8 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
             p99_us: 0,
             p999_us: 0,
             max_us: 0,
+            inflight_mean: 0.0,
+            inflight_max: 0,
         };
     }
 
@@ -95,6 +97,8 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
         p99_us:  wavg_u64(|s| s.p99_us),
         p999_us: wavg_u64(|s| s.p999_us),
         max_us,
+        inflight_mean: snaps.iter().map(|s| s.inflight_mean).sum::<f64>() / snaps.len().max(1) as f64,
+        inflight_max:  snaps.iter().map(|s| s.inflight_max).max().unwrap_or(0),
     }
 }
 
@@ -246,6 +250,8 @@ mod tests {
             p99_us:            p99,
             p999_us:           500,
             max_us:            800,
+            inflight_mean:     0.0,
+            inflight_max:      0,
         }
     }
 

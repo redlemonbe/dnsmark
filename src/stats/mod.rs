@@ -18,7 +18,10 @@ pub struct StatsCollector {
     pub rcode_servfail: AtomicU64,
     pub rcode_refused: AtomicU64,
     pub rcode_other: AtomicU64,
-    histogram: Mutex<Histogram<u64>>,
+    histogram:       Mutex<Histogram<u64>>,
+    inflight_sum:    AtomicU64,
+    inflight_count:  AtomicU64,
+    inflight_max:    AtomicU64,
 }
 
 impl StatsCollector {
@@ -33,6 +36,9 @@ impl StatsCollector {
             rcode_servfail: AtomicU64::new(0),
             rcode_refused: AtomicU64::new(0),
             rcode_other: AtomicU64::new(0),
+            inflight_sum:   AtomicU64::new(0),
+            inflight_count: AtomicU64::new(0),
+            inflight_max:   AtomicU64::new(0),
             histogram: Mutex::new(
                 Histogram::new_with_bounds(1, 60_000_000, 3)
                     .expect("create HDR histogram"),
@@ -54,6 +60,22 @@ impl StatsCollector {
 
     pub fn inc_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Called each TX batch to track outstanding query depth.
+    #[inline]
+    pub fn record_inflight(&self, current: usize) {
+        let v = current as u64;
+        self.inflight_sum.fetch_add(v, Ordering::Relaxed);
+        self.inflight_count.fetch_add(1, Ordering::Relaxed);
+        // Update max via CAS loop
+        let mut old = self.inflight_max.load(Ordering::Relaxed);
+        while v > old {
+            match self.inflight_max.compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(x) => old = x,
+            }
+        }
     }
 
     pub fn record_response(&self, rcode: u8, rtt_us: u64) {
@@ -87,6 +109,11 @@ impl StatsCollector {
         } else {
             (0, 0.0, 0, 0, 0, 0, 0)
         };
+        let ifl_count = self.inflight_count.load(Ordering::Relaxed);
+        let ifl_mean = if ifl_count > 0 {
+            self.inflight_sum.load(Ordering::Relaxed) as f64 / ifl_count as f64
+        } else { 0.0 };
+        let ifl_max = self.inflight_max.load(Ordering::Relaxed);
         StatsSnapshot {
             queries_sent: sent,
             queries_completed: completed,
@@ -105,6 +132,8 @@ impl StatsCollector {
             p99_us: p99,
             p999_us: p999,
             max_us,
+            inflight_mean: ifl_mean,
+            inflight_max: ifl_max,
         }
     }
 }

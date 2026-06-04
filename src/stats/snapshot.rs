@@ -17,4 +17,6 @@ pub struct StatsSnapshot {
     pub p99_us: u64,
     pub p999_us: u64,
     pub max_us: u64,
+    pub inflight_mean: f64,
+    pub inflight_max: u64,
 }
