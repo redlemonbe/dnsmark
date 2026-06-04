@@ -12,19 +12,33 @@
 
 ---
 
+## Documentation
+
+- **[Whitepaper](docs/WHITEPAPER.md)** — architecture, the unified worker loop, and how latency is measured.
+- **[Benchmarking methodology](docs/benchmarking.md)** — throughput at NIC counters + the wire-validated latency decomposition (§7).
+
+---
+
 ## What you get
 
-| | dnsperf | flamethrower | dnsmark |
-|---|:---:|:---:|:---:|
-| UDP / TCP | UDP only | UDP / TCP | ✅ UDP / TCP |
-| DNS-over-TLS (DoT) | ❌ | ❌ | ✅ |
-| Auto ramp (find max QPS) | ❌ | ❌ | ✅ `--ramp` |
-| Compare two servers | ❌ | ❌ | ✅ `--compare` |
-| Live TUI dashboard | ❌ | ❌ | ✅ |
-| p50/p95/p99/p999 latency | basic | basic | ✅ full histogram |
-| JSON output | ❌ | ❌ | ✅ `--json` |
-| AF/XDP fast-path (optional) | ❌ | ❌ | ✅ |
-| Static binary, no deps | ❌ requires libssl | ❌ | ✅ musl |
+dnsperf (ISC/DNS-OARC) is the established reference and does UDP, TCP, DoT and DoH;
+this table lists only where dnsmark adds something on top of it.
+
+| | dnsperf | dnsmark |
+|---|:---:|:---:|
+| UDP / TCP / DoT | ✅ | ✅ |
+| Built-in auto-ramp to max QPS | via companion `resperf` | ✅ `--ramp` |
+| Side-by-side two-server compare | ❌ | ✅ `--compare` |
+| Live TUI dashboard | ❌ | ✅ |
+| p50 / p95 / p99 / p999 | average + per-query `-v` | ✅ built-in HDR histogram |
+| JSON output | ❌ | ✅ `--json` |
+| AF_XDP zero-copy datapath | ❌ | ✅ `--xdp` |
+| Single static binary, no deps | ❌ | ✅ musl |
+
+> Latency note: dnsmark and dnsperf measure the same thing differently — see
+> [Measurement accuracy](#measurement-accuracy--transport) and the
+> [whitepaper](docs/WHITEPAPER.md). Neither tool's absolute latency is "the server's
+> latency"; anchor on a wire capture.
 
 ---
 
@@ -32,16 +46,11 @@
 
 dnsmark sends over a **UDP kernel socket by default** — the same datapath as dnsperf — so latency is directly comparable. `--xdp` is **opt-in** and changes the datapath: only use it when the server under test is itself AF_XDP (a symmetric **XDP-vs-XDP** measurement) or for raw saturation throughput. **Never compare an XDP generator against a kernel server** — that is asymmetric and not publishable. The rule is simple: *the generator's datapath must match the server's.*
 
-Latency is validated against the **wire** — a `tcpdump` capture on the server — not against another tool. No benchmark tool is ground truth; the wire is. On a controlled-load run (identical settings, latency cross-checked against a server-side capture):
+A closed-loop generator's reported RTT is **`server processing + network + the tool's own client-side overhead`** — only the first term belongs to the server, and the third differs between any two generators. So **absolute** latency is a property of the *(server, generator, rig)* triple, not of the server alone: validate the server's term against the **wire** (a `tcpdump` capture on the server, paired by DNS transaction id) and compare servers with **one fixed generator**.
 
-| server | wire (tcpdump) | dnsmark UDP | dnsperf |
-|---|---:|---:|---:|
-| Unbound | 19 µs | 62 µs | 90 µs |
-| BIND    | 35 µs | 83 µs | 104 µs |
+dnsmark's client-side overhead happens to be lower than dnsperf's (batched `recvmmsg`, tight send/poll loop), which is why it sits closer to the wire — but dnsperf's larger figure reflects a heavier client path, not an error. dnsperf is a sound relative reference and a valuable independent cross-check.
 
-Each tool adds a roughly **constant** generator overhead — dnsmark ~45 µs, dnsperf ~70 µs — independent of the server. dnsmark sits ~25 µs closer to the wire on *every* server, so its **absolute** latency is more accurate; both tools **rank** servers identically (a constant offset cancels in comparisons). Treat dnsperf as a relative cross-check, not an absolute reference.
-
-*(Numbers above are one controlled-load run on a virtio-net VM pair — absolute values are rig-dependent; the methodology and the relative generator overheads are the point.)*
+See **[docs/benchmarking.md §7](docs/benchmarking.md)** for the full three-term decomposition (dnsmark, dnsperf and the wire, on two rigs and both generator↔receiver directions) and the exact commands to reproduce it.
 
 ---
 
