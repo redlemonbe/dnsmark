@@ -379,6 +379,7 @@ fn throughput_udp_worker(
     // ── Per-worker local counters (zero shared state on hot path) ────────────
     let mut local_sent:      u64 = 0;
     let mut local_completed: u64 = 0;
+    let mut rc = [0u64; 5]; // noerror, nxdomain, servfail, refused, other
 
     let mut next_id:  u16   = rand::random();
     let mut tmpl_idx: usize = rand::random();
@@ -423,6 +424,14 @@ fn throughput_udp_worker(
                     )
                 };
                 if n <= 0 { break; }
+                for i in 0..n as usize {
+                    let len = (rx_msgs[i].msg_len as usize).min(MAX_MSG_SIZE);
+                    let off = i * MAX_MSG_SIZE;
+                    let idx = match crate::dns::response::parse_response(&rx_flat[off..off + len]).map(|r| r.rcode) {
+                        Some(0) => 0, Some(3) => 1, Some(2) => 2, Some(5) => 3, _ => 4,
+                    };
+                    rc[idx] += 1;
+                }
                 local_completed += n as u64;
             }
         }
@@ -434,7 +443,8 @@ fn throughput_udp_worker(
                 local_sent = 0;
             }
             if local_completed > 0 {
-                stats.inc_completed_n(local_completed);
+                stats.record_rcodes(rc[0], rc[1], rc[2], rc[3], rc[4]);
+                rc = [0u64; 5];
                 local_completed = 0;
             }
         }
@@ -442,7 +452,7 @@ fn throughput_udp_worker(
 
     // ── Final flush ──────────────────────────────────────────────────────────
     if local_sent > 0      { stats.inc_sent_n(local_sent as usize); }
-    if local_completed > 0 { stats.inc_completed_n(local_completed); }
+    if local_completed > 0 { stats.record_rcodes(rc[0], rc[1], rc[2], rc[3], rc[4]); }
 }
 
 // ─── Public async entry point ─────────────────────────────────────────────────

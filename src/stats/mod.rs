@@ -71,9 +71,16 @@ impl StatsCollector {
     }
 
     /// Bulk-increment completed counter (throughput path, no RTT recorded).
-    pub fn inc_completed_n(&self, n: u64) {
-        self.completed.fetch_add(n, Ordering::Relaxed);
-        self.rcode_noerror.fetch_add(n, Ordering::Relaxed);
+    /// Bulk-record completions by parsed rcode (throughput path; no latency sample).
+    pub fn record_rcodes(&self, noerror: u64, nxdomain: u64, servfail: u64, refused: u64, other: u64) {
+        let total = noerror + nxdomain + servfail + refused + other;
+        if total == 0 { return; }
+        self.completed.fetch_add(total, Ordering::Relaxed);
+        if noerror  > 0 { self.rcode_noerror.fetch_add(noerror,  Ordering::Relaxed); }
+        if nxdomain > 0 { self.rcode_nxdomain.fetch_add(nxdomain, Ordering::Relaxed); }
+        if servfail > 0 { self.rcode_servfail.fetch_add(servfail, Ordering::Relaxed); }
+        if refused  > 0 { self.rcode_refused.fetch_add(refused,  Ordering::Relaxed); }
+        if other    > 0 { self.rcode_other.fetch_add(other,      Ordering::Relaxed); }
     }
 
     pub fn inc_error(&self) {
