@@ -255,13 +255,7 @@ schema is stable and is the recommended interface for automated comparison.
 
 ---
 
-*This document describes the implementation as of v2.0.0. Mechanisms are referenced to
-their source files so the description can be checked against the code rather than taken
-on trust.*
-
----
-
-## 9. SIMD copy in the hot path — measured verdict
+## 10. SIMD copy in the hot path — measured verdict
 
 `write_with_index()` (`query/wire.rs`) assembles each DNS query frame by copying a
 pre-built wire template (30–60 bytes) into the send buffer and patching 2 bytes (the
@@ -315,3 +309,9 @@ documentation. The copy path is described as a detail of implementation, not a
 performance feature. If a future profiling session on a 25/100 G NIC shows the copy
 is on the critical path, the correct fix is to eliminate the copy entirely (zero-copy
 UMEM frames reuse the template in-place).
+
+---
+
+*This document describes the implementation as of v2.0.1. Mechanisms are referenced to
+their source files so the description can be checked against the code rather than taken
+on trust.*
