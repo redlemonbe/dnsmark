@@ -246,6 +246,23 @@ The 82599 RETA table has 128 entries but only **16 unique queues**. You cannot
 spread RX beyond 16 physical cores on this NIC, regardless of `ethtool -X`
 arguments or core count. This is a hardware limit, not a driver bug.
 
+### 5.5 Ramp mode declares saturation with no hysteresis
+
+`--ramp` doubles the target QPS every 5 s and declares saturation as soon as a
+single 1-second burst delivers fewer than 80 % of the target completions. The
+criterion is deliberately simple and topology-independent, but it has **no
+hysteresis**: one bad burst — a momentary server hiccup, a cache flush, a GC
+pause, an IRQ storm during that one second — trips it, and the reported
+max-sustainable QPS is the *previous* step (up to ~2x too low).
+
+Treat a ramp figure as a fast estimate. To publish a number, confirm it at a
+fixed rate, without `--ramp`, over the full duration:
+
+```bash
+# ramp reported, say, ~3.1M before declaring saturation -- verify it holds:
+dnsmark -s <ip> -Q 3100000 -l 30
+```
+
 ---
 
 ## 6. Reference Result

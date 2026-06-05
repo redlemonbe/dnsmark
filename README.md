@@ -68,6 +68,8 @@ dnsmark's client-side overhead happens to be lower than dnsperf's (batched `recv
 
 See **[docs/benchmarking.md §7](docs/benchmarking.md)** for the full three-term decomposition (dnsmark, dnsperf and the wire, on two rigs and both generator↔receiver directions) and the exact commands to reproduce it.
 
+> **Concurrency (`-c`).** Each client is a dedicated OS thread. `-c auto` (the default) uses one thread per physical core (HT excluded) -- the sweet spot. Setting `-c` far above the physical core count oversubscribes the CPU and adds scheduling jitter to *both* throughput and latency; raise it only when the bottleneck is clearly elsewhere.
+
 ---
 
 ## Install
