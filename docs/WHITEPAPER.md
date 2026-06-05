@@ -255,12 +255,12 @@ schema is stable and is the recommended interface for automated comparison.
 
 ---
 
-## 10. SIMD copy in the hot path — measured verdict
+## 10. The hot-path copy — why it is plain `copy_from_slice`
 
 `write_with_index()` (`query/wire.rs`) assembles each DNS query frame by copying a
 pre-built wire template (30–60 bytes) into the send buffer and patching 2 bytes (the
-transaction ID). The copy is dispatched through `simd::memcpy_dispatch()` (`simd.rs`):
-AVX2 (32 B/iter) → SSE2 (16 B/iter) → scalar, detected once at process start.
+transaction ID). We evaluated a hand-written, runtime-dispatched SIMD copy (AVX2 32 B/iter
+→ SSE2 16 B/iter) against the standard library's `copy_from_slice`, and measured both.
 
 ### Microbench — isolated copy (criterion, 200 samples × ≥1 B iterations, Threadripper PRO 5995WX AVX2)
 
@@ -294,21 +294,17 @@ by the copy path.
 
 ### Decision
 
-The hand-written SIMD is **not beneficial at these packet sizes and is not removed**
-for two reasons:
+Because `copy_from_slice` is **as fast as or faster than** the hand-written SIMD at these
+sizes — and is simpler, `unsafe`-free, and one fewer thing to audit — the hot-path copy
+uses `copy_from_slice`, and the hand-rolled AVX2/SSE2 memcpy has been **removed**
+(v2.0.2). CPU-tier detection is kept only for the startup banner.
 
-1. On bare-metal X520 at 10 Mpps, each worker calls `write_with_index` at ~10 MHz; the
-   ~1 ns difference accumulates to ~10 ms/s per core — negligible against the NIC
-   receive/transmit budget, and the compiler may inline the scalar path differently on
-   a production build anyway.
-2. The code is already written, tested, and audited; removing it for a sub-1% gain
-   (that cannot be measured end-to-end) introduces churn for no user-visible benefit.
-
-**What is not claimed:** dnsmark does not assert any SIMD-driven speedup in its
-documentation. The copy path is described as a detail of implementation, not a
-performance feature. If a future profiling session on a 25/100 G NIC shows the copy
-is on the critical path, the correct fix is to eliminate the copy entirely (zero-copy
-UMEM frames reuse the template in-place).
+The numbers above are retained as the recorded justification: the change is backed by a
+measurement, not a hunch, and the comparison is reproducible from the git history.
+dnsmark claims **no** SIMD-driven speedup anywhere — the copy is an implementation
+detail, not a feature. If profiling on a 25/100 G NIC ever puts the copy on the critical
+path, the correct fix is to eliminate the copy entirely (zero-copy UMEM frames reuse the
+template in-place), not to re-introduce a hand-rolled loop.
 
 ---
 

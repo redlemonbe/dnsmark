@@ -1,6 +1,6 @@
 [package]
 name = "dnsmark"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "High-performance DNS benchmark — drop-in dnsperf replacement"
@@ -42,10 +42,3 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "simd_bench"
-harness = false
