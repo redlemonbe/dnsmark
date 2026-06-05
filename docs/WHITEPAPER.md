@@ -88,6 +88,52 @@ Why this shape:
 
 ---
 
+## 3b. The throughput datapath (saturation mode)
+
+The unified loop above is **latency-accurate**, but it pays for that accuracy: every
+iteration is ~3 syscalls (`sendmsg` + `poll` + `recvmmsg`) plus per-query bookkeeping
+(timestamp, histogram, the outstanding atomic). That is the right trade-off when you
+*measure* latency — but it caps the raw send rate.
+
+When all you need is **maximum offered load** — `--max-outstanding 0` (saturation /
+flood) — dnsmark switches to a dedicated **throughput worker**
+(`transport/udp.rs::throughput_udp_worker`) that strips everything not needed to
+bombard:
+
+- **`sendmmsg`, batch 64** — one syscall pushes 64 queries instead of one `send` per
+  packet, amortising the syscall-entry cost (the dominant per-packet overhead in
+  kernel mode).
+- **bulk `recvmmsg`, drained periodically** — not after every packet; responses are
+  counted for loss accounting, never timed per query.
+- **no `poll`** per packet — no latency-precise wake-up is needed when flooding.
+- **no shared atomic on the hot path** — the outstanding gate is off in unlimited
+  mode, so each worker keeps a purely local counter and flushes in batches: zero
+  cross-core cache-line traffic per packet.
+
+Measured at the CPU-cycle level (bare-metal X520, `perf`), the generator's **own**
+(user-space) cost collapses — the per-packet bookkeeping is gone — leaving the loop
+essentially **kernel-bound** (the irreducible UDP-stack traversal). dnsmark then sends
+*more* packets at *fewer* cycles each.
+
+**Bench (dragonrage AMD -> dragonsage, X520 10 GbE, vs unbound, measured at NIC
+tx_packets):**
+
+| generator | offered (NIC) |
+|---|---|
+| dnsmark, single-send (before the throughput path) | ~500 k qps |
+| dnsperf (`-q 1000`) | ~610 k qps |
+| **dnsmark, throughput path** | **~680 k qps** |
+
+In pure kernel mode the throughput path **exceeds dnsperf**. Per-query user-space cost
+fell from ~17 k to ~340 cycles; total cost from ~128 k to ~94 k cycles/query.
+
+> **This mode is NOT a latency measurement.** Send timestamps are per-batch, so the
+> p50/p99 reported under `--max-outstanding 0` are throughput-mode figures, not
+> comparable to dnsperf's latency. For any latency comparison use
+> `--max-outstanding > 0` (the closed-loop path of section 3), which is unchanged.
+
+---
+
 ## 4. In-flight tracking and the latency histogram
 
 **Per-worker in-flight table.** Each worker keeps its own table mapping query id →
