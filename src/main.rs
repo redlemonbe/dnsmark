@@ -269,6 +269,8 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("build tokio runtime")?;
 
+    crate::autodetect::log_host_info(config.server);
+
     rt.block_on(async {
         if let Some(secondary) = config.compare {
             // Compare mode (mono-NIC, uses config.server)

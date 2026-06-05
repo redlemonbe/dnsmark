@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic V
 
 ---
 
+## [2.0.5] — 2026-06-05
+
+### Added
+
+- **Host environment capture (#6).** `--json` output now includes a `host` object — CPU
+  model, physical cores / logical threads, NUMA nodes, total memory, and the egress NIC
+  toward the target (interface, driver, link speed, NUMA node) — and a one-line host
+  banner is printed at startup. A `notes` field flags a result that may be bounded by the
+  **receiver's** NIC/bus rather than the server software (high loss → read the receiver's
+  NIC counters; see docs/benchmarking.md §3). Generator-side capture; receiver-side is out
+  of scope (no remote hook).
+
+---
+
 ## [2.0.4] — 2026-06-05
 
 Hardening and measurement-correctness follow-ups to 2.0.0, each backed by a bench or a

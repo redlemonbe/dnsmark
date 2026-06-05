@@ -170,3 +170,85 @@ pub fn physical_cores_numa_sorted(preferred_node: Option<usize>) -> Vec<usize> {
     local.extend(remote);
     local
 }
+
+// ── Host environment capture (issue #6) ─────────────────────────────────────
+
+/// First "model name" line from /proc/cpuinfo (x86); None on arches without it.
+pub fn cpu_model_name() -> Option<String> {
+    let txt = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    for line in txt.lines() {
+        if let Some(v) = line.strip_prefix("model name") {
+            return Some(v.trim_start_matches([':', ' ', '\t']).trim().to_string());
+        }
+    }
+    None
+}
+
+/// Number of NUMA nodes (`/sys/devices/system/node/nodeN`); 1 if unknown.
+pub fn numa_node_count() -> usize {
+    let mut n = 0usize;
+    if let Ok(rd) = std::fs::read_dir("/sys/devices/system/node") {
+        for e in rd.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if name.len() > 4 && name.starts_with("node")
+                    && name[4..].chars().all(|c| c.is_ascii_digit())
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n.max(1)
+}
+
+/// Kernel driver bound to `iface` (basename of `.../device/driver`).
+pub fn nic_driver(iface: &str) -> Option<String> {
+    let link = std::fs::read_link(format!("/sys/class/net/{iface}/device/driver")).ok()?;
+    link.file_name()?.to_str().map(|s| s.to_string())
+}
+
+/// Link speed in Mb/s from `/sys/class/net/<if>/speed` (None if down/unknown).
+pub fn nic_speed_mbps(iface: &str) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/speed")).ok()?;
+    match s.trim().parse::<i64>().ok()? {
+        v if v > 0 => Some(v as u64),
+        _ => None,
+    }
+}
+
+/// JSON snapshot of the **generator** host + the egress NIC toward `target`.
+pub fn host_info_json(target: std::net::IpAddr) -> serde_json::Value {
+    let (mem_total_kb, _) = read_proc_meminfo_total_and_avail_kb();
+    let nic = iface_for_addr(target).map(|ifc| serde_json::json!({
+        "iface":      ifc,
+        "driver":     nic_driver(&ifc),
+        "speed_mbps": nic_speed_mbps(&ifc),
+        "numa_node":  numa_node_for_iface(&ifc),
+    }));
+    serde_json::json!({
+        "role": "generator (the host running dnsmark)",
+        "cpu": {
+            "model":           cpu_model_name(),
+            "physical_cores":  num_cpus::get_physical(),
+            "logical_threads": num_cpus::get(),
+        },
+        "numa_nodes":   numa_node_count(),
+        "mem_total_mb": mem_total_kb / 1024,
+        "nic":          nic,
+    })
+}
+
+/// One-line host banner at startup (stderr), companion to `log_simd_info()`.
+pub fn log_host_info(target: std::net::IpAddr) {
+    let model = cpu_model_name().unwrap_or_else(|| "unknown CPU".into());
+    let nic = iface_for_addr(target)
+        .map(|i| format!("{} ({}, {})",
+            i,
+            nic_driver(&i).unwrap_or_else(|| "?".into()),
+            nic_speed_mbps(&i).map(|s| format!("{s}Mb/s")).unwrap_or_else(|| "?".into())))
+        .unwrap_or_else(|| "n/a".into());
+    eprintln!(
+        "[dnsmark] host: {} ({}c/{}t, {} NUMA) | egress NIC: {}",
+        model, num_cpus::get_physical(), num_cpus::get(), numa_node_count(), nic
+    );
+}
