@@ -312,6 +312,139 @@ fn unified_udp_worker(
     }
 }
 
+
+// ─── Throughput worker (max_outstanding == 0 / flood mode) ───────────────────
+//
+// This path is active ONLY when max_outstanding == 0 (saturation/flood).
+//
+// Design: reduce syscall count per packet.
+//   Closed-loop path (latency): ~3 syscalls/pkt — send()+poll()+recvmmsg()
+//   Throughput path:            ~1/64 sendmmsg() + ~1/256 recvmmsg() = <<1/pkt
+//
+// Trade-offs (documented — do NOT use for latency measurement):
+//   - send timestamp is per-batch, not per-query → p50/p99 marked "throughput"
+//   - no poll() → recv is drained periodically, not on each response
+//   - no global_in_flight gate → local counters only, zero shared state on hot path
+//
+// The closed-loop path (max_outstanding > 0) is BIT-FOR-BIT unchanged.
+
+const TX_BATCH: usize = 64;         // sendmmsg batch size
+const DRAIN_EVERY: usize = 4;       // drain RX every N TX batches (= every 256 pkts)
+const FLUSH_STATS: usize = 16;      // flush local counters to Arc<StatsCollector> every N batches
+
+#[allow(clippy::too_many_arguments)]
+fn throughput_udp_worker(
+    fd: i32,
+    wire_pool: Arc<WireQueryPool>,
+    stats: Arc<StatsCollector>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // ── TX buffers (allocated once) ──────────────────────────────────────────
+    let mut tx_flat: Vec<u8> = vec![0u8; TX_BATCH * MAX_QUERY];
+    let mut tx_iovecs: Vec<libc::iovec> = (0..TX_BATCH)
+        .map(|i| libc::iovec {
+            iov_base: unsafe { tx_flat.as_mut_ptr().add(i * MAX_QUERY) as *mut libc::c_void },
+            iov_len:  MAX_QUERY,
+        })
+        .collect();
+    let mut tx_msgs: Vec<libc::mmsghdr> = tx_iovecs
+        .iter_mut()
+        .map(|iov| {
+            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            m.msg_hdr.msg_iov    = iov as *mut libc::iovec;
+            m.msg_hdr.msg_iovlen = 1;
+            m
+        })
+        .collect();
+
+    // ── RX buffers (allocated once) ──────────────────────────────────────────
+    const RX_BATCH: usize = 256;
+    let mut rx_flat: Vec<u8> = vec![0u8; RX_BATCH * MAX_MSG_SIZE];
+    let mut rx_iovecs: Vec<libc::iovec> = (0..RX_BATCH)
+        .map(|i| libc::iovec {
+            iov_base: unsafe { rx_flat.as_mut_ptr().add(i * MAX_MSG_SIZE) as *mut libc::c_void },
+            iov_len:  MAX_MSG_SIZE,
+        })
+        .collect();
+    let mut rx_msgs: Vec<libc::mmsghdr> = rx_iovecs
+        .iter_mut()
+        .map(|iov| {
+            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            m.msg_hdr.msg_iov    = iov as *mut libc::iovec;
+            m.msg_hdr.msg_iovlen = 1;
+            m
+        })
+        .collect();
+
+    // ── Per-worker local counters (zero shared state on hot path) ────────────
+    let mut local_sent:      u64 = 0;
+    let mut local_completed: u64 = 0;
+
+    let mut next_id:  u16   = rand::random();
+    let mut tmpl_idx: usize = rand::random();
+    let mut batch_ctr: usize = 0;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) { break; }
+
+        // ── Build + send one TX batch (sendmmsg, 1 syscall for TX_BATCH pkts) ─
+        let mut built = 0usize;
+        for i in 0..TX_BATCH {
+            let slot = &mut tx_flat[i * MAX_QUERY..(i + 1) * MAX_QUERY];
+            let qlen = wire_pool.write_with_index(tmpl_idx, next_id, slot);
+            tx_iovecs[i].iov_len  = qlen;
+            tx_msgs[i].msg_hdr.msg_iov    = &mut tx_iovecs[i] as *mut libc::iovec;
+            tx_msgs[i].msg_hdr.msg_iovlen = 1;
+            tmpl_idx = tmpl_idx.wrapping_add(1);
+            next_id  = next_id.wrapping_add(1);
+            built += 1;
+        }
+
+        // Single sendmmsg syscall for the whole batch
+        let sent = unsafe {
+            libc::sendmmsg(fd, tx_msgs.as_mut_ptr(), built as libc::c_uint, libc::MSG_DONTWAIT)
+        };
+        if sent > 0 {
+            local_sent += sent as u64;
+        }
+
+        batch_ctr += 1;
+
+        // ── Drain RX every DRAIN_EVERY batches ───────────────────────────────
+        if batch_ctr % DRAIN_EVERY == 0 {
+            loop {
+                let n = unsafe {
+                    libc::recvmmsg(
+                        fd,
+                        rx_msgs.as_mut_ptr(),
+                        RX_BATCH as libc::c_uint,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if n <= 0 { break; }
+                local_completed += n as u64;
+            }
+        }
+
+        // ── Flush local counters to shared stats every FLUSH_STATS batches ───
+        if batch_ctr % FLUSH_STATS == 0 {
+            if local_sent > 0 {
+                stats.inc_sent_n(local_sent as usize);
+                local_sent = 0;
+            }
+            if local_completed > 0 {
+                stats.inc_completed_n(local_completed);
+                local_completed = 0;
+            }
+        }
+    }
+
+    // ── Final flush ──────────────────────────────────────────────────────────
+    if local_sent > 0      { stats.inc_sent_n(local_sent as usize); }
+    if local_completed > 0 { stats.inc_completed_n(local_completed); }
+}
+
 // ─── Public async entry point ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -348,8 +481,16 @@ pub async fn run_udp_worker(
     tokio::task::spawn_blocking(move || {
         super::pin_to_cpu(worker_id);
         let _sock = socket;
-        unified_udp_worker(fd, wire_pool, stats, shutdown, qps_per_worker,
-            verbose, max_outstanding, global_in_flight, timeout_dur);
+        if max_outstanding == 0 {
+            // Throughput / flood mode: sendmmsg batch, no poll, no per-pkt atomic.
+            // NOT suitable for latency measurement — timestamps are per-batch.
+            throughput_udp_worker(fd, wire_pool, stats, shutdown);
+        } else {
+            // Closed-loop / latency mode: single send, timestamp per query,
+            // poll-with-deadline, HDR histogram. Comparable to dnsperf.
+            unified_udp_worker(fd, wire_pool, stats, shutdown, qps_per_worker,
+                verbose, max_outstanding, global_in_flight, timeout_dur);
+        }
     }).await.ok();
 }
 
