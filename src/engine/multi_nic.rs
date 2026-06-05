@@ -282,13 +282,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_two_nics_weighted_p99() {
-        // NIC1: 9M done, p99=200  |  NIC2: 1M done, p99=800
-        // weighted p99 = (9M*200 + 1M*800) / 10M = (1800M + 800M) / 10M = 260
+    fn merge_two_nics_worst_nic_p99() {
+        // NIC1: 9M done, p99=200  |  NIC2: 1M done (10% of traffic), p99=800.
+        // A weighted average would report (9M*200 + 1M*800)/10M = 260 and HIDE the slow
+        // NIC. The aggregate reports the worst NIC's p99 (800), surfacing it instead.
         let s1 = make_snap(9_000_000, 9_000_000, 900_000.0, 200, 10.0);
         let s2 = make_snap(1_000_000, 1_000_000, 100_000.0, 800, 10.0);
         let m  = merge_snapshots(&[s1, s2]);
-        assert_eq!(m.p99_us, 260);
+        assert_eq!(m.p99_us, 800, "aggregate p99 must be the worst NIC's, not a masking average");
     }
 
     #[test]
