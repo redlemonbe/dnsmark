@@ -317,15 +317,15 @@ fn xdp_unified_worker(
         }
 
         // 5) Expire timed-out queries every 10 ms.
-        // Expired queries are recorded in the latency histogram at their real age
-        // (honest tail: p99/p999 includes the slowest queries, not just the ones
-        // that got a response in time).
+        // A timed-out query is a loss (no response arrived within the timeout): count
+        // it, but do not record it as a completion or a latency sample. The histogram
+        // holds real response latencies only — slow responses still count (default
+        // timeout is 3 s), genuine timeouts do not pollute the latency distribution.
         let now = Instant::now();
         if now.duration_since(last_timeout) >= Duration::from_millis(10) {
             let ages = in_flight.sweep_with_ages(timeout_dur);
             if !ages.is_empty() {
-                for &age_us in &ages {
-                    stats.record_response(0xff, age_us); // rcode=0xff = timeout sentinel
+                for _ in &ages {
                     stats.inc_timeout();
                 }
                 if max_outstanding > 0 {
@@ -335,13 +335,10 @@ fn xdp_unified_worker(
             last_timeout = now;
         }
     }
-    // End-of-run: drain remaining in-flight queries into the histogram as losses.
-    // They will not have a real RTT — record them at their current age so the
-    // histogram is honest (no silent truncation of slow queries).
+    // End-of-run: queries still in flight never got a response → losses.
     {
         let remaining = in_flight.drain_all();
-        for &age_us in &remaining {
-            stats.record_response(0xff, age_us); // timeout sentinel
+        for _ in &remaining {
             stats.inc_timeout();
         }
         if local_sent > 0 { stats.inc_sent_n(local_sent); }
@@ -423,9 +420,8 @@ fn xdp_receiver_thread(
             if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
                 let ages = in_flight.sweep_with_ages(timeout_dur);
                 if !ages.is_empty() {
-                    for &age_us in &ages {
-                        stats.record_response(0xff, age_us);
-                        stats.inc_timeout();
+                    for _ in &ages {
+                        stats.inc_timeout(); // timeout = loss, not a completion or latency
                     }
                     global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(ages.len()))).ok();
                 }
@@ -468,8 +464,7 @@ fn xdp_receiver_thread(
         // Expire timed-out queries every 10 ms.
         let now = Instant::now();
         if now.duration_since(last_timeout_check) >= Duration::from_millis(10) {
-            let _ages_legacy = in_flight.sweep_with_ages(timeout_dur); let expired = _ages_legacy.len();
-            if !_ages_legacy.is_empty() { for &age_us in &_ages_legacy { stats.record_response(0xff, age_us); } }
+            let expired = in_flight.sweep_with_ages(timeout_dur).len();
             if expired > 0 {
                 for _ in 0..expired { stats.inc_timeout(); }
                 global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {

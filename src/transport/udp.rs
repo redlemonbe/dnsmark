@@ -181,11 +181,10 @@ fn unified_udp_worker(
                     libc::send(fd, single_buf.as_ptr() as *const libc::c_void, qlen, libc::MSG_DONTWAIT)
                 };
                 if ret >= 0 {
-                    // insert() returns Some(age_us) if a different query was evicted
-                    // from this slot (flood mode, table full). Account for it as a
-                    // timeout so sent == completed + lost is always exact.
-                    if let Some(evicted_age_us) = in_flight.insert(next_id, send_ns) {
-                        stats.record_response(0xff, evicted_age_us);
+                    // insert() returns Some(_) if a different query was evicted from this
+                    // slot (flood mode, table full). Count it as a timeout — a loss, not a
+                    // completion — so `lost` reflects it and `sent == completed + lost`.
+                    if in_flight.insert(next_id, send_ns).is_some() {
                         stats.inc_timeout();
                         global_in_flight.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -285,8 +284,10 @@ fn unified_udp_worker(
             let now_ns = base.elapsed().as_nanos() as u64;
             let expired = in_flight.sweep(now_ns, timeout_ns);
             let n_exp = expired.len();
-            for age_us in expired {
-                stats.record_response(0xff, age_us);
+            // A timeout is a loss (no response arrived in time): count it, but do not
+            // record it as a completion or as a latency sample. The histogram holds
+            // real response latencies only.
+            for _ in 0..n_exp {
                 stats.inc_timeout();
             }
             if n_exp > 0 {
@@ -301,8 +302,8 @@ fn unified_udp_worker(
     let now_ns = base.elapsed().as_nanos() as u64;
     let remaining = in_flight.drain(now_ns);
     let n_rem = remaining.len();
-    for age_us in remaining {
-        stats.record_response(0xff, age_us);
+    // Queries still in flight when the run ends never got a response → losses.
+    for _ in 0..n_rem {
         stats.inc_timeout();
     }
     if n_rem > 0 {

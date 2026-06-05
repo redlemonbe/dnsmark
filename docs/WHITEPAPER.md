@@ -105,17 +105,15 @@ send timestamp — there is no shared map and no per-packet lock.
 p50/p95/p99/p999, min, mean and max are read at the end. HDR gives constant-time
 recording and bounded relative error across six orders of magnitude.
 
-**Honest tail — the part most tools get wrong.** A query that never gets a response
-must not simply vanish from the percentiles, or the tail is silently truncated and the
-server looks better than it is. dnsmark records *every* outstanding query into the
-histogram at its real age:
-
-- the **10 ms timeout sweep** records each expired query at its measured age and counts
-  a timeout (`record_response(0xff, age); inc_timeout()`);
-- at **end of run**, any still-in-flight query is drained into the histogram the same
-  way.
-
-So p99/p999 reflect the slowest responses, including the ones that timed out.
+**Honest tail — slow responses count, losses are losses.** A *slow response* — one that
+arrives within the timeout (default 3 s) — is recorded at its real RTT, so p99/p999
+include the genuinely slow responses; the tail is never truncated by a generator that
+keeps only the fast ones. A query that gets **no** response (a *timeout*) is a different
+thing: it is a **loss**, not a completion and not a latency sample. The 10 ms sweep and
+the end-of-run drain mark such queries as timeouts (`inc_timeout`); they move into
+`queries_lost`, never into `queries_completed` or the latency histogram. This matches
+dnsperf and keeps three counters clean: `queries_completed` = real responses,
+`queries_lost` = timeouts + send errors, and `sent == completed + lost` exactly.
 
 **Outstanding depth** is tracked too (mean and max concurrent in-flight), and reported
 in JSON — this is the number to align with dnsperf's `-q` when comparing the two tools.
@@ -231,14 +229,12 @@ schema is stable and is the recommended interface for automated comparison.
 - **In-flight table sizing and eviction accounting.** Each UDP worker's in-flight table
   is a power-of-two slot array indexed by `id & (len−1)`. With sequentially-issued ids
   and the table sized to ≥ the outstanding window (controlled-rate mode), there are zero
-  collisions and `sent == completed + lost` exactly. In **flood/unlimited** mode
-  (`--max-outstanding 0`) the number in flight can exceed the table length; when two ids
-  hash to the same slot, `insert()` detects the collision, records the evicted query's
-  real age into the latency histogram as a timeout (`record_response(0xff, age_us)`),
-  and decrements `global_in_flight` — so the accounting identity `sent == completed +
-  lost` holds exactly even in flood mode. The tail is never silently truncated.
-  Quote latency from **controlled-rate** runs; flood-mode p99 reflects both true slow
-  responses and eviction timeouts.
+  collisions. In **flood/unlimited** mode (`--max-outstanding 0`) the number in flight
+  can exceed the table length; when two ids hash to the same slot, `insert()` detects the
+  collision and the evicted query is counted as a **timeout** (a loss) and removed from
+  `global_in_flight` — so `sent == completed + lost` holds exactly even in flood mode,
+  with no query silently disappearing. Eviction-timeouts, like all timeouts, count toward
+  `queries_lost`, not the latency histogram. Quote latency from **controlled-rate** runs.
 - **`--compare` shares one async runtime.** The two servers run as concurrent tasks in
   the same runtime, so a side-by-side compare is fair at controlled rates but not a clean
   isolation at saturation (the tasks contend for the runtime). For saturation
