@@ -58,6 +58,12 @@ impl StatsCollector {
         self.timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Bulk-increment completed counter (throughput path, no RTT recorded).
+    pub fn inc_completed_n(&self, n: u64) {
+        self.completed.fetch_add(n, Ordering::Relaxed);
+        self.rcode_noerror.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn inc_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
