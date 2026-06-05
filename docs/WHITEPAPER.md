@@ -228,12 +228,17 @@ schema is stable and is the recommended interface for automated comparison.
 
 ### Known caveats (write them down rather than hide them)
 
-- **In-flight table sizing.** Each worker's in-flight table is a power-of-two slot array
-  indexed by DNS id. With sequentially-issued ids and the table sized to ≥ the
-  outstanding window it is collision-free in controlled-rate mode. In **unlimited/flood**
-  mode (`--max-outstanding 0`) the number in flight can exceed the table; a colliding id
-  is then overwritten and later counted as a timeout — a small, bounded perturbation,
-  consistent with the honest-tail accounting. Quote latency from **controlled-rate** runs.
+- **In-flight table sizing and eviction accounting.** Each UDP worker's in-flight table
+  is a power-of-two slot array indexed by `id & (len−1)`. With sequentially-issued ids
+  and the table sized to ≥ the outstanding window (controlled-rate mode), there are zero
+  collisions and `sent == completed + lost` exactly. In **flood/unlimited** mode
+  (`--max-outstanding 0`) the number in flight can exceed the table length; when two ids
+  hash to the same slot, `insert()` detects the collision, records the evicted query's
+  real age into the latency histogram as a timeout (`record_response(0xff, age_us)`),
+  and decrements `global_in_flight` — so the accounting identity `sent == completed +
+  lost` holds exactly even in flood mode. The tail is never silently truncated.
+  Quote latency from **controlled-rate** runs; flood-mode p99 reflects both true slow
+  responses and eviction timeouts.
 - **`--compare` shares one async runtime.** The two servers run as concurrent tasks in
   the same runtime, so a side-by-side compare is fair at controlled rates but not a clean
   isolation at saturation (the tasks contend for the runtime). For saturation
