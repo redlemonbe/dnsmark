@@ -242,6 +242,15 @@ startup.
   `global_in_flight` — so `sent == completed + lost` holds exactly even in flood mode,
   with no query silently disappearing. Eviction-timeouts, like all timeouts, count toward
   `queries_lost`, not the latency histogram. Quote latency from **controlled-rate** runs.
+- **Flood mode bounds the latency window (read p99 with the loss rate).** A consequence of
+  the above: at offered rate *R*, the in-flight table holds at most `table_len` queries,
+  so a response slower than ≈ `table_len / R` is evicted (counted as a *loss*) before it
+  can return. In **flood** the latency histogram therefore holds only the responses that
+  came back *within* that window — its p99 is the latency of the queries that **made it
+  back**, and is optimistic if read without the loss rate. This is not hidden data (the
+  slow ones are losses, reported in `queries_lost`), but it means **p99 in flood must be
+  read together with loss%** — and for any latency figure you should use a controlled rate,
+  where there are no evictions and loss ≈ 0.
 - **`--compare` shares one async runtime.** The two servers run as concurrent tasks in
   the same runtime, so a side-by-side compare is fair at controlled rates but not a clean
   isolation at saturation (the tasks contend for the runtime). For saturation
