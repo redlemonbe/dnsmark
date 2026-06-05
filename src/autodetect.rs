@@ -15,24 +15,47 @@ pub fn detect() -> AutoConfig {
     AutoConfig { cpus, mem_mb, af_xdp_socket_available }
 }
 
-/// Returns the logical CPU IDs of physical cores only — one per physical
-/// core_id, selected by reading /sys topology. HT siblings are excluded.
+fn read_topo(cpu_id: usize, file: &str) -> Option<usize> {
+    std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu_id}/topology/{file}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Returns one logical CPU id per **physical** core, HT siblings excluded.
 ///
-/// Falls back to `0..num_cpus::get_physical()` if /sys is unavailable.
+/// Enumerates the real `/sys/devices/system/cpu/cpuN` entries — so it is correct for
+/// any SMT width (2/4/8) and for sparse/high CPU ids (e.g. a cgroup cpuset), unlike a
+/// `0..N*2` scan. Dedups by **(package, core)**, not `core_id` alone, so cores on a
+/// second socket (where `core_id` repeats) are not collapsed.
+///
+/// Falls back to `0..num_cpus::get_physical()` if `/sys` is unavailable.
 pub fn physical_cores() -> Vec<usize> {
+    let mut ids: Vec<usize> = match std::fs::read_dir("/sys/devices/system/cpu") {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let digits = name.strip_prefix("cpu")?;
+                if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                    digits.parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => return (0..num_cpus::get_physical()).collect(),
+    };
+    ids.sort_unstable();
+
     let mut seen = std::collections::HashSet::new();
     let mut cores = Vec::new();
-
-    for cpu_id in 0..num_cpus::get() * 2 {
-        let path = format!(
-            "/sys/devices/system/cpu/cpu{}/topology/core_id",
-            cpu_id
-        );
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(core_id) = s.trim().parse::<usize>() {
-                if seen.insert(core_id) {
-                    cores.push(cpu_id);
-                }
+    for cpu_id in ids {
+        if let Some(core) = read_topo(cpu_id, "core_id") {
+            let pkg = read_topo(cpu_id, "physical_package_id").unwrap_or(0);
+            if seen.insert((pkg, core)) {
+                cores.push(cpu_id);
             }
         }
     }

@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic V
 
 ---
 
+## [2.0.6] — 2026-06-05
+
+### Fixed
+
+- **`physical_cores()` CPU enumeration.** It now walks the real
+  `/sys/devices/system/cpu/cpuN` entries — correct for any SMT width (2/4/8) and for
+  sparse/high CPU ids (e.g. a cgroup cpuset) — and dedups by **(package, core)** rather
+  than `core_id` alone, so on a multi-socket host the second socket's cores are no longer
+  collapsed (a dual-socket box previously reported ~half its physical cores). Still
+  returns exactly **one logical CPU per physical core — HT siblings are excluded** (we pin
+  to real cores, never HyperThreads). Falls back to `num_cpus::get_physical()` if `/sys`
+  is absent.
+
+---
+
 ## [2.0.5] — 2026-06-05
 
 ### Added
