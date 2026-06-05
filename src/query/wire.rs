@@ -25,6 +25,13 @@ impl WireQueryPool {
         Self { templates }
     }
 
+    /// Return the raw wire template at `local_idx % len` (read-only).
+    /// Used by benchmarks and tests as scalar baseline for A/B comparison.
+    #[inline]
+    pub fn get_template(&self, local_idx: usize) -> &[u8] {
+        &self.templates[local_idx % self.templates.len()]
+    }
+
     /// Write the template at caller-owned cursor `local_idx` (mod len) into `buf`,
     /// patch the transaction ID, return the bytes written. `buf` must be >= the
     /// template length. SIMD-accelerated copy (AVX2 → SSE2 → scalar, runtime dispatch).
