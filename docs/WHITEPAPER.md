@@ -258,3 +258,60 @@ schema is stable and is the recommended interface for automated comparison.
 *This document describes the implementation as of v2.0.0. Mechanisms are referenced to
 their source files so the description can be checked against the code rather than taken
 on trust.*
+
+---
+
+## 9. SIMD copy in the hot path — measured verdict
+
+`write_with_index()` (`query/wire.rs`) assembles each DNS query frame by copying a
+pre-built wire template (30–60 bytes) into the send buffer and patching 2 bytes (the
+transaction ID). The copy is dispatched through `simd::memcpy_dispatch()` (`simd.rs`):
+AVX2 (32 B/iter) → SSE2 (16 B/iter) → scalar, detected once at process start.
+
+### Microbench — isolated copy (criterion, 200 samples × ≥1 B iterations, Threadripper PRO 5995WX AVX2)
+
+| Template size | SIMD (AVX2) | Scalar (`copy_from_slice`) | SIMD slower by |
+|---------------|-------------|---------------------------|----------------|
+| 21 B (short)  | 3.83 ns     | **2.97 ns**               | +29%           |
+| 43 B (medium) | 4.13 ns     | **2.90 ns**               | +42%           |
+| 59 B (long)   | 4.28 ns     | **2.78 ns**               | +54%           |
+
+At these sizes (< 64 bytes), the compiler-generated `copy_from_slice` under `-O3`
+(which emits `vmovdqu` + `vmovq` automatically, without function-call overhead) is
+**consistently faster** than the hand-written AVX2 loop. The loop's overhead comes from
+the function-call boundary, the branch on `len >= 32`, and the loop counter — all
+absent in the inlined scalar path.
+
+### End-to-end A/B — 3 paired runs, -c 4 -Q 100000 -l 5, VM virtio-net, same unbound receiver
+
+| Run | Binary     | qps    | p50   | p99    |
+|-----|------------|--------|-------|--------|
+| 1   | SIMD (AVX2)| 99 860 | 87 µs | 161 µs |
+| 1   | Scalar     | 99 812 | 86 µs | 153 µs |
+| 2   | SIMD (AVX2)| 99 473 | 92 µs | 1122 µs|
+| 2   | Scalar     | 99 817 | 92 µs | 186 µs |
+| 3   | SIMD (AVX2)| 99 841 | 84 µs | 318 µs |
+| 3   | Scalar     | 99 781 | 93 µs | 352 µs |
+
+p50 and qps are **indistinguishable** across runs — the ~1 ns/op difference in the
+isolated copy is completely masked by the syscall (`send()` ~3–5 µs) and the network
+RTT (~85 µs). p99 variance is dominated by scheduler jitter on the shared test VM, not
+by the copy path.
+
+### Decision
+
+The hand-written SIMD is **not beneficial at these packet sizes and is not removed**
+for two reasons:
+
+1. On bare-metal X520 at 10 Mpps, each worker calls `write_with_index` at ~10 MHz; the
+   ~1 ns difference accumulates to ~10 ms/s per core — negligible against the NIC
+   receive/transmit budget, and the compiler may inline the scalar path differently on
+   a production build anyway.
+2. The code is already written, tested, and audited; removing it for a sub-1% gain
+   (that cannot be measured end-to-end) introduces churn for no user-visible benefit.
+
+**What is not claimed:** dnsmark does not assert any SIMD-driven speedup in its
+documentation. The copy path is described as a detail of implementation, not a
+performance feature. If a future profiling session on a 25/100 G NIC shows the copy
+is on the critical path, the correct fix is to eliminate the copy entirely (zero-copy
+UMEM frames reuse the template in-place).
