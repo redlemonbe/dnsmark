@@ -207,6 +207,13 @@ CI/automation), as CSV (`--csv`), or as plain text: achieved QPS, sent/completed
 RCODE breakdown, latency min/mean/p50/p95/p99/p999/max, and in-flight mean/max. The JSON
 schema is stable and is the recommended interface for automated comparison.
 
+The JSON also carries a **`host`** object — the generator's CPU model, physical/logical
+core counts, NUMA nodes, memory, and the egress NIC (driver, link speed, NUMA node) — so a
+result records the rig it was produced on, and a **`notes`** array that flags conditions
+worth knowing (e.g. high loss → the result may be bounded by the *receiver's* NIC/bus, not
+the server; read the receiver's NIC counters). A one-line host banner is printed at
+startup.
+
 ---
 
 ## 9. Reproducibility and limitations
