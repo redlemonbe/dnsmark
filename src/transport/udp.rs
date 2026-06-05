@@ -21,20 +21,31 @@ const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 struct InFlight {
     slots: Vec<(u16, u64)>, // (query_id, send_time_ns); 0 = empty
-    count: usize,
 }
 
 impl InFlight {
     fn new(capacity: usize) -> Self {
         let cap = capacity.next_power_of_two().max(256);
-        Self { slots: vec![(0, 0); cap], count: 0 }
+        Self { slots: vec![(0, 0); cap] }
     }
 
+    /// Insert a new in-flight entry.
+    ///
+    /// Returns `Some(evicted_age_us)` if the slot was occupied by a **different** id
+    /// (hash collision in flood mode). The caller must account for it as a timeout.
+    /// Returns `None` in the common case (empty slot or same id re-sent).
     #[inline]
-    fn insert(&mut self, id: u16, now_ns: u64) {
+    fn insert(&mut self, id: u16, now_ns: u64) -> Option<u64> {
         let idx = (id as usize) & (self.slots.len() - 1);
-        if self.slots[idx].1 == 0 { self.count += 1; }
-        self.slots[idx] = (id, now_ns);
+        let slot = &mut self.slots[idx];
+        let evicted = if slot.1 != 0 && slot.0 != id {
+            // Collision: a different query occupies this slot. Evict it explicitly.
+            Some(now_ns.saturating_sub(slot.1) / 1000)
+        } else {
+            None
+        };
+        *slot = (id, now_ns);
+        evicted
     }
 
     #[inline]
@@ -44,7 +55,6 @@ impl InFlight {
         if slot.1 != 0 && slot.0 == id {
             let rtt_ns = now_ns.saturating_sub(slot.1);
             *slot = (0, 0);
-            self.count -= 1;
             Some(rtt_ns)
         } else {
             None
@@ -57,7 +67,6 @@ impl InFlight {
             if slot.1 != 0 && now_ns.saturating_sub(slot.1) >= timeout_ns {
                 expired.push(now_ns.saturating_sub(slot.1) / 1000);
                 *slot = (0, 0);
-                self.count -= 1;
             }
         }
         expired
@@ -71,7 +80,6 @@ impl InFlight {
                 *slot = (0, 0);
             }
         }
-        self.count = 0;
         ages
     }
 }
@@ -173,7 +181,14 @@ fn unified_udp_worker(
                     libc::send(fd, single_buf.as_ptr() as *const libc::c_void, qlen, libc::MSG_DONTWAIT)
                 };
                 if ret >= 0 {
-                    in_flight.insert(next_id, send_ns);
+                    // insert() returns Some(age_us) if a different query was evicted
+                    // from this slot (flood mode, table full). Account for it as a
+                    // timeout so sent == completed + lost is always exact.
+                    if let Some(evicted_age_us) = in_flight.insert(next_id, send_ns) {
+                        stats.record_response(0xff, evicted_age_us);
+                        stats.inc_timeout();
+                        global_in_flight.fetch_sub(1, Ordering::Relaxed);
+                    }
                     global_in_flight.fetch_add(1, Ordering::Relaxed);
                     stats.inc_sent();
                     if verbose { tracing::debug!(id = next_id, "sent query"); }
@@ -335,4 +350,82 @@ pub async fn run_udp_worker(
         unified_udp_worker(fd, wire_pool, stats, shutdown, qps_per_worker,
             verbose, max_outstanding, global_in_flight, timeout_dur);
     }).await.ok();
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+
+    #[test]
+    fn no_eviction_empty_slot() {
+        let mut ifl = InFlight::new(64);
+        // Insert into empty slot → no eviction
+        let evicted = ifl.insert(42, 1000);
+        assert!(evicted.is_none(), "empty slot must not evict");
+    }
+
+    #[test]
+    fn no_eviction_same_id_retry() {
+        let mut ifl = InFlight::new(64);
+        ifl.insert(42, 1_000_000); // t=1ms (never use 0 — sentinel for "empty")
+        // Same id re-sent (retry) → no eviction
+        let evicted = ifl.insert(42, 2_000_000);
+        assert!(evicted.is_none(), "same-id re-insert must not count as eviction");
+        // take should use the latest timestamp
+        let rtt = ifl.take(42, 3_000_000).unwrap();
+        assert_eq!(rtt, 1_000_000, "rtt = 3ms - 2ms = 1ms in ns");
+    }
+
+    #[test]
+    fn eviction_collision_flood_mode() {
+        // Table size 256; id 0 and id 256 map to slot 0 (x & 255).
+        // Use non-zero timestamps — 0 is the "empty" sentinel.
+        let mut ifl = InFlight::new(256);
+        ifl.insert(0, 1_000_000); // slot 0 ← id=0 at t=1ms
+        // id 256 collides at t=3ms → evicts id 0, age = (3ms-1ms) = 2ms = 2000µs
+        let evicted = ifl.insert(256, 3_000_000);
+        assert!(evicted.is_some(), "collision must return evicted age");
+        assert_eq!(evicted.unwrap(), 2000, "evicted age: (3ms-1ms)/1µs = 2000µs");
+        // id 0 gone
+        assert!(ifl.take(0, 4_000_000).is_none(), "evicted id must not be takeable");
+        // id 256 present
+        assert!(ifl.take(256, 4_000_000).is_some(), "new id must be present");
+    }
+
+    #[test]
+    fn controlled_rate_zero_eviction() {
+        // Sequential ids 1..=64 (skip 0, sentinel), table=1024 → no collisions.
+        let mut ifl = InFlight::new(1024);
+        for id in 1u16..=64 {
+            let evicted = ifl.insert(id, id as u64 * 1_000_000);
+            assert!(evicted.is_none(), "sequential ids must not collide (id={})", id);
+        }
+        for id in 1u16..=64 {
+            assert!(ifl.take(id, 100_000_000).is_some(), "id {} must be present", id);
+        }
+    }
+
+    #[test]
+    fn drain_returns_all_ages() {
+        let mut ifl = InFlight::new(64);
+        ifl.insert(1, 1_000_000); // t=1ms
+        ifl.insert(2, 2_000_000); // t=2ms
+        let ages = ifl.drain(5_000_000); // t=5ms
+        assert_eq!(ages.len(), 2, "both entries must be drained");
+        // Slots cleared — take must return None
+        assert!(ifl.take(1, 6_000_000).is_none());
+        assert!(ifl.take(2, 6_000_000).is_none());
+    }
+
+    #[test]
+    fn sweep_expires_old_entries() {
+        let mut ifl = InFlight::new(64);
+        ifl.insert(10, 1_000_000); // t=1ms
+        ifl.insert(11, 3_000_000); // t=3ms
+        // sweep at t=6ms, timeout=4ms → id10 (age 5ms ≥ 4ms) expires; id11 (age 3ms) survives
+        let expired = ifl.sweep(6_000_000, 4_000_000);
+        assert_eq!(expired.len(), 1, "one entry must expire");
+        assert_eq!(expired[0], 5000, "age = (6ms-1ms) = 5000µs");
+        assert!(ifl.take(11, 7_000_000).is_some(), "non-expired entry must remain");
+    }
 }
