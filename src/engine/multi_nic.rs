@@ -28,8 +28,10 @@ use crate::stats::StatsSnapshot;
 use super::run_with_shutdown;
 
 /// Merge N per-NIC snapshots into one aggregate.
-/// Totals are summed; latency metrics are weighted averages (by completed).
-/// run_time_s is the maximum (wall-clock of the longest NIC run).
+/// Totals are summed; mean latency is a weighted average (by completed); **percentiles
+/// are the worst NIC's value** — averaging percentiles is statistically invalid, and a
+/// max (unlike an average) never hides a pathological NIC. Use `--nic-stats` for true
+/// per-NIC percentiles. min/max span all NICs; run_time_s is the longest NIC run.
 fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
     if snaps.is_empty() {
         return StatsSnapshot {
@@ -67,15 +69,6 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
         snaps.iter().map(|s| f(s) * s.queries_completed as f64).sum::<f64>() / weight_sum
     };
 
-    // For discrete percentiles we do a simple weighted average — not perfect
-    // (you'd need the raw histogram) but good enough for aggregate reporting.
-    let wavg_u64 = |f: fn(&StatsSnapshot) -> u64| -> u64 {
-        if weight_sum == 0.0 { return 0; }
-        let v = snaps.iter().map(|s| f(s) as f64 * s.queries_completed as f64).sum::<f64>()
-            / weight_sum;
-        v.round() as u64
-    };
-
     let min_us = snaps.iter().map(|s| s.min_us).filter(|&v| v > 0).min().unwrap_or(0);
     let max_us = snaps.iter().map(|s| s.max_us).max().unwrap_or(0);
 
@@ -91,11 +84,14 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
         run_time_s: max_time,
         avg_qps:    if max_time > 0.0 { total_done as f64 / max_time } else { 0.0 },
         min_us,
-        avg_us:  wavg(|s| s.avg_us),
-        p50_us:  wavg_u64(|s| s.p50_us),
-        p95_us:  wavg_u64(|s| s.p95_us),
-        p99_us:  wavg_u64(|s| s.p99_us),
-        p999_us: wavg_u64(|s| s.p999_us),
+        avg_us:  wavg(|s| s.avg_us), // mean is linear → a weighted mean is valid
+        // Percentiles cannot be averaged across NICs. Report the worst NIC's value:
+        // conservative, and — unlike a weighted average — it never hides a pathological
+        // NIC. For true per-NIC percentiles use `--nic-stats`.
+        p50_us:  snaps.iter().map(|s| s.p50_us).max().unwrap_or(0),
+        p95_us:  snaps.iter().map(|s| s.p95_us).max().unwrap_or(0),
+        p99_us:  snaps.iter().map(|s| s.p99_us).max().unwrap_or(0),
+        p999_us: snaps.iter().map(|s| s.p999_us).max().unwrap_or(0),
         max_us,
         inflight_mean: snaps.iter().map(|s| s.inflight_mean).sum::<f64>() / snaps.len().max(1) as f64,
         inflight_max:  snaps.iter().map(|s| s.inflight_max).max().unwrap_or(0),

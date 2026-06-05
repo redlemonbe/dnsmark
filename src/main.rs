@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "xdp")]
         {
             let auto = autodetect::detect();
-            if !auto.xdp_available {
+            if !auto.af_xdp_socket_available {
                 anyhow::bail!("AF_XDP not available on this system");
             }
         }

@@ -248,6 +248,11 @@ schema is stable and is the recommended interface for automated comparison.
   kernel supports the family, not that attach will succeed (containers, missing BPF
   privileges, virtual interfaces). dnsmark falls back if attach fails; treat the
   capability flag as a hint, not a guarantee.
+- **Multi-NIC aggregate percentiles.** With several NICs (`-s` repeated), the aggregate
+  latency percentiles are the **worst NIC's** value, not a true cross-NIC percentile —
+  percentiles cannot be averaged. This is conservative and *surfaces* a slow NIC rather
+  than hiding it behind a weighted average; use `--nic-stats` for per-NIC percentiles.
+  (Aggregate throughput, mean, min and max are exact.)
 
 ---
 

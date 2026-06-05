@@ -2,14 +2,17 @@
 pub struct AutoConfig {
     pub cpus: usize,
     pub mem_mb: u64,
-    pub xdp_available: bool,
+    /// True if an `AF_XDP` socket can be *opened*. This is a capability hint, **not** a
+    /// guarantee that XDP attach will succeed (a container, missing BPF privileges, or a
+    /// virtual interface can still fail later) — `--xdp` falls back / errors clearly if so.
+    pub af_xdp_socket_available: bool,
 }
 
 pub fn detect() -> AutoConfig {
     let cpus = num_cpus::get();
     let mem_mb = read_proc_meminfo_avail_mb();
-    let xdp_available = probe_xdp_support();
-    AutoConfig { cpus, mem_mb, xdp_available }
+    let af_xdp_socket_available = probe_xdp_support();
+    AutoConfig { cpus, mem_mb, af_xdp_socket_available }
 }
 
 /// Returns the logical CPU IDs of physical cores only — one per physical
@@ -122,7 +125,15 @@ pub fn iface_for_addr(addr: std::net::IpAddr) -> Option<String> {
     if addr.is_loopback() { return None; }
     let v4 = match addr {
         std::net::IpAddr::V4(a) => u32::from(a),
-        _ => return None, // IPv6: skip NUMA lookup
+        std::net::IpAddr::V6(_) => {
+            // The /proc/net/route lookup is IPv4-only, so we cannot map an IPv6 target
+            // to its NIC/NUMA node — NUMA-local pinning is skipped. Warn once.
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| eprintln!(
+                "[dnsmark] IPv6 target: NUMA-local CPU pinning skipped (route lookup is \
+                 IPv4-only); workers still run, just not NUMA-pinned"));
+            return None;
+        }
     };
     let mut default_iface: Option<String> = None;
     for line in content.lines().skip(1) {
