@@ -44,6 +44,7 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
             rcode_refused: 0,
             rcode_other: 0,
             run_time_s: 0.0,
+            send_qps: 0.0,
             avg_qps: 0.0,
             min_us: 0,
             avg_us: 0.0,
@@ -82,6 +83,7 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
         rcode_refused:  snaps.iter().map(|s| s.rcode_refused).sum(),
         rcode_other:    snaps.iter().map(|s| s.rcode_other).sum(),
         run_time_s: max_time,
+        send_qps:   snaps.iter().map(|s| s.send_qps).sum(),
         avg_qps:    if max_time > 0.0 { total_done as f64 / max_time } else { 0.0 },
         min_us,
         avg_us:  wavg(|s| s.avg_us), // mean is linear → a weighted mean is valid
@@ -238,6 +240,7 @@ mod tests {
             rcode_refused:     0,
             rcode_other:       0,
             run_time_s:        time,
+            send_qps:          qps,
             avg_qps:           qps,
             min_us:            50,
             avg_us:            120.0,

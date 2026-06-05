@@ -2,6 +2,7 @@ pub mod oom_guard;
 pub mod snapshot;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
@@ -22,6 +23,11 @@ pub struct StatsCollector {
     inflight_sum:    AtomicU64,
     inflight_count:  AtomicU64,
     inflight_max:    AtomicU64,
+    /// Monotone offset (ns since collector creation) of the last TX completion.
+    /// Set via inc_sent_n() using start.elapsed(). Never a UNIX timestamp.
+    last_egress_ns:  AtomicU64,
+    /// Monotone clock captured at creation — anchors last_egress_ns.
+    start:           Instant,
 }
 
 impl StatsCollector {
@@ -36,9 +42,11 @@ impl StatsCollector {
             rcode_servfail: AtomicU64::new(0),
             rcode_refused: AtomicU64::new(0),
             rcode_other: AtomicU64::new(0),
-            inflight_sum:   AtomicU64::new(0),
-            inflight_count: AtomicU64::new(0),
-            inflight_max:   AtomicU64::new(0),
+            inflight_sum:    AtomicU64::new(0),
+            inflight_count:  AtomicU64::new(0),
+            inflight_max:    AtomicU64::new(0),
+            last_egress_ns:  AtomicU64::new(0),
+            start:           Instant::now(),
             histogram: Mutex::new(
                 Histogram::new_with_bounds(1, 60_000_000, 3)
                     .expect("create HDR histogram"),
@@ -50,8 +58,12 @@ impl StatsCollector {
         self.sent.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count N TX completions (DMA-confirmed egress) and record the timestamp
+    /// as a monotone offset from self.start — no UNIX clock, no reconstruction.
     pub fn inc_sent_n(&self, n: usize) {
         self.sent.fetch_add(n as u64, Ordering::Relaxed);
+        let elapsed_ns = self.start.elapsed().as_nanos() as u64;
+        self.last_egress_ns.store(elapsed_ns, Ordering::Relaxed);
     }
 
     pub fn inc_timeout(&self) {
@@ -74,7 +86,6 @@ impl StatsCollector {
         let v = current as u64;
         self.inflight_sum.fetch_add(v, Ordering::Relaxed);
         self.inflight_count.fetch_add(1, Ordering::Relaxed);
-        // Update max via CAS loop
         let mut old = self.inflight_max.load(Ordering::Relaxed);
         while v > old {
             match self.inflight_max.compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
@@ -98,9 +109,25 @@ impl StatsCollector {
     }
 
     pub fn snapshot(&self, elapsed_secs: f64) -> StatsSnapshot {
-        let sent = self.sent.load(Ordering::Relaxed);
+        let sent      = self.sent.load(Ordering::Relaxed);
         let completed = self.completed.load(Ordering::Relaxed);
-        let avg_qps = if elapsed_secs > 0.0 { completed as f64 / elapsed_secs } else { 0.0 };
+        let avg_qps   = if elapsed_secs > 0.0 { completed as f64 / elapsed_secs } else { 0.0 };
+
+        // send_qps uses the real egress window — monotone offset from self.start.
+        // last_egress_ns = self.start.elapsed().as_nanos() at the last inc_sent_n().
+        // Covers the full TX window including in-flight drain after run end.
+        // NO UNIX timestamp, NO now-based reconstruction, NO subtraction.
+        let send_qps = {
+            let last_ns = self.last_egress_ns.load(Ordering::Relaxed);
+            if last_ns > 0 {
+                let egress_secs = last_ns as f64 / 1_000_000_000.0;
+                if egress_secs > 0.1 { sent as f64 / egress_secs }
+                else                  { sent as f64 / elapsed_secs }
+            } else {
+                if elapsed_secs > 0.0 { sent as f64 / elapsed_secs } else { 0.0 }
+            }
+        };
+
         let h = self.histogram.lock();
         let (min_us, avg_us, p50, p95, p99, p999, max_us) = if !h.is_empty() {
             (
@@ -116,30 +143,32 @@ impl StatsCollector {
             (0, 0.0, 0, 0, 0, 0, 0)
         };
         let ifl_count = self.inflight_count.load(Ordering::Relaxed);
-        let ifl_mean = if ifl_count > 0 {
+        let ifl_mean  = if ifl_count > 0 {
             self.inflight_sum.load(Ordering::Relaxed) as f64 / ifl_count as f64
         } else { 0.0 };
         let ifl_max = self.inflight_max.load(Ordering::Relaxed);
+
         StatsSnapshot {
-            queries_sent: sent,
-            queries_completed: completed,
-            queries_lost: sent.saturating_sub(completed),
-            rcode_noerror: self.rcode_noerror.load(Ordering::Relaxed),
-            rcode_nxdomain: self.rcode_nxdomain.load(Ordering::Relaxed),
-            rcode_servfail: self.rcode_servfail.load(Ordering::Relaxed),
-            rcode_refused: self.rcode_refused.load(Ordering::Relaxed),
-            rcode_other: self.rcode_other.load(Ordering::Relaxed),
-            run_time_s: elapsed_secs,
+            queries_sent:       sent,
+            queries_completed:  completed,
+            queries_lost:       sent.saturating_sub(completed),
+            rcode_noerror:      self.rcode_noerror.load(Ordering::Relaxed),
+            rcode_nxdomain:     self.rcode_nxdomain.load(Ordering::Relaxed),
+            rcode_servfail:     self.rcode_servfail.load(Ordering::Relaxed),
+            rcode_refused:      self.rcode_refused.load(Ordering::Relaxed),
+            rcode_other:        self.rcode_other.load(Ordering::Relaxed),
+            run_time_s:         elapsed_secs,
+            send_qps,
             avg_qps,
             min_us,
             avg_us,
-            p50_us: p50,
-            p95_us: p95,
-            p99_us: p99,
+            p50_us:  p50,
+            p95_us:  p95,
+            p99_us:  p99,
             p999_us: p999,
             max_us,
             inflight_mean: ifl_mean,
-            inflight_max: ifl_max,
+            inflight_max:  ifl_max,
         }
     }
 }

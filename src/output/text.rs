@@ -57,8 +57,11 @@ pub fn print_result(snap: &StatsSnapshot, config: &Config) {
     println!("    SERVFAIL:           {:<10}  ({:.2}%)", snap.rcode_servfail, pct(snap.rcode_servfail, completed));
     println!("    REFUSED:            {:<10}  ({:.2}%)", snap.rcode_refused,  pct(snap.rcode_refused,  completed));
     println!();
-    println!("  Average QPS:          {:.0}", snap.avg_qps);
-    println!("  Throughput:           {:.0} qps", snap.avg_qps);
+    // Egress throughput = what the NIC actually sent (TX completions)
+    println!("  Send throughput (egress):  {:.0} qps  ← match this to rx_packets on receiver NIC", snap.send_qps);
+    // Round-trip metric = responses received back (latency/loss tool)
+    println!("  Round-trip completed:      {:.0} qps  ({:.1}% of egress)", snap.avg_qps,
+        if snap.send_qps > 0.0 { snap.avg_qps / snap.send_qps * 100.0 } else { 0.0 });
     println!();
     println!("  Latency:");
     println!("    min:       {:.3} ms", snap.min_us as f64 / 1000.0);

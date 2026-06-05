@@ -9,6 +9,7 @@ pub struct StatsSnapshot {
     pub rcode_refused: u64,
     pub rcode_other: u64,
     pub run_time_s: f64,
+    pub send_qps: f64,   // egress throughput: completions/s from TX CQ
     pub avg_qps: f64,
     pub min_us: u64,
     pub avg_us: f64,

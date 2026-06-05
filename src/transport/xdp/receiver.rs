@@ -194,7 +194,13 @@ fn xdp_unified_worker(
     let mut id_ctr:   usize = 0;
     let mut tmpl_idx: usize = worker_id;
     const FLUSH_N: usize = 1024;
-    let mut local_sent: usize = 0;
+    let mut local_egress:      usize = 0;
+    let mut _local_submitted: usize = 0;
+    // stall detection (egress vs submitted)
+    let mut stall_sub:    usize = 0;
+    let mut stall_egr:    usize = 0;
+    let mut stall_warned: bool  = false;
+    let mut stall_window  = std::time::Instant::now();
 
     // Fixed src port per worker: RSS on the receiver hashes (src_ip, dst_ip, sport, dport=53)
     // → each worker's responses land on one RX queue of the receiver, which maps back
@@ -217,8 +223,33 @@ fn xdp_unified_worker(
         if shutdown.load(Ordering::Relaxed) { break; }
 
         // 1) Reclaim TX completions → recycle frames to the local pool.
+        // 1) Reclaim TX completions → recycle frames; count EGRESS (DMA done).
         let done = sock.umem.comp.dequeue_all();
-        if !done.is_empty() { sock.tx_pool.extend_from_slice(&done); }
+        if !done.is_empty() {
+            let n = done.len();
+            sock.tx_pool.extend_from_slice(&done);
+            local_egress += n;
+            stall_egr    += n;
+            if local_egress >= FLUSH_N {
+                stats.inc_sent_n(local_egress);
+                local_egress = 0;
+            }
+        }
+        // stall detection: every 2 s, warn if egress << submitted
+        if stall_window.elapsed().as_secs() >= 2 && !stall_warned {
+            if stall_sub >= 1024 && stall_egr < stall_sub / 5 {
+                let pct = stall_egr * 100 / stall_sub.max(1);
+                eprintln!(
+                    "\x1b[33m[dnsmark] WARN: XDP TX stalling — {} submitted, \
+                    {} egressed ({}% not transmitted). \
+                    Reset NIC: modprobe -r ixgbe && modprobe ixgbe\x1b[0m",
+                    stall_sub, stall_egr, pct
+                );
+                stall_warned = true;
+            }
+            stall_sub = 0; stall_egr = 0;
+            stall_window = std::time::Instant::now();
+        }
 
         // 2) Decide how many to TX this iteration (rate / backpressure gate).
         let qps = qps_per_worker.load(Ordering::Relaxed);
@@ -284,11 +315,9 @@ fn xdp_unified_worker(
                         local_in_flight += enq;
                         stats.record_inflight(local_in_flight);
                     }
-                    local_sent += enq;
-                    if local_sent >= FLUSH_N {
-                        stats.inc_sent_n(local_sent);
-                        local_sent = 0;
-                    }
+                    _local_submitted += enq;
+                    stall_sub       += enq;
+                    // backpressure gate only — NOT stats.sent
                 }
             }
         }
@@ -341,7 +370,10 @@ fn xdp_unified_worker(
         for _ in &remaining {
             stats.inc_timeout();
         }
-        if local_sent > 0 { stats.inc_sent_n(local_sent); }
+        // DIAGNOSTIC: print raw egress total so caller can compare to
+        // ethtool -S <nic> tx_packets at the same instant.
+        // This is the ONLY honest number — compare to ASIC to diagnose +9% residual.
+        if local_egress > 0 { stats.inc_sent_n(local_egress); }
     }
 }
 
