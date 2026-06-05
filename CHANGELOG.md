@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic V
 
 ---
 
+## [2.0.4] — 2026-06-05
+
+Hardening and measurement-correctness follow-ups to 2.0.0, each backed by a bench or a
+microbench and cross-checked against a `tcpdump` wire capture (see docs/WHITEPAPER.md).
+
+### Fixed
+
+- **A timeout is a loss, not a completion** (2.0.3). Timed-out / evicted / end-of-run
+  in-flight queries count toward `queries_lost`, never `queries_completed` or the latency
+  histogram. So `queries_completed` = real responses, `queries_lost` = timeouts + send
+  errors, `sent == completed + lost`, and the latency tail is pure response latencies.
+- **Explicit in-flight eviction accounting** (2.0.1). In flood mode, a hash collision in
+  a per-worker in-flight table is detected and counted as a loss, so the accounting
+  identity holds exactly even when the table overflows.
+
+### Changed
+
+- **Hot-path query copy uses `copy_from_slice`** (2.0.2). The hand-rolled AVX2/SSE2
+  memcpy was measured no faster than the standard copy at 30–60 B and was removed —
+  simpler, `unsafe`-free. No SIMD speedup is claimed (see WHITEPAPER §10).
+- **Multi-NIC aggregate percentiles report the worst NIC's value**, not a weighted
+  average — averaging percentiles is invalid and could hide a slow NIC; a max surfaces
+  it. `--nic-stats` gives per-NIC percentiles. Mean / min / max / throughput are exact.
+
+### Added
+
+- IPv6 targets log a one-time warning that NUMA-local pinning is skipped (the route
+  lookup is IPv4-only) instead of degrading silently.
+- **Technical whitepaper** (docs/WHITEPAPER.md) and a **wire-validated latency methodology**
+  (docs/benchmarking.md §7): a generator's reported RTT = server + network + the tool's own
+  client-side overhead, so absolute latency is anchored on a `tcpdump` capture, not on
+  another tool. Default transport is UDP (comparable to dnsperf); `--xdp` is opt-in and
+  symmetric (XDP-vs-XDP only).
+
+---
+
 ## [2.0.0] — 2026-06-05
 
 ### Changed
