@@ -402,7 +402,7 @@ fn throughput_udp_worker(
 
         // Single sendmmsg syscall for the whole batch
         let sent = unsafe {
-            libc::sendmmsg(fd, tx_msgs.as_mut_ptr(), built as libc::c_uint, libc::MSG_DONTWAIT)
+            libc::sendmmsg(fd, tx_msgs.as_mut_ptr(), built as libc::c_uint, libc::MSG_DONTWAIT as _)
         };
         if sent > 0 {
             local_sent += sent as u64;
@@ -418,7 +418,7 @@ fn throughput_udp_worker(
                         fd,
                         rx_msgs.as_mut_ptr(),
                         RX_BATCH as libc::c_uint,
-                        libc::MSG_DONTWAIT,
+                        libc::MSG_DONTWAIT as _,
                         std::ptr::null_mut(),
                     )
                 };
