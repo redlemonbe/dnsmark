@@ -275,3 +275,24 @@ pub fn log_host_info(target: std::net::IpAddr) {
         model, num_cpus::get_physical(), num_cpus::get(), numa_node_count(), nic
     );
 }
+
+/// True iff this host is a Xeon E5 v2 (Ivy Bridge-EP, CPU family 6 model 62) AND
+/// `iface` is driven by ixgbe (Intel 82599 / X520). That exact combination has a
+/// QPI bottleneck that collapses the AF_XDP zero-copy datapath beyond ~16 busy
+/// cores (10 NIC-local + 6 cross-NUMA), so the worker budget is capped to 16 for
+/// it specifically. Every other CPU/NIC keeps the normal per-port budget.
+pub fn is_xeon_v2_x520(iface: &str) -> bool {
+    let xeon_v2 = std::fs::read_to_string("/proc/cpuinfo").map(|s| {
+        let f6 = s.lines().any(|l| l.starts_with("cpu family")
+            && l.split(':').nth(1).map(|v| v.trim() == "6").unwrap_or(false));
+        let m62 = s.lines().any(|l| l.starts_with("model") && !l.starts_with("model name")
+            && l.split(':').nth(1).map(|v| v.trim() == "62").unwrap_or(false));
+        f6 && m62
+    }).unwrap_or(false);
+    if !xeon_v2 { return false; }
+    if iface.is_empty() || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return false;
+    }
+    std::fs::read_link(format!("/sys/class/net/{iface}/device/driver/module"))
+        .map(|pth| pth.to_string_lossy().contains("ixgbe")).unwrap_or(false)
+}

@@ -1052,7 +1052,7 @@ fn do_start_xdp_receive_path(
     //  - 2-socket Intel (Xeon-v2 + X520): inter-socket QPI collapses the ixgbe ZC
     //    datapath beyond ~6 cross-NUMA workers => 10 local + 6 remote = 16 total.
     //  - many-node AMD (Infinity Fabric, cheap cross-CCX) => 12 per port, 24 total.
-    let (per_nic_cap, total_cap) = if crate::autodetect::numa_node_count() <= 2 {
+    let (per_nic_cap, total_cap) = if crate::autodetect::is_xeon_v2_x520(iface) {
         (n_local, n_local + 6)
     } else {
         (12usize, 24usize)
