@@ -226,11 +226,14 @@ pub async fn run_with_shutdown(
         Some(tokio::spawn(async move {
             let mut ctrl = ramp::RampController::new();
             loop {
-                let burst_start = st.completed.load(Ordering::Relaxed);
+                // Measure the achieved rate via SENT (submitted descriptors) — reliable
+                // on every datapath. completed (round-trip) is unusable under XDP
+                // zero-copy when the generator can't drain all RX queues (X520).
+                let burst_start = st.sent.load(Ordering::Relaxed);
                 qps_arc.store(0, Ordering::Relaxed);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if sd.load(Ordering::Relaxed) { break; }
-                let burst_completions = st.completed.load(Ordering::Relaxed)
+                let burst_completions = st.sent.load(Ordering::Relaxed)
                     .saturating_sub(burst_start);
 
                 let per_worker = (ctrl.current_qps / concurrent.max(1) as u64).max(1);

@@ -259,7 +259,7 @@ fn main() -> anyhow::Result<()> {
         no_tui: cli.no_tui || cli.quiet,
         force_xdp: cli.xdp,
         no_xdp: cli.no_xdp,
-        max_outstanding: cli.max_outstanding,
+        max_outstanding: if cli.ramp { 0 } else { cli.max_outstanding }, // ramp paces via qps token-bucket; no in-flight gate (RX completions unreliable under XDP-ZC)
         nic_stats: cli.nic_stats,
     });
 
