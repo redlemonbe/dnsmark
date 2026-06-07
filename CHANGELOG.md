@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.1.0] - 2026-06-07
+
+### Added
+- **Reliable throughput counter**: report SUBMITTED TX descriptors (what actually
+  reaches the wire), not completion-ring entries which under-report at multi-Mpps.
+- **Auto warm-up** (`DNSMARK_WARMUP`, default 3 s): reset the measurement window
+  after XSK bind / ring fill / NIC ramp so reported rates are steady-state.
+- **GovernorGuard**: pin every CPU to `performance` for the run, restore on exit
+  (DVFS is the #1 benchmark confounder).
+- **Huge-page (2 MiB) UMEM** with 4 KiB fallback — fewer dTLB misses at multi-Mpps.
+
+### Changed / Fixed
+- **AF_XDP generator no longer self-throttles** (the non-reproducible "peak then
+  collapse" behaviour): cap unified workers to NIC-local PHYSICAL cores (never HT)
+  instead of one-per-HW-queue, which oversubscribed the few NIC-local cores and
+  overdrove the ixgbe ZC datapath. Core budget by topology: 2-socket Intel = 10
+  local + 6 cross-NUMA (QPI-bound); many-node AMD = 12 per port (Infinity Fabric).
+- Global cross-NIC core cursor so dual-fibre spreads across distinct cores.
+- Incremental IPv4 header checksum (RFC 1071) on the hot path.
+
+### Notes
+- Frame size dominates pps: realistic short query names (corpus) reach far higher
+  rates than 32-hex `--random` names (~104 B). Bench with a realistic dataset.
+
+
 All notable changes to this project will be documented in this file.  
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
