@@ -253,6 +253,7 @@ pub async fn run_with_shutdown(
         let notify = ramp_done.clone();
         Some(tokio::spawn(async move {
             let mut ctrl = ramp::RampController::new();
+            let mut best_ok_offered: u64 = 0;  // highest offered load that held the p50 SLO
             loop {
                 // Measure the achieved rate via SENT (submitted descriptors) — reliable
                 // on every datapath. completed (round-trip) is unusable under XDP
@@ -265,21 +266,40 @@ pub async fn run_with_shutdown(
                     .saturating_sub(burst_start);
 
                 let per_worker = (ctrl.current_qps / concurrent.max(1) as u64).max(1);
+                let _ = st.ramp_step_latency();        // drop burst-phase RTTs, open clean window
+                let sent_w0 = st.sent.load(Ordering::Relaxed);
+                let comp_w0 = st.completed.load(Ordering::Relaxed);
                 qps_arc.store(per_worker, Ordering::Relaxed);
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 if sd.load(Ordering::Relaxed) { break; }
 
+                // Per-step latency + answered ratio for the 4 s paced window: the
+                // methodology curve (percentiles vs offered load, step by step).
+                let (p50, p95, p99, samples) = st.ramp_step_latency();
+                let sent_w = st.sent.load(Ordering::Relaxed).saturating_sub(sent_w0);
+                let _ = comp_w0;
+
+                if p50 <= 1_000 { best_ok_offered = best_ok_offered.max(sent_w / 4); }
                 let target_qps = ctrl.current_qps;
-                let (new_qps, saturated, max_sustainable) = ctrl.advance(burst_completions);
+                let (new_qps, saturated, max_sustainable) = ctrl.advance(sent_w / 4, p50);
+
+                // Per-step methodology line: offered load vs RTT percentiles. `samples`
+                // is the RTTs actually measured this step; when it collapses relative to
+                // the offered rate, the round-trip path (not the server) is saturated.
+                println!(
+                    "Ramp step: offered {:>9} q/s | rtt-samples {:>8} | \
+                     p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms",
+                    sent_w / 4, samples,
+                    p50 as f64 / 1000.0, p95 as f64 / 1000.0, p99 as f64 / 1000.0,
+                );
+                let _ = target_qps;
 
                 if saturated {
-                    let reported = if max_sustainable == 0 { target_qps } else { max_sustainable };
-                    let reason = if burst_completions < (target_qps as f64 * 0.80) as u64 {
-                        format!("burst {}/s < {}/s target", burst_completions, target_qps)
-                    } else {
-                        "hard cap (20 doublings)".to_string()
-                    };
-                    println!("\nMax sustainable QPS: {} ({})", reported, reason);
+                    let _ = max_sustainable; let _ = target_qps;
+                    println!(
+                        "\nMax offered load under p50<1ms SLO: {} q/s (highest step that held the SLO)",
+                        best_ok_offered,
+                    );
                     sd.store(true, Ordering::Relaxed);
                     notify.notify_one();
                     break;
@@ -287,7 +307,7 @@ pub async fn run_with_shutdown(
 
                 let new_per_worker = (new_qps / concurrent.max(1) as u64).max(1);
                 qps_arc.store(new_per_worker, Ordering::Relaxed);
-                println!("Ramp: target QPS -> {} (burst: {}/s)", new_qps, burst_completions);
+                let _ = new_qps; let _ = burst_completions; let _ = target_qps;
             }
         }))
     } else {

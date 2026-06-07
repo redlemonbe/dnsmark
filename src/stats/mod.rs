@@ -133,6 +133,22 @@ impl StatsCollector {
         let _ = h.record(rtt_us.max(1));
     }
 
+    /// Per-ramp-step latency window: p50/p95/p99 (microseconds) and sample count for
+    /// the RTTs recorded since the last call, then clears the histogram so the next
+    /// step measures its own load only. This is what makes `--ramp` emit a
+    /// percentiles-vs-load curve (the methodology output).
+    pub fn ramp_step_latency(&self) -> (u64, u64, u64, u64) {
+        let mut h = self.histogram.lock();
+        let out = if h.is_empty() {
+            (0, 0, 0, 0)
+        } else {
+            (h.value_at_quantile(0.50), h.value_at_quantile(0.95),
+             h.value_at_quantile(0.99), h.len())
+        };
+        h.clear();
+        out
+    }
+
     pub fn snapshot(&self, elapsed_secs: f64) -> StatsSnapshot {
         let sent      = self.sent.load(Ordering::Relaxed);
         let completed = self.completed.load(Ordering::Relaxed);
