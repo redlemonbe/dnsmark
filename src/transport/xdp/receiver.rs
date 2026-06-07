@@ -1034,14 +1034,28 @@ fn do_start_xdp_receive_path(
     // workers. For dual fibre the global cursor gives NIC1 the physical cores and
     // NIC2 their HT siblings — both stay on the NIC-local NUMA node (cross-NUMA
     // node1 placement is QPI-bound and ~30% slower).
-    let core_pool: Vec<usize> = if local_cpus.is_empty() {
-        crate::autodetect::physical_cores_numa_sorted(nic_node)
-    } else { local_cpus.clone() };
-    let n_phys_local = (core_pool.len() / 2).max(1);
-    let queue_count = (hw_queue_count as usize).min(n_phys_local).max(1) as u32;
+    // PHYSICAL cores only — NEVER HyperThread siblings: the ASM/SIMD wire path
+    // saturates a physical core's execution units, so an HT-sibling worker steals
+    // throughput instead of adding it. NIC-local NUMA node first, then at most
+    // REMOTE_CORE_CAP cross-NUMA cores: the inter-socket QPI saturates beyond ~6
+    // remote workers feeding a node-0 NIC, and past that the ixgbe ZC datapath
+    // collapses (the dual-Xeon-v2 "16 = 10+6" limit, empirically verified).
+    const REMOTE_CORE_CAP: usize = 6;
+    let phys_sorted = crate::autodetect::physical_cores_numa_sorted(nic_node);
+    let n_local = phys_sorted.iter()
+        .filter(|&&c| crate::autodetect::numa_node_for_cpu(c) == nic_node)
+        .count().max(1);
+    let n_remote = phys_sorted.len().saturating_sub(n_local).min(REMOTE_CORE_CAP);
+    let core_pool: Vec<usize> = phys_sorted.into_iter().take(n_local + n_remote).collect();
+    let queue_count = (hw_queue_count as usize).min(n_local).max(1) as u32;
     tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
 
     for q in 0..queue_count {
+        // Global cross-NIC cursor: NIC1 fills its node-local cores, NIC2 takes the
+        // remaining cross-NUMA budget; stop once the 10+6 pool is spent (no wrap).
+        let gi = GLOBAL_CORE_IDX.fetch_add(1, Ordering::Relaxed);
+        if gi >= core_pool.len() { break; }
+        let assigned_core = core_pool[gi];
         let mut sock = match unsafe { create_xsk_socket(ifidx, q, true) } {
             Ok(s) => { tracing::info!(queue = q, "AF_XDP bound ZERO-COPY"); s }
             Err(zc_err) => match unsafe { create_xsk_socket(ifidx, q, false) } {
@@ -1075,12 +1089,7 @@ fn do_start_xdp_receive_path(
                 sxdp_queue_id:       q,
                 sxdp_shared_umem_fd: 0,
             };
-            let core = if core_pool.is_empty() {
-                None
-            } else {
-                let gi = GLOBAL_CORE_IDX.fetch_add(1, Ordering::Relaxed);
-                Some(core_pool[gi % core_pool.len()])
-            };
+            let core = Some(assigned_core);
             let wp  = cfg.wire_pool.clone();
             let qps = cfg.qps_per_worker.clone();
             let mo  = cfg.max_outstanding;
