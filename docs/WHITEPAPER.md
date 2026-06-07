@@ -264,8 +264,12 @@ counters give the **throughput**. See [benchmarking.md](benchmarking.md).
 With `--xdp`, dnsmark bypasses the kernel network stack on both send and receive.
 Query frames are written straight into the NIC's **UMEM** and submitted to the **TX
 ring**; responses are delivered to the **RX ring** by a tiny XDP/eBPF program that
-redirects DNS replies (`udp src port 53`) into the per-queue `XSKS` socket map. There
-is no `sendmsg`/`recvmsg`, no per-packet syscall, and no socket-buffer copy.
+redirects DNS replies (`udp src port 53`) into the per-queue `XSKS` socket map.
+(`XDP_REDIRECT` into an AF_XDP socket is the kernel's native mechanism for handing a
+frame straight from the NIC driver to a userspace socket — no network-stack
+traversal, no copy; `XSKS` is the BPF map that points the redirect at the right
+per-queue socket.) There is no `sendmsg`/`recvmsg`, no per-packet syscall, and no
+socket-buffer copy.
 
 Design points that make this fast *and* correct:
 
@@ -383,7 +387,8 @@ startup.
 - **Flood mode bounds the latency window (read p99 with the loss rate).** A consequence of
   the above: at offered rate *R*, the in-flight table holds at most `table_len` queries,
   so a response slower than ≈ `table_len / R` is evicted (counted as a *loss*) before it
-  can return. In **flood** the latency histogram therefore holds only the responses that
+  can return (e.g. a 65 536-slot table at R = 10 M qps evicts anything slower than
+  ≈ 6.5 ms). In **flood** the latency histogram therefore holds only the responses that
   came back *within* that window — its p99 is the latency of the queries that **made it
   back**, and is optimistic if read without the loss rate. This is not hidden data (the
   slow ones are losses, reported in `queries_lost`), but it means **p99 in flood must be
