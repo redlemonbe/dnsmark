@@ -146,6 +146,9 @@ static XDP_TX_STATES: OnceLock<Vec<Arc<XdpTxState>>> = OnceLock::new();
 /// the rings (the HT-contending 2-thread-per-queue model is what capped scaling
 /// to the 8 NIC-local physical cores). This is the Runbound worker model.
 static XDP_UNIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Global physical-core cursor across ALL NICs: NIC1 takes its node, NIC2 spills
+// to the next node, so dual fibre uses distinct cores (no oversubscription).
+static GLOBAL_CORE_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Config the engine hands to the unified workers (set before start_xdp_receive_path).
 pub struct UnifiedCfg {
@@ -196,6 +199,10 @@ fn xdp_unified_worker(
     const FLUSH_N: usize = 1024;
     let mut local_egress:      usize = 0;
     let mut _local_submitted: usize = 0;
+    // Reliable "sent" = descriptors SUBMITTED to the TX ring (what actually goes on
+    // the wire). The completion-ring count under-reports under load (the comp ring
+    // overflows/lags at multi-Mpps), so we count enq, flushed in batches (low CPU).
+    let mut sub_acc: usize = 0;
     // stall detection (egress vs submitted)
     let mut stall_sub:    usize = 0;
     let mut stall_egr:    usize = 0;
@@ -230,10 +237,7 @@ fn xdp_unified_worker(
             sock.tx_pool.extend_from_slice(&done);
             local_egress += n;
             stall_egr    += n;
-            if local_egress >= FLUSH_N {
-                stats.inc_sent_n(local_egress);
-                local_egress = 0;
-            }
+            if local_egress >= FLUSH_N { local_egress = 0; }
         }
         // stall detection: every 2 s, warn if egress << submitted
         if stall_window.elapsed().as_secs() >= 2 && !stall_warned {
@@ -317,6 +321,8 @@ fn xdp_unified_worker(
                     }
                     _local_submitted += enq;
                     stall_sub       += enq;
+                    sub_acc += enq;
+                    if sub_acc >= FLUSH_N { stats.inc_sent_n(sub_acc); sub_acc = 0; }
                     // backpressure gate only — NOT stats.sent
                 }
             }
@@ -373,7 +379,7 @@ fn xdp_unified_worker(
         // DIAGNOSTIC: print raw egress total so caller can compare to
         // ethtool -S <nic> tx_packets at the same instant.
         // This is the ONLY honest number — compare to ASIC to diagnose +9% residual.
-        if local_egress > 0 { stats.inc_sent_n(local_egress); }
+        if sub_acc > 0 { stats.inc_sent_n(sub_acc); }
     }
 }
 
@@ -1001,7 +1007,7 @@ fn do_start_xdp_receive_path(
         Some(FrameHeader::new(src_mac, dst_mac, src_ip, dst_ip, 12345, server_port))
     })();
 
-    let queue_count = get_rx_queue_count(iface);
+    let hw_queue_count = get_rx_queue_count(iface);
     let mut tx_states: Vec<Arc<XdpTxState>> = Vec::new();
     let mut n_unified: usize = 0;
 
@@ -1015,7 +1021,52 @@ fn do_start_xdp_receive_path(
         tracing::info!("[XDP] NIC node {}, local cpus {:?}", node, local_cpus);
     }
 
+    // One busy-poll RX+TX worker per NIC-local PHYSICAL core. Binding one XSK
+    // per HW queue (often = num CPUs, e.g. 40) oversubscribes the few NIC-local
+    // cores the workers are pinned to (measured: 40 workers on 10 cores = 265k
+    // qps vs 1.3M with 10). Cap to the local physical-core count; this needs no
+    // `ethtool -L` (reconfiguring channels around an active ZC bind wedges the
+    // ixgbe queue state until a module reload).
+    // Spread workers across ALL physical cores, NUMA-local node first (the X520
+    // can fan RSS to many queues, but one busy-poll worker per PHYSICAL core is
+    // the stable point; >1 worker/core overdrives the ixgbe ZC datapath and
+    // collapses throughput). Cross-NUMA cores are used only after local ones.
+    // Worker core pool = NIC-LOCAL logical CPUs (physical cores first, then their
+    // HT siblings — see nic_local_logical_cpus ordering). Cap per NIC to the
+    // physical-core count: a single X520 port is link-bound at ~that many busy
+    // workers. For dual fibre the global cursor gives NIC1 the physical cores and
+    // NIC2 their HT siblings — both stay on the NIC-local NUMA node (cross-NUMA
+    // node1 placement is QPI-bound and ~30% slower).
+    // PHYSICAL cores only — NEVER HyperThread siblings: the ASM/SIMD wire path
+    // saturates a physical core's execution units, so an HT-sibling worker steals
+    // throughput instead of adding it. NIC-local NUMA node first, then at most
+    // REMOTE_CORE_CAP cross-NUMA cores: the inter-socket QPI saturates beyond ~6
+    // remote workers feeding a node-0 NIC, and past that the ixgbe ZC datapath
+    // collapses (the dual-Xeon-v2 "16 = 10+6" limit, empirically verified).
+    let phys_sorted = crate::autodetect::physical_cores_numa_sorted(nic_node);
+    let n_local = phys_sorted.iter()
+        .filter(|&&c| crate::autodetect::numa_node_for_cpu(c) == nic_node)
+        .count().max(1);
+    // Worker budget. A single X520 port is link-bound at ~10-12 busy workers;
+    // extra cores only serve the SECOND port of a dual-fibre setup. Two regimes:
+    //  - 2-socket Intel (Xeon-v2 + X520): inter-socket QPI collapses the ixgbe ZC
+    //    datapath beyond ~6 cross-NUMA workers => 10 local + 6 remote = 16 total.
+    //  - many-node AMD (Infinity Fabric, cheap cross-CCX) => 12 per port, 24 total.
+    let (per_nic_cap, total_cap) = if crate::autodetect::numa_node_count() <= 2 {
+        (n_local, n_local + 6)
+    } else {
+        (12usize, 24usize)
+    };
+    let core_pool: Vec<usize> = phys_sorted.into_iter().take(total_cap).collect();
+    let queue_count = (hw_queue_count as usize).min(per_nic_cap).max(1) as u32;
+    tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
+
     for q in 0..queue_count {
+        // Global cross-NIC cursor: NIC1 fills its node-local cores, NIC2 takes the
+        // remaining cross-NUMA budget; stop once the 10+6 pool is spent (no wrap).
+        let gi = GLOBAL_CORE_IDX.fetch_add(1, Ordering::Relaxed);
+        if gi >= core_pool.len() { break; }
+        let assigned_core = core_pool[gi];
         let mut sock = match unsafe { create_xsk_socket(ifidx, q, true) } {
             Ok(s) => { tracing::info!(queue = q, "AF_XDP bound ZERO-COPY"); s }
             Err(zc_err) => match unsafe { create_xsk_socket(ifidx, q, false) } {
@@ -1049,12 +1100,7 @@ fn do_start_xdp_receive_path(
                 sxdp_queue_id:       q,
                 sxdp_shared_umem_fd: 0,
             };
-            let core = if local_cpus.is_empty() {
-                None
-            } else {
-                let half = (local_cpus.len() / 2).max(1); // physical cores in lower half
-                Some(local_cpus[(q as usize) % half])
-            };
+            let core = Some(assigned_core);
             let wp  = cfg.wire_pool.clone();
             let qps = cfg.qps_per_worker.clone();
             let mo  = cfg.max_outstanding;

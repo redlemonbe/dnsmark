@@ -247,17 +247,33 @@ impl Umem {
     /// Returns (Umem, tx_pool) where tx_pool contains UMEM frame offsets
     /// for the TX path (frames RING_SIZE..FRAME_COUNT).
     pub unsafe fn new(xsk_fd: RawFd) -> Result<(Self, Vec<u64>), String> {
-        let page = sysconf(_SC_PAGESIZE) as usize;
-        let area_len = ((FRAME_COUNT * FRAME_SIZE) as usize + page - 1) & !(page - 1);
+        // UMEM is FRAME_COUNT*FRAME_SIZE (~32 MiB) per worker, touched randomly at
+        // multi-Mpps. 4 KiB pages => heavy dTLB pressure; back it with 2 MiB huge
+        // pages when available (one TLB entry per 2 MiB), fall back to 4 KiB.
+        const HUGE_2M: usize = 2 * 1024 * 1024;
+        let raw_len = (FRAME_COUNT * FRAME_SIZE) as usize;
+        let area_len = (raw_len + HUGE_2M - 1) & !(HUGE_2M - 1);
 
-        let area = mmap(
+        let mut area = mmap(
             ptr::null_mut(),
             area_len,
             PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
+            MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE | libc::MAP_HUGETLB,
             -1,
             0,
         );
+        if area == MAP_FAILED {
+            // No huge pages provisioned — fall back to 4 KiB (area_len is a
+            // multiple of 2 MiB, hence also of 4 KiB, so munmap/REG stay valid).
+            area = mmap(
+                ptr::null_mut(),
+                area_len,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
+                -1,
+                0,
+            );
+        }
         if area == MAP_FAILED {
             return Err(format!("UMEM mmap: {}", std::io::Error::last_os_error()));
         }

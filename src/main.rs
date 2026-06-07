@@ -1,5 +1,6 @@
 pub mod simd;
 mod autodetect;
+mod governor;
 mod config;
 mod dns;
 mod engine;
@@ -263,6 +264,9 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Build tokio runtime
+    // Pin CPU governor to performance for the whole run (restored on drop).
+    let _gov = if cli.xdp { Some(governor::GovernorGuard::pin_performance()) } else { None };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.threads)
         .enable_all()

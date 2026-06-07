@@ -277,6 +277,17 @@ pub async fn run_with_shutdown(
         None
     };
 
+    // Auto warm-up: let XSK bind, rings fill and the NIC ramp, then reset the
+    // measurement window so the reported rate is steady-state (env DNSMARK_WARMUP
+    // overrides; default 3 s; skipped for ramp and very short runs).
+    if !config.ramp {
+        let warmup = std::env::var("DNSMARK_WARMUP").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(3);
+        if warmup > 0 && config.duration_secs > warmup {
+            tokio::time::sleep(std::time::Duration::from_secs(warmup)).await;
+            stats.reset_window();
+        }
+    }
     let start = Instant::now();
 
     tokio::select! {
