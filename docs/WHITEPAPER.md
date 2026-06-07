@@ -198,7 +198,7 @@ approaches are coarse:
   octave*: if a server saturates between 8M and 16M, a doubling ramp can only tell you
   "more than 8M, less than 16M" and will report 8M. The true knee is invisible.
 
-dnsmark's `--ramp` uses a two-phase **Dichotomic Saturation Discovery (DSS)**:
+dnsmark's `--ramp` uses a two-phase **Dichotomic Saturation Discovery (DSD)**:
 
 1. **Logarithmic discovery.** Start at 100k QPS and double each 5 s step (1 s burst +
    4 s paced measurement) until a step *breaks the latency SLO*. This brackets the
@@ -241,7 +241,7 @@ offered q/s   rtt-samples    p50 ms   p95 ms   p99 ms
 Max offered load under p50 < 1 ms SLO: 11 266 506 q/s
 ```
 
-A doubling ramp would have reported **6.4M** (the last clean octave). DSS pins the knee
+A doubling ramp would have reported **6.4M** (the last clean octave). DSD pins the knee
 at **11.27M** — a 76 % higher, defensible number, and it shows *exactly* where latency
 turns (the p50 step from 0.08 ms at 6.4M to 1.78 ms at 12.4M). To our knowledge dnsmark
 is the only DNS benchmark that does this binary-search convergence; it is what lets a
@@ -254,7 +254,7 @@ the tail), which is why the median is the saturation signal. And `rtt-samples` i
 *round-trip* count the generator could drain back; on an X520 the generator's own
 PCIe 2.0 RX shares its bus with TX, so this is a lower bound on what the server actually
 answered. The server's true served rate is read at the **receiver's NIC counters** (here
-~8.2–8.4 M qps at 8.7 % receiver CPU); DSS characterises the **latency envelope**, the NIC
+~8.2–8.4 M qps at 8.7 % receiver CPU); DSD characterises the **latency envelope**, the NIC
 counters give the **throughput**. See [benchmarking.md](benchmarking.md).
 
 ---

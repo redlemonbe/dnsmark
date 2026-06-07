@@ -215,7 +215,7 @@ dnsmark -s 192.0.2.1 -d top-10000-domains.txt --xdp --ramp
 ```
 
 `--ramp` doesn't just climb and stop — it runs a two-phase **Dichotomic Saturation
-Discovery (DSS)** to pinpoint the *exact* saturation knee, which a plain doubling ramp
+Discovery (DSD)** to pinpoint the *exact* saturation knee, which a plain doubling ramp
 cannot do:
 
 1. **Logarithmic discovery** — start at 100k QPS and double every step until the median
@@ -225,7 +225,7 @@ cannot do:
    the edge toward it, repeat) until within 5 %, converging on the real knee instead of
    falling back to a power of two.
 
-A doubling-only ramp that sees 6.4M work and 12.8M fail can only say "6.4M". DSS reports
+A doubling-only ramp that sees 6.4M work and 12.8M fail can only say "6.4M". DSD reports
 the truth — here **11.27M** (real run: Runbound over a single 10 GbE Intel X520, warm
 cache):
 
