@@ -31,7 +31,7 @@ fn nic_wire_tx_packets(iface: &str) -> Option<u64> {
                 for line in s.lines() {
                     let l = line.trim();
                     if let Some(rest) = l.strip_prefix(key) {
-                        let v = rest.trim_start_matches(|c: char| c == ':' || c == ' ').trim();
+                        let v = rest.trim_start_matches([':', ' ']).trim();
                         if let Some(tok) = v.split_whitespace().next() {
                             if let Ok(n) = tok.parse::<u64>() { return Some(n); }
                         }

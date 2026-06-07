@@ -10,7 +10,7 @@ use std::{ptr, slice};
 
 use libc::{
     MAP_ANONYMOUS, MAP_FAILED, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE,
-    mmap, munmap, sysconf, _SC_PAGESIZE,
+    mmap, munmap,
 };
 
 // ── Frame configuration ────────────────────────────────────────────────────

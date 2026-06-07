@@ -76,6 +76,7 @@ impl InFlight {
         Some(now.saturating_sub(prev) / 1000)
     }
     /// Expire slots older than `timeout`; returns the count expired.
+    #[allow(dead_code)]
     pub fn sweep(&self, timeout: Duration) -> usize {
         let now = self.base.elapsed().as_nanos() as u64;
         let to  = timeout.as_nanos() as u64;

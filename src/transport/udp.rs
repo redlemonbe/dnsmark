@@ -424,6 +424,7 @@ fn throughput_udp_worker(
                     )
                 };
                 if n <= 0 { break; }
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..n as usize {
                     let len = (rx_msgs[i].msg_len as usize).min(MAX_MSG_SIZE);
                     let off = i * MAX_MSG_SIZE;
