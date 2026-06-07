@@ -146,6 +146,9 @@ static XDP_TX_STATES: OnceLock<Vec<Arc<XdpTxState>>> = OnceLock::new();
 /// the rings (the HT-contending 2-thread-per-queue model is what capped scaling
 /// to the 8 NIC-local physical cores). This is the Runbound worker model.
 static XDP_UNIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Global physical-core cursor across ALL NICs: NIC1 takes its node, NIC2 spills
+// to the next node, so dual fibre uses distinct cores (no oversubscription).
+static GLOBAL_CORE_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Config the engine hands to the unified workers (set before start_xdp_receive_path).
 pub struct UnifiedCfg {
@@ -1021,7 +1024,20 @@ fn do_start_xdp_receive_path(
     // qps vs 1.3M with 10). Cap to the local physical-core count; this needs no
     // `ethtool -L` (reconfiguring channels around an active ZC bind wedges the
     // ixgbe queue state until a module reload).
-    let n_phys_local = (local_cpus.len() / 2).max(1);
+    // Spread workers across ALL physical cores, NUMA-local node first (the X520
+    // can fan RSS to many queues, but one busy-poll worker per PHYSICAL core is
+    // the stable point; >1 worker/core overdrives the ixgbe ZC datapath and
+    // collapses throughput). Cross-NUMA cores are used only after local ones.
+    // Worker core pool = NIC-LOCAL logical CPUs (physical cores first, then their
+    // HT siblings — see nic_local_logical_cpus ordering). Cap per NIC to the
+    // physical-core count: a single X520 port is link-bound at ~that many busy
+    // workers. For dual fibre the global cursor gives NIC1 the physical cores and
+    // NIC2 their HT siblings — both stay on the NIC-local NUMA node (cross-NUMA
+    // node1 placement is QPI-bound and ~30% slower).
+    let core_pool: Vec<usize> = if local_cpus.is_empty() {
+        crate::autodetect::physical_cores_numa_sorted(nic_node)
+    } else { local_cpus.clone() };
+    let n_phys_local = (core_pool.len() / 2).max(1);
     let queue_count = (hw_queue_count as usize).min(n_phys_local).max(1) as u32;
     tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
 
@@ -1059,11 +1075,11 @@ fn do_start_xdp_receive_path(
                 sxdp_queue_id:       q,
                 sxdp_shared_umem_fd: 0,
             };
-            let core = if local_cpus.is_empty() {
+            let core = if core_pool.is_empty() {
                 None
             } else {
-                let half = (local_cpus.len() / 2).max(1); // physical cores in lower half
-                Some(local_cpus[(q as usize) % half])
+                let gi = GLOBAL_CORE_IDX.fetch_add(1, Ordering::Relaxed);
+                Some(core_pool[gi % core_pool.len()])
             };
             let wp  = cfg.wire_pool.clone();
             let qps = cfg.qps_per_worker.clone();
