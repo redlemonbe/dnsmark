@@ -55,6 +55,7 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
             max_us: 0,
             inflight_mean: 0.0,
             inflight_max: 0,
+            wire_qps: None,
         };
     }
 
@@ -97,6 +98,7 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
         max_us,
         inflight_mean: snaps.iter().map(|s| s.inflight_mean).sum::<f64>() / snaps.len().max(1) as f64,
         inflight_max:  snaps.iter().map(|s| s.inflight_max).max().unwrap_or(0),
+        wire_qps: None,
     }
 }
 
@@ -251,6 +253,7 @@ mod tests {
             max_us:            800,
             inflight_mean:     0.0,
             inflight_max:      0,
+            wire_qps: None,
         }
     }
 

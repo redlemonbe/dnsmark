@@ -208,22 +208,55 @@ the source port (single-flow / single-core testing).
 
 ---
 
-## Ramp mode
+## Ramp mode — Dichotomic Saturation Discovery
 
 ```bash
-dnsmark -s 192.0.2.1 --random --ramp
+dnsmark -s 192.0.2.1 -d top-10000-domains.txt --xdp --ramp
 ```
 
-Starts at 1 000 QPS, doubles every 5 seconds, stops when the server can no longer keep up.
+`--ramp` doesn't just climb and stop — it runs a two-phase **Dichotomic Saturation
+Discovery (DSS)** to pinpoint the *exact* saturation knee, which a plain doubling ramp
+cannot do:
+
+1. **Logarithmic discovery** — start at 100k QPS and double every step until the median
+   (p50) round-trip latency breaks the SLO (1 ms). This brackets the maximum between the
+   last sustained step and the first broken one in `log₂` steps.
+2. **Dichotomic convergence** — binary-search inside that bracket (test the midpoint, move
+   the edge toward it, repeat) until within 5 %, converging on the real knee instead of
+   falling back to a power of two.
+
+A doubling-only ramp that sees 6.4M work and 12.8M fail can only say "6.4M". DSS reports
+the truth — here **11.27M** (real run: Runbound over a single 10 GbE Intel X520, warm
+cache):
 
 ```
-Ramp: target QPS ->   2000  (burst: 171 017/s)
-Ramp: target QPS ->   4000  (burst: 164 892/s)
-...
-Ramp: target QPS -> 256000  (burst: 153 058/s)
+offered      rtt-samples   p50       p95       p99
+   50k         21 800      0.032     9.407     9.591    ┐ exponential phase
+  100k         41 802      0.038     0.071     9.535    │ (×2 from 100k)
+  200k         81 527      0.193     0.256     9.431    │
+  400k        161 412      0.198     0.256     8.615    │
+  800k        321 243      0.240     0.320     0.364    │
+  1.6M        641 088      0.163     0.247     0.282    │
+  3.2M      1 279 751      0.076     0.120     0.143    │
+  6.4M      2 552 748      0.079     0.108     0.155    │
+ 12.4M ↑    2 427 966      1.781     2.299     2.499    ┘ SLO broken (p50 > 1 ms)
+ ── dichotomic convergence ──
+  9.56M     3 672 929      0.129     0.237     0.699    ok
+ 10.88M     2 925 873      0.558     1.192     7.407    ok
+ 11.62M     2 652 467      1.150     1.697     1.923    breach
+ 11.27M     2 876 953      0.944     1.533     1.840    ok ← converged
 
-Max sustainable QPS: 128000
+Max offered load under p50<1ms SLO: 11 266 506 q/s
 ```
+
+The **median (p50)** is the saturation signal, not p95/p99: a small fraction of forwarded
+cache-misses produces large tail outliers — the 9 ms values at low load above — that are a
+property of the workload, not server saturation, and would trip a tail-based test
+prematurely. Each step measures its own window (the latency histogram is reset per step),
+so the percentiles are the load *at that step*, never a cumulative blur. To our knowledge
+dnsmark is the only DNS benchmark that does this binary-search convergence.
+
+See **[WHITEPAPER.md §5b](docs/WHITEPAPER.md)** for the full algorithm.
 
 ---
 

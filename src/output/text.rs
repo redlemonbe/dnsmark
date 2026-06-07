@@ -59,7 +59,21 @@ pub fn print_result(snap: &StatsSnapshot, config: &Config) {
     println!();
     // Egress throughput = what the NIC actually sent (TX completions)
     println!("  Send throughput (egress):  {:.0} qps  ← match this to rx_packets on receiver NIC", snap.send_qps);
-    // Round-trip metric = responses received back (latency/loss tool)
+
+    // wire-truth guard: the submitted-descriptor egress above is fictional if
+    // the NIC never put the frames on the wire. Show the PHY-confirmed rate and
+    // shout if they diverge (wedged ixgbe ZC TX, bad queue setup, etc.).
+    if let Some(wire) = snap.wire_qps {
+        println!("  Wire egress (NIC PHY):     {:.0} qps  (confirmed transmitted)", wire);
+        if snap.send_qps > 1_000.0 && wire < snap.send_qps * 0.5 {
+            eprintln!(
+                "\x1b[1;31m[dnsmark] WARNING: reported egress ({:.0} qps) is NOT reaching the wire \
+                 - NIC PHY confirmed only {:.0} qps. The XDP TX path is wedged or \
+                 misconfigured; the throughput number above is fictional. \
+                 (ixgbe X520: try a host reboot; modprobe reload is insufficient.)\x1b[0m",
+                snap.send_qps, wire);
+        }
+    }    // Round-trip metric = responses received back (latency/loss tool)
     println!("  Round-trip completed:      {:.0} qps  ({:.1}% of egress)", snap.avg_qps,
         if snap.send_qps > 0.0 { snap.avg_qps / snap.send_qps * 100.0 } else { 0.0 });
     println!();

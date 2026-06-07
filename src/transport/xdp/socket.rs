@@ -314,3 +314,36 @@ pub fn get_tx_queue_count(iface: &str) -> u32 {
         .unwrap_or(1)
         .max(1)
 }
+
+// ---------------------------------------------------------------------------
+// AF_XDP per-socket statistics (XDP_STATISTICS getsockopt).
+// Layout from the kernel UAPI (include/uapi/linux/if_xdp.h struct xdp_statistics).
+// Written from the UAPI definition only — no bpftool/libbpf code is used here,
+// so this stays AGPL-clean. Valid even in zero-copy mode, where ethtool -S
+// counters are blind on the ixgbe (82599/X520) datapath.
+// ---------------------------------------------------------------------------
+pub const XDP_STATISTICS: libc::c_int = 7;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct XdpStatistics {
+    pub rx_dropped:               u64,
+    pub rx_invalid_descs:         u64,
+    pub tx_invalid_descs:         u64,
+    pub rx_ring_full:             u64,
+    pub rx_fill_ring_empty_descs: u64,
+    pub tx_ring_empty_descs:      u64,
+}
+
+/// Read the kernel-maintained AF_XDP statistics for one XSK fd.
+pub fn read_xsk_statistics(fd: RawFd) -> Option<XdpStatistics> {
+    let mut st  = XdpStatistics::default();
+    let mut len = std::mem::size_of::<XdpStatistics>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd, SOL_XDP, XDP_STATISTICS,
+            &mut st as *mut _ as *mut libc::c_void, &mut len,
+        )
+    };
+    if rc == 0 { Some(st) } else { None }
+}

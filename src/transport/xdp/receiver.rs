@@ -240,8 +240,8 @@ fn xdp_unified_worker(
             if local_egress >= FLUSH_N { local_egress = 0; }
         }
         // stall detection: every 2 s, warn if egress << submitted
-        if stall_window.elapsed().as_secs() >= 2 && !stall_warned {
-            if stall_sub >= 1024 && stall_egr < stall_sub / 5 {
+        if stall_window.elapsed().as_secs() >= 2 {
+            if !stall_warned && stall_sub >= 1024 && stall_egr < stall_sub / 5 {
                 let pct = stall_egr * 100 / stall_sub.max(1);
                 eprintln!(
                     "\x1b[33m[dnsmark] WARN: XDP TX stalling — {} submitted, \
@@ -250,6 +250,19 @@ fn xdp_unified_worker(
                     stall_sub, stall_egr, pct
                 );
                 stall_warned = true;
+            }
+            if worker_id == 0 {
+                if let Some(st) = super::socket::read_xsk_statistics(fd) {
+                    eprintln!(
+                        "\x1b[36m[dnsmark] XSK q0: tx_invalid_descs={} tx_ring_empty={} \
+                         rx_dropped={} rx_invalid={} rx_fill_empty={} rx_ring_full={} \
+                         | submitted_2s={} completed_2s={}\x1b[0m",
+                        st.tx_invalid_descs, st.tx_ring_empty_descs,
+                        st.rx_dropped, st.rx_invalid_descs,
+                        st.rx_fill_ring_empty_descs, st.rx_ring_full,
+                        stall_sub, stall_egr,
+                    );
+                }
             }
             stall_sub = 0; stall_egr = 0;
             stall_window = std::time::Instant::now();

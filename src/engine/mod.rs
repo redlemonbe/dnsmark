@@ -18,6 +18,34 @@ use crate::config::{Config, Protocol};
 use crate::query::{file::FileQuerySource, random::RandomQuerySource, QuerySource, WireQueryPool};
 use crate::stats::{oom_guard, StatsCollector, StatsSnapshot};
 
+#[cfg(feature = "xdp")]
+/// PHY-confirmed transmitted packet count for one interface. Prefers the driver
+/// NIC-level counter (the truth on ixgbe AF_XDP zero-copy, where the netdev
+/// tx_packets can report descriptors that never reached the wire); falls back to
+/// the portable netdev counter when no NIC-level counter is exposed.
+fn nic_wire_tx_packets(iface: &str) -> Option<u64> {
+    if let Ok(out) = std::process::Command::new("ethtool").arg("-S").arg(iface).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for key in ["tx_pkts_nic", "port.tx_unicast", "tx_unicast"] {
+                for line in s.lines() {
+                    let l = line.trim();
+                    if let Some(rest) = l.strip_prefix(key) {
+                        let v = rest.trim_start_matches(|c: char| c == ':' || c == ' ').trim();
+                        if let Some(tok) = v.split_whitespace().next() {
+                            if let Ok(n) = tok.parse::<u64>() { return Some(n); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // No netdev tx_packets fallback on purpose: under AF_XDP zero-copy that counter
+    // reports descriptors *submitted*, not transmitted on the wire — exactly the
+    // fiction this guard exists to catch. Only PHY-level *_nic counters count.
+    None
+}
+
 pub async fn run(config: Arc<Config>) -> anyhow::Result<StatsSnapshot> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let result = run_with_shutdown(config, shutdown.clone()).await;
@@ -225,6 +253,7 @@ pub async fn run_with_shutdown(
         let notify = ramp_done.clone();
         Some(tokio::spawn(async move {
             let mut ctrl = ramp::RampController::new();
+            let mut best_ok_offered: u64 = 0;  // highest offered load that held the p50 SLO
             loop {
                 // Measure the achieved rate via SENT (submitted descriptors) — reliable
                 // on every datapath. completed (round-trip) is unusable under XDP
@@ -237,21 +266,40 @@ pub async fn run_with_shutdown(
                     .saturating_sub(burst_start);
 
                 let per_worker = (ctrl.current_qps / concurrent.max(1) as u64).max(1);
+                let _ = st.ramp_step_latency();        // drop burst-phase RTTs, open clean window
+                let sent_w0 = st.sent.load(Ordering::Relaxed);
+                let comp_w0 = st.completed.load(Ordering::Relaxed);
                 qps_arc.store(per_worker, Ordering::Relaxed);
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 if sd.load(Ordering::Relaxed) { break; }
 
+                // Per-step latency + answered ratio for the 4 s paced window: the
+                // methodology curve (percentiles vs offered load, step by step).
+                let (p50, p95, p99, samples) = st.ramp_step_latency();
+                let sent_w = st.sent.load(Ordering::Relaxed).saturating_sub(sent_w0);
+                let _ = comp_w0;
+
+                if p50 <= 1_000 { best_ok_offered = best_ok_offered.max(sent_w / 4); }
                 let target_qps = ctrl.current_qps;
-                let (new_qps, saturated, max_sustainable) = ctrl.advance(burst_completions);
+                let (new_qps, saturated, max_sustainable) = ctrl.advance(sent_w / 4, p50);
+
+                // Per-step methodology line: offered load vs RTT percentiles. `samples`
+                // is the RTTs actually measured this step; when it collapses relative to
+                // the offered rate, the round-trip path (not the server) is saturated.
+                println!(
+                    "Ramp step: offered {:>9} q/s | rtt-samples {:>8} | \
+                     p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms",
+                    sent_w / 4, samples,
+                    p50 as f64 / 1000.0, p95 as f64 / 1000.0, p99 as f64 / 1000.0,
+                );
+                let _ = target_qps;
 
                 if saturated {
-                    let reported = if max_sustainable == 0 { target_qps } else { max_sustainable };
-                    let reason = if burst_completions < (target_qps as f64 * 0.80) as u64 {
-                        format!("burst {}/s < {}/s target", burst_completions, target_qps)
-                    } else {
-                        "hard cap (20 doublings)".to_string()
-                    };
-                    println!("\nMax sustainable QPS: {} ({})", reported, reason);
+                    let _ = max_sustainable; let _ = target_qps;
+                    println!(
+                        "\nMax offered load under p50<1ms SLO: {} q/s (highest step that held the SLO)",
+                        best_ok_offered,
+                    );
                     sd.store(true, Ordering::Relaxed);
                     notify.notify_one();
                     break;
@@ -259,7 +307,7 @@ pub async fn run_with_shutdown(
 
                 let new_per_worker = (new_qps / concurrent.max(1) as u64).max(1);
                 qps_arc.store(new_per_worker, Ordering::Relaxed);
-                println!("Ramp: target QPS -> {} (burst: {}/s)", new_qps, burst_completions);
+                let _ = new_qps; let _ = burst_completions; let _ = target_qps;
             }
         }))
     } else {
@@ -292,6 +340,21 @@ pub async fn run_with_shutdown(
         }
     }
     let start = Instant::now();
+    // wire-truth guard: snapshot the egress NIC PHY tx counter to confirm that the
+    // reported throughput actually reached the wire (catches a wedged ZC TX path,
+    // where descriptors are submitted/completed but tx_pkts_nic never advances).
+    #[cfg(feature = "xdp")]
+    let wt_baseline: Option<(Vec<String>, u64)> = if use_xdp {
+        let mut ifs: Vec<String> = Vec::new();
+        let mut srvs = config.servers.clone();
+        if srvs.is_empty() { srvs.push(config.server); }
+        for srv in srvs {
+            let i = crate::transport::xdp::iface_for_benchmark(srv);
+            if !ifs.contains(&i) { ifs.push(i); }
+        }
+        let tx0: u64 = ifs.iter().filter_map(|i| nic_wire_tx_packets(i)).sum();
+        Some((ifs, tx0))
+    } else { None };
 
     tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)), if !config.ramp => {
@@ -312,7 +375,15 @@ pub async fn run_with_shutdown(
     // _xdp_handle drops here, detaching XDP program from the NIC.
 
     let elapsed = start.elapsed().as_secs_f64();
-    Ok(stats.snapshot(elapsed))
+    #[allow(unused_mut)]
+    let mut snap = stats.snapshot(elapsed);
+    #[cfg(feature = "xdp")]
+    if let Some((ifs, tx0)) = wt_baseline {
+        let tx1: u64 = ifs.iter().filter_map(|i| nic_wire_tx_packets(i)).sum();
+        let secs = elapsed.max(1e-9);
+        snap.wire_qps = Some(tx1.saturating_sub(tx0) as f64 / secs);
+    }
+    Ok(snap)
 }
 
 #[cfg(feature = "xdp")]

@@ -179,8 +179,83 @@ Two independent limits shape the send side:
   `--max-outstanding` (default 100, mirroring `dnsperf -q`). This bounds how many
   queries can be in flight at once, exactly like dnsperf's closed-loop window.
 
-`--ramp` replaces the fixed rate with a controller that climbs QPS until the server
-stops keeping up, reporting the maximum sustainable rate (`engine/ramp.rs`).
+`--ramp` replaces the fixed rate with the two-phase saturation search described in
+§5b (`engine/ramp.rs`): it climbs QPS until a latency SLO breaks, then binary-searches
+the exact knee.
+
+---
+
+## 5b. Dichotomic Saturation Discovery (the `--ramp` algorithm)
+
+Finding a server's real maximum is the hard part of DNS benchmarking, and the common
+approaches are coarse:
+
+- **Fixed-load** requires you to already know the answer — you guess a rate and check
+  whether it holds. Wrong guesses either under-load the server or drown it.
+- **Linear step-ramp** (e.g. +100k each step) is slow over a wide range and still lands
+  on whichever step boundary you happened to pick.
+- **Geometric (doubling) ramp** covers the range fast but its resolution is a *whole
+  octave*: if a server saturates between 8M and 16M, a doubling ramp can only tell you
+  "more than 8M, less than 16M" and will report 8M. The true knee is invisible.
+
+dnsmark's `--ramp` uses a two-phase **Dichotomic Saturation Discovery (DSS)**:
+
+1. **Logarithmic discovery.** Start at 100k QPS and double each 5 s step (1 s burst +
+   4 s paced measurement) until a step *breaks the latency SLO*. This brackets the
+   maximum between the last sustained step (`lo`) and the first broken one (`hi`) in
+   `log₂` steps.
+2. **Dichotomic convergence.** Binary-search inside `[lo, hi]` — test the midpoint, move
+   `lo` or `hi` toward it, repeat — until the bracket is within 5 %. e.g. 6.4M ok /
+   12.8M broken → try 9.6M, 11.2M, 12.0M, 11.6M … converging on the real knee instead of
+   falling back to a power of two.
+
+**Saturation criterion.** A step is "sustained" when its **p50** round-trip latency is
+under the SLO (1 ms by default). The median — not p95/p99 — is the signal on purpose: a
+small fraction of forwarded cache-misses produces large tail outliers that are a property
+of the *workload*, not of server saturation, and would trip a tail-based test
+prematurely. Each step measures its own window: the latency histogram is reset at the
+start of every step (`ramp_step_latency()`), so the percentiles are the load *at that
+step*, never a cumulative blur.
+
+**Worked example** — Runbound v0.15.3 over a single 10 GbE X520 link, warm real cache
+(99.5 % hit, no local-data), generator = dual Xeon E5-2690 v2:
+
+```
+offered q/s   rtt-samples    p50 ms   p95 ms   p99 ms
+─ logarithmic discovery ───────────────────────────────
+     49 664        21 800     0.032    9.407    9.591
+    100 096        41 802     0.038    0.071    9.535
+    200 448        81 527     0.193    0.256    9.431
+    400 407       161 412     0.198    0.256    8.615
+    800 530       321 243     0.240    0.320    0.364
+  1 600 036       641 088     0.163    0.247    0.282
+  3 200 409     1 279 751     0.076    0.120    0.143
+  6 399 053     2 552 748     0.079    0.108    0.155   ← last sustained
+ 12 370 839     2 427 966     1.781    2.299    2.499   ← SLO broken (p50 > 1 ms)
+─ dichotomic convergence inside [6.4M, 12.8M] ─────────
+  9 559 792     3 672 929     0.129    0.237    0.699   ok
+ 10 883 579     2 925 873     0.558    1.192    7.407   ok
+ 11 618 254     2 652 467     1.150    1.697    1.923   broken
+ 11 266 506     2 876 953     0.944    1.533    1.840   ok  ← converged
+
+Max offered load under p50 < 1 ms SLO: 11 266 506 q/s
+```
+
+A doubling ramp would have reported **6.4M** (the last clean octave). DSS pins the knee
+at **11.27M** — a 76 % higher, defensible number, and it shows *exactly* where latency
+turns (the p50 step from 0.08 ms at 6.4M to 1.78 ms at 12.4M). To our knowledge dnsmark
+is the only DNS benchmark that does this binary-search convergence; it is what lets a
+single `--ramp` command answer "what is the real maximum, and what is the latency right
+at it?".
+
+Two honest notes about *this* rig (not the algorithm): the early low-QPS steps show
+9 ms p95/p99 — those are the ~0.5 % forwarded cache-misses (few samples, so they dominate
+the tail), which is why the median is the saturation signal. And `rtt-samples` is the
+*round-trip* count the generator could drain back; on an X520 the generator's own
+PCIe 2.0 RX shares its bus with TX, so this is a lower bound on what the server actually
+answered. The server's true served rate is read at the **receiver's NIC counters** (here
+~8.2–8.4 M qps at 8.7 % receiver CPU); DSS characterises the **latency envelope**, the NIC
+counters give the **throughput**. See [benchmarking.md](benchmarking.md).
 
 ---
 
@@ -206,6 +281,22 @@ Design points that make this fast *and* correct:
   to be.
 - **No real-time scheduling.** Workers run `SCHED_OTHER`; the kernel can always preempt
   them, so per-core softirqs (and the host) stay healthy under load.
+
+Operational hardening (so a benchmark is repeatable without a setup ritual):
+
+- **Stale-program auto-detach.** On startup the loader force-detaches any XDP program
+  already bound to the interface — a previous run killed with `SIGKILL` never runs its
+  `Drop`, and the leftover program otherwise wedges the next attach and silently breaks
+  TX. Pure netlink, no dependency; the user never has to `ip link set <if> xdp off`.
+- **Per-socket AF_XDP statistics.** `getsockopt(SOL_XDP, XDP_STATISTICS)` (kernel UAPI
+  only — no bpftool/libbpf code) exposes `tx_invalid_descs`, fill/completion-ring state,
+  etc., live per queue. These are valid in zero-copy, where `ethtool -S` *netdev*
+  counters read a flat zero.
+- **Wire-truth guard.** dnsmark reads the NIC PHY tx counter (`*_nic`) around the run and
+  prints the PHY-confirmed egress next to the submitted-descriptor egress; if they
+  diverge it shouts and refuses to present a fictional rate. It never falls back to the
+  netdev `tx_packets` counter, which counts *submissions*, not transmissions, under
+  zero-copy — exactly the fiction the guard exists to catch.
 
 On an Intel X520 (82599) this saturates a 10 GbE link; see
 [benchmarking.md](benchmarking.md) for the throughput methodology (measured at NIC
