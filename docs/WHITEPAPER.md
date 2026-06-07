@@ -115,7 +115,8 @@ Measured at the CPU-cycle level (bare-metal X520, `perf`), the generator's **own
 essentially **kernel-bound** (the irreducible UDP-stack traversal). dnsmark then sends
 *more* packets at *fewer* cycles each.
 
-**Bench (dragonrage AMD -> dragonsage, X520 10 GbE, vs unbound, measured at NIC
+**Bench (generator: dual Intel Xeon E5-2690 v2 — 20 physical cores / 2 NUMA nodes;
+Intel 82599 / X520 10 GbE link; UDP kernel mode vs unbound; measured at NIC
 tx_packets):**
 
 | generator | offered (NIC) |
