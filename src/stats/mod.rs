@@ -195,6 +195,7 @@ impl StatsCollector {
             max_us,
             inflight_mean: ifl_mean,
             inflight_max:  ifl_max,
+            wire_qps:      None,
         }
     }
 }

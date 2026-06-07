@@ -20,4 +20,6 @@ pub struct StatsSnapshot {
     pub max_us: u64,
     pub inflight_mean: f64,
     pub inflight_max: u64,
+    /// PHY-confirmed wire egress (NIC tx_pkts_nic delta / run). None if not measured.
+    pub wire_qps: Option<f64>,
 }

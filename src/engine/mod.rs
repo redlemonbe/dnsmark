@@ -18,6 +18,34 @@ use crate::config::{Config, Protocol};
 use crate::query::{file::FileQuerySource, random::RandomQuerySource, QuerySource, WireQueryPool};
 use crate::stats::{oom_guard, StatsCollector, StatsSnapshot};
 
+#[cfg(feature = "xdp")]
+/// PHY-confirmed transmitted packet count for one interface. Prefers the driver
+/// NIC-level counter (the truth on ixgbe AF_XDP zero-copy, where the netdev
+/// tx_packets can report descriptors that never reached the wire); falls back to
+/// the portable netdev counter when no NIC-level counter is exposed.
+fn nic_wire_tx_packets(iface: &str) -> Option<u64> {
+    if let Ok(out) = std::process::Command::new("ethtool").arg("-S").arg(iface).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for key in ["tx_pkts_nic", "port.tx_unicast", "tx_unicast"] {
+                for line in s.lines() {
+                    let l = line.trim();
+                    if let Some(rest) = l.strip_prefix(key) {
+                        let v = rest.trim_start_matches(|c: char| c == ':' || c == ' ').trim();
+                        if let Some(tok) = v.split_whitespace().next() {
+                            if let Ok(n) = tok.parse::<u64>() { return Some(n); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // No netdev tx_packets fallback on purpose: under AF_XDP zero-copy that counter
+    // reports descriptors *submitted*, not transmitted on the wire — exactly the
+    // fiction this guard exists to catch. Only PHY-level *_nic counters count.
+    None
+}
+
 pub async fn run(config: Arc<Config>) -> anyhow::Result<StatsSnapshot> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let result = run_with_shutdown(config, shutdown.clone()).await;
@@ -292,6 +320,21 @@ pub async fn run_with_shutdown(
         }
     }
     let start = Instant::now();
+    // wire-truth guard: snapshot the egress NIC PHY tx counter to confirm that the
+    // reported throughput actually reached the wire (catches a wedged ZC TX path,
+    // where descriptors are submitted/completed but tx_pkts_nic never advances).
+    #[cfg(feature = "xdp")]
+    let wt_baseline: Option<(Vec<String>, u64)> = if use_xdp {
+        let mut ifs: Vec<String> = Vec::new();
+        let mut srvs = config.servers.clone();
+        if srvs.is_empty() { srvs.push(config.server); }
+        for srv in srvs {
+            let i = crate::transport::xdp::iface_for_benchmark(srv);
+            if !ifs.contains(&i) { ifs.push(i); }
+        }
+        let tx0: u64 = ifs.iter().filter_map(|i| nic_wire_tx_packets(i)).sum();
+        Some((ifs, tx0))
+    } else { None };
 
     tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)), if !config.ramp => {
@@ -312,7 +355,15 @@ pub async fn run_with_shutdown(
     // _xdp_handle drops here, detaching XDP program from the NIC.
 
     let elapsed = start.elapsed().as_secs_f64();
-    Ok(stats.snapshot(elapsed))
+    #[allow(unused_mut)]
+    let mut snap = stats.snapshot(elapsed);
+    #[cfg(feature = "xdp")]
+    if let Some((ifs, tx0)) = wt_baseline {
+        let tx1: u64 = ifs.iter().filter_map(|i| nic_wire_tx_packets(i)).sum();
+        let secs = elapsed.max(1e-9);
+        snap.wire_qps = Some(tx1.saturating_sub(tx0) as f64 / secs);
+    }
+    Ok(snap)
 }
 
 #[cfg(feature = "xdp")]

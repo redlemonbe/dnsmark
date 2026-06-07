@@ -1,6 +1,6 @@
 [package]
 name = "dnsmark"
-version = "2.1.2"
+version = "2.1.3"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "High-performance DNS benchmark — drop-in dnsperf replacement"

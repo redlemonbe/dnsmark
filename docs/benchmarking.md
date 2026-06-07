@@ -26,12 +26,21 @@ the true NIC-to-NIC bandwidth.
 
 | Role | Machine |
 |------|---------|
-| Generator (`dnsmark --xdp`) | AMD Threadripper PRO 5995WX |
-| Receiver (DNS under test) | Dual Intel Xeon E5-2690 v2 (2013, 20 cores / 40 threads) |
+| Generator (`dnsmark --xdp`) | Dual Intel Xeon E5-2690 v2 (2013, 20 cores / 40 threads) |
+| Receiver (DNS under test) | AMD Threadripper PRO 5995WX |
 
 Both machines run Linux with the `ixgbe` driver. The X520 exposes up to
 **16 RSS queues** (hardware RETA limit of the 82599 — you cannot exceed this,
 regardless of core count).
+
+> **NIC choice — the X520 works but is not recommended for this benchmark.**
+> The 82599 / `ixgbe` is usable end-to-end, but it is a poor *measurement*
+> platform: in AF_XDP zero-copy its netdev counters (`rx_packets`,
+> `rx_missed_errors`, `tx_packets`) read a delta of 0 under load, so wire
+> throughput is only visible via `*_nic` driver counters and the per-socket
+> `XDP_STATISTICS`; it is PCIe 2.0; and RSS is hard-capped at 16 queues. Prefer
+> Intel i40e (X710), ice (E810) or igc for high-rate or reproducible
+> measurements (valid zero-copy counters, PCIe 3.0+, no 16-queue cap).
 
 ---
 
