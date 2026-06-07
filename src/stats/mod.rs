@@ -26,6 +26,9 @@ pub struct StatsCollector {
     /// Monotone offset (ns since collector creation) of the last TX completion.
     /// Set via inc_sent_n() using start.elapsed(). Never a UNIX timestamp.
     last_egress_ns:  AtomicU64,
+    /// Offset (ns from creation) when the current measurement window started
+    /// (set by reset_window() after warm-up); 0 = since creation.
+    window_start_ns: AtomicU64,
     /// Monotone clock captured at creation — anchors last_egress_ns.
     start:           Instant,
 }
@@ -46,6 +49,7 @@ impl StatsCollector {
             inflight_count:  AtomicU64::new(0),
             inflight_max:    AtomicU64::new(0),
             last_egress_ns:  AtomicU64::new(0),
+            window_start_ns: AtomicU64::new(0),
             start:           Instant::now(),
             histogram: Mutex::new(
                 Histogram::new_with_bounds(1, 60_000_000, 3)
@@ -64,6 +68,20 @@ impl StatsCollector {
         self.sent.fetch_add(n as u64, Ordering::Relaxed);
         let elapsed_ns = self.start.elapsed().as_nanos() as u64;
         self.last_egress_ns.store(elapsed_ns, Ordering::Relaxed);
+    }
+
+    /// Discard everything counted so far and open a fresh measurement window.
+    /// Called after a warm-up period so steady-state numbers exclude XSK bind,
+    /// ring fill and NIC ramp.
+    pub fn reset_window(&self) {
+        self.window_start_ns.store(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        for a in [&self.sent, &self.completed, &self.timeouts, &self.errors,
+                  &self.rcode_noerror, &self.rcode_nxdomain, &self.rcode_servfail,
+                  &self.rcode_refused, &self.rcode_other,
+                  &self.inflight_sum, &self.inflight_count, &self.inflight_max] {
+            a.store(0, Ordering::Relaxed);
+        }
+        self.histogram.lock().clear();
     }
 
     pub fn inc_timeout(&self) {
@@ -126,8 +144,9 @@ impl StatsCollector {
         // NO UNIX timestamp, NO now-based reconstruction, NO subtraction.
         let send_qps = {
             let last_ns = self.last_egress_ns.load(Ordering::Relaxed);
-            if last_ns > 0 {
-                let egress_secs = last_ns as f64 / 1_000_000_000.0;
+            let win0 = self.window_start_ns.load(Ordering::Relaxed);
+            if last_ns > win0 {
+                let egress_secs = (last_ns - win0) as f64 / 1_000_000_000.0;
                 if egress_secs > 0.1 { sent as f64 / egress_secs }
                 else                  { sent as f64 / elapsed_secs }
             } else {

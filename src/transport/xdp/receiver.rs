@@ -199,6 +199,10 @@ fn xdp_unified_worker(
     const FLUSH_N: usize = 1024;
     let mut local_egress:      usize = 0;
     let mut _local_submitted: usize = 0;
+    // Reliable "sent" = descriptors SUBMITTED to the TX ring (what actually goes on
+    // the wire). The completion-ring count under-reports under load (the comp ring
+    // overflows/lags at multi-Mpps), so we count enq, flushed in batches (low CPU).
+    let mut sub_acc: usize = 0;
     // stall detection (egress vs submitted)
     let mut stall_sub:    usize = 0;
     let mut stall_egr:    usize = 0;
@@ -233,10 +237,7 @@ fn xdp_unified_worker(
             sock.tx_pool.extend_from_slice(&done);
             local_egress += n;
             stall_egr    += n;
-            if local_egress >= FLUSH_N {
-                stats.inc_sent_n(local_egress);
-                local_egress = 0;
-            }
+            if local_egress >= FLUSH_N { local_egress = 0; }
         }
         // stall detection: every 2 s, warn if egress << submitted
         if stall_window.elapsed().as_secs() >= 2 && !stall_warned {
@@ -320,6 +321,8 @@ fn xdp_unified_worker(
                     }
                     _local_submitted += enq;
                     stall_sub       += enq;
+                    sub_acc += enq;
+                    if sub_acc >= FLUSH_N { stats.inc_sent_n(sub_acc); sub_acc = 0; }
                     // backpressure gate only — NOT stats.sent
                 }
             }
@@ -376,7 +379,7 @@ fn xdp_unified_worker(
         // DIAGNOSTIC: print raw egress total so caller can compare to
         // ethtool -S <nic> tx_packets at the same instant.
         // This is the ONLY honest number — compare to ASIC to diagnose +9% residual.
-        if local_egress > 0 { stats.inc_sent_n(local_egress); }
+        if sub_acc > 0 { stats.inc_sent_n(sub_acc); }
     }
 }
 
@@ -1040,14 +1043,22 @@ fn do_start_xdp_receive_path(
     // REMOTE_CORE_CAP cross-NUMA cores: the inter-socket QPI saturates beyond ~6
     // remote workers feeding a node-0 NIC, and past that the ixgbe ZC datapath
     // collapses (the dual-Xeon-v2 "16 = 10+6" limit, empirically verified).
-    const REMOTE_CORE_CAP: usize = 6;
     let phys_sorted = crate::autodetect::physical_cores_numa_sorted(nic_node);
     let n_local = phys_sorted.iter()
         .filter(|&&c| crate::autodetect::numa_node_for_cpu(c) == nic_node)
         .count().max(1);
-    let n_remote = phys_sorted.len().saturating_sub(n_local).min(REMOTE_CORE_CAP);
-    let core_pool: Vec<usize> = phys_sorted.into_iter().take(n_local + n_remote).collect();
-    let queue_count = (hw_queue_count as usize).min(n_local).max(1) as u32;
+    // Worker budget. A single X520 port is link-bound at ~10-12 busy workers;
+    // extra cores only serve the SECOND port of a dual-fibre setup. Two regimes:
+    //  - 2-socket Intel (Xeon-v2 + X520): inter-socket QPI collapses the ixgbe ZC
+    //    datapath beyond ~6 cross-NUMA workers => 10 local + 6 remote = 16 total.
+    //  - many-node AMD (Infinity Fabric, cheap cross-CCX) => 12 per port, 24 total.
+    let (per_nic_cap, total_cap) = if crate::autodetect::numa_node_count() <= 2 {
+        (n_local, n_local + 6)
+    } else {
+        (12usize, 24usize)
+    };
+    let core_pool: Vec<usize> = phys_sorted.into_iter().take(total_cap).collect();
+    let queue_count = (hw_queue_count as usize).min(per_nic_cap).max(1) as u32;
     tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
 
     for q in 0..queue_count {

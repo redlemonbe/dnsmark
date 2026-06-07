@@ -17,6 +17,10 @@ pub const OUTER_HDR: usize = ETH_HDR + IPV4_HDR + UDP_HDR; // 42 bytes
 #[derive(Clone)]
 pub struct FrameHeader {
     tpl: [u8; OUTER_HDR],
+    /// One's-complement sum of the constant IPv4 header words (total-length and
+    /// checksum fields = 0). Per packet we add only the total-length and fold —
+    /// no 10-word recompute on the hot path.
+    ip_base_sum: u32,
 }
 
 impl FrameHeader {
@@ -45,8 +49,13 @@ impl FrameHeader {
         tpl[ETH_HDR + IPV4_HDR + 1] = src_port as u8;
         tpl[ETH_HDR + IPV4_HDR + 2] = (dst_port >> 8) as u8;
         tpl[ETH_HDR + IPV4_HDR + 3] = dst_port as u8;
-        // IP checksum = 0 and UDP checksum = 0 until write_frame patches them
-        Self { tpl }
+        // IP checksum = 0 and UDP checksum = 0 until write_frame patches them.
+        // Precompute the constant part of the IPv4 header checksum once.
+        let mut ip_base_sum: u32 = 0;
+        for i in 0..(IPV4_HDR / 2) {
+            ip_base_sum += u16::from_be_bytes([tpl[ETH_HDR + 2*i], tpl[ETH_HDR + 2*i + 1]]) as u32;
+        }
+        Self { tpl, ip_base_sum }
     }
 
     /// Stamp a complete Ethernet frame into `out` for DNS payload `dns`.
@@ -75,8 +84,12 @@ impl FrameHeader {
         // IP total length
         out[ETH_HDR + 2] = (ip_tot >> 8) as u8;
         out[ETH_HDR + 3] = ip_tot as u8;
-        // IP checksum (header bytes [10..12] are 0 from the template copy)
-        let cksum = ipv4_checksum(&out[ETH_HDR..ETH_HDR + IPV4_HDR]);
+        // IP checksum: constant base + this packet's total-length, folded once
+        // (RFC 1071) — no per-packet 10-word sum.
+        let mut sum = self.ip_base_sum + ip_tot as u32;
+        sum = (sum & 0xFFFF) + (sum >> 16);
+        sum = (sum & 0xFFFF) + (sum >> 16);
+        let cksum = !(sum as u16);
         out[ETH_HDR + 10] = (cksum >> 8) as u8;
         out[ETH_HDR + 11] = cksum as u8;
         // UDP length
