@@ -53,7 +53,7 @@ hand-off. The loop, each iteration:
 
 ```
 1. SEND (if a slot is free)
-     timestamp = clock.now()        ← taken BEFORE send(), the dnsperf timestamp point
+     timestamp = clock.now()        ← taken BEFORE send(), the conventional timestamp point
      send(fd, query, MSG_DONTWAIT)
      in_flight.insert(id, timestamp)
      global_in_flight += 1
@@ -122,15 +122,14 @@ tx_packets):**
 | generator | offered (NIC) |
 |---|---|
 | dnsmark, single-send (before the throughput path) | ~500 k qps |
-| dnsperf (`-q 1000`) | ~610 k qps |
 | **dnsmark, throughput path** | **~680 k qps** |
 
-In pure kernel mode the throughput path **exceeds dnsperf**. Per-query user-space cost
+In pure kernel mode the throughput path lifts the single-send rate by ~36 %. Per-query user-space cost
 fell from ~17 k to ~340 cycles; total cost from ~128 k to ~94 k cycles/query.
 
 > **This mode is NOT a latency measurement.** Send timestamps are per-batch, so the
 > p50/p99 reported under `--max-outstanding 0` are throughput-mode figures, not
-> comparable to dnsperf's latency. For any latency comparison use
+> comparable to a closed-loop latency figure. For any latency comparison use
 > `--max-outstanding > 0` (the closed-loop path of section 3), which is unchanged.
 
 ---
@@ -158,12 +157,11 @@ include the genuinely slow responses; the tail is never truncated by a generator
 keeps only the fast ones. A query that gets **no** response (a *timeout*) is a different
 thing: it is a **loss**, not a completion and not a latency sample. The 10 ms sweep and
 the end-of-run drain mark such queries as timeouts (`inc_timeout`); they move into
-`queries_lost`, never into `queries_completed` or the latency histogram. This matches
-dnsperf and keeps three counters clean: `queries_completed` = real responses,
+`queries_lost`, never into `queries_completed` or the latency histogram. This keeps three counters clean: `queries_completed` = real responses,
 `queries_lost` = timeouts + send errors, and `sent == completed + lost` exactly.
 
 **Outstanding depth** is tracked too (mean and max concurrent in-flight), and reported
-in JSON — this is the number to align with dnsperf's `-q` when comparing the two tools.
+in JSON — this is the closed-loop outstanding depth (the `-q`-style window).
 
 ---
 
@@ -176,8 +174,8 @@ Two independent limits shape the send side:
   catch up (`next_send = now + interval`), so a scheduler hiccup cannot produce a
   thundering send and a distorted tail.
 - **Outstanding** — a shared atomic `global_in_flight` is gated against
-  `--max-outstanding` (default 100, mirroring `dnsperf -q`). This bounds how many
-  queries can be in flight at once, exactly like dnsperf's closed-loop window.
+  `--max-outstanding` (default 100). This bounds how many queries can be in flight at
+  once — a standard closed-loop outstanding window.
 
 `--ramp` replaces the fixed rate with the two-phase saturation search described in
 §5b (`engine/ramp.rs`): it climbs QPS until a latency SLO breaks, then binary-searches
@@ -243,8 +241,7 @@ Max offered load under p50 < 1 ms SLO: 11 266 506 q/s
 
 A doubling ramp would have reported **6.4M** (the last clean octave). DSD pins the knee
 at **11.27M** — a 76 % higher, defensible number, and it shows *exactly* where latency
-turns (the p50 step from 0.08 ms at 6.4M to 1.78 ms at 12.4M). To our knowledge dnsmark
-is the only DNS benchmark that does this binary-search convergence; it is what lets a
+turns (the p50 step from 0.08 ms at 6.4M to 1.78 ms at 12.4M). This is what lets a
 single `--ramp` command answer "what is the real maximum, and what is the latency right
 at it?".
 
@@ -309,7 +306,7 @@ counters, not at the application).
 **Symmetric-transport rule.** `--xdp` is for benchmarking a server that is *itself*
 AF_XDP, or for raw saturation. Comparing an XDP generator against a kernel server (or
 vice-versa) compares two different datapaths and is not a fair latency measurement. The
-default UDP path is what you compare against dnsperf. See §7.
+default UDP path is the one to use for a fair kernel-vs-kernel comparison. See §7.
 
 ---
 
@@ -322,16 +319,15 @@ reported RTT = server processing + network round-trip + generator client-side ov
 ```
 
 Only the first is a property of the server; the third belongs to the *tool* and differs
-between any two generators. dnsmark and dnsperf are both closed-loop UDP generators and
-differ in that third term, so their **absolute** numbers differ even against the same
-server — which is expected of any two tools and is **not a defect in either**.
+between any two generators, so two tools' **absolute** numbers differ even against the
+same server — which is expected and is **not a defect in either**.
 
 dnsmark therefore validates latency against the **wire** — a `tcpdump` capture on the
 server, paired by DNS transaction id, which isolates the server's own term — rather than
-against another tool. Across two rigs and both generator↔receiver directions, dnsmark and
-dnsperf both report *more* than the wire (neither under-measures), dnsmark sits closer to
-the wire (lower client-side overhead), and for a fixed generator the offset is stable
-across servers (so server rankings are preserved). The full decomposition, numbers, and
+against another tool. Across two rigs and both generator↔receiver directions the generator
+always reports *more* than the wire (it never under-measures), dnsmark's light client path
+sits close to the wire, and for a fixed generator the offset is stable across servers (so
+server rankings are preserved). The full decomposition, numbers, and
 reproduction commands are in **[benchmarking.md §7](benchmarking.md)**.
 
 The practical rules that follow:

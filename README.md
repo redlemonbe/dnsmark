@@ -37,13 +37,13 @@ see the [whitepaper](docs/WHITEPAPER.md).
 
 ## What you get
 
-dnsperf (ISC/DNS-OARC) is the established reference and does UDP, TCP, DoT and DoH;
-this table lists only where dnsmark adds something on top of it.
+Established DNS load generators cover UDP, TCP, DoT and DoH; this table lists what
+dnsmark adds on top.
 
-| | dnsperf | dnsmark |
+| | established generators | dnsmark |
 |---|:---:|:---:|
 | UDP / TCP / DoT | ✅ | ✅ |
-| Built-in auto-ramp to max QPS | via companion `resperf` | ✅ `--ramp` |
+| Built-in auto-ramp to max QPS | a separate companion tool | ✅ `--ramp` (Dichotomic Saturation Discovery) |
 | Side-by-side two-server compare | ❌ | ✅ `--compare` |
 | Live TUI dashboard | ❌ | ✅ |
 | p50 / p95 / p99 / p999 | average + per-query `-v` | ✅ built-in HDR histogram |
@@ -51,22 +51,22 @@ this table lists only where dnsmark adds something on top of it.
 | AF_XDP zero-copy datapath | ❌ | ✅ `--xdp` |
 | Single static binary, no deps | ❌ | ✅ musl |
 
-> Latency note: dnsmark and dnsperf measure the same thing differently — see
+> Latency note: a closed-loop generator's absolute latency is never "the server's
+> latency" — it includes the tool's own client-side overhead. See
 > [Measurement accuracy](#measurement-accuracy--transport) and the
-> [whitepaper](docs/WHITEPAPER.md). Neither tool's absolute latency is "the server's
-> latency"; anchor on a wire capture.
+> [whitepaper](docs/WHITEPAPER.md). Anchor on a wire capture.
 
 ---
 
 ## Measurement accuracy & transport
 
-dnsmark sends over a **UDP kernel socket by default** — the same datapath as dnsperf — so latency is directly comparable. `--xdp` is **opt-in** and changes the datapath: only use it when the server under test is itself AF_XDP (a symmetric **XDP-vs-XDP** measurement) or for raw saturation throughput. **Never compare an XDP generator against a kernel server** — that is asymmetric and not publishable. The rule is simple: *the generator's datapath must match the server's.*
+dnsmark sends over a **UDP kernel socket by default** — the same datapath as a standard kernel UDP client — so latency is directly comparable. `--xdp` is **opt-in** and changes the datapath: only use it when the server under test is itself AF_XDP (a symmetric **XDP-vs-XDP** measurement) or for raw saturation throughput. **Never compare an XDP generator against a kernel server** — that is asymmetric and not publishable. The rule is simple: *the generator's datapath must match the server's.*
 
 A closed-loop generator's reported RTT is **`server processing + network + the tool's own client-side overhead`** — only the first term belongs to the server, and the third differs between any two generators. So **absolute** latency is a property of the *(server, generator, rig)* triple, not of the server alone: validate the server's term against the **wire** (a `tcpdump` capture on the server, paired by DNS transaction id) and compare servers with **one fixed generator**.
 
-dnsmark's client-side overhead happens to be lower than dnsperf's (batched `recvmmsg`, tight send/poll loop), which is why it sits closer to the wire — but dnsperf's larger figure reflects a heavier client path, not an error. dnsperf is a sound relative reference and a valuable independent cross-check.
+dnsmark's client path is deliberately light (batched `recvmmsg`, a tight send/poll loop), so its figure sits close to the wire — but the **wire**, not any tool, is the reference.
 
-See **[docs/benchmarking.md §7](docs/benchmarking.md)** for the full three-term decomposition (dnsmark, dnsperf and the wire, on two rigs and both generator↔receiver directions) and the exact commands to reproduce it.
+See **[docs/benchmarking.md §7](docs/benchmarking.md)** for the full three-term decomposition (the tool's figure against the wire, on two rigs and both generator↔receiver directions) and the exact commands to reproduce it.
 
 > **Concurrency (`-c`).** Each client is a dedicated OS thread. `-c auto` (the default) uses one thread per physical core (HT excluded) -- the sweet spot. Setting `-c` far above the physical core count oversubscribes the CPU and adds scheduling jitter to *both* throughput and latency; raise it only when the bottleneck is clearly elsewhere.
 
@@ -105,7 +105,7 @@ dnsmark -s 192.0.2.1 --random --ramp
 # Fixed load — 5 000 QPS for 60 s
 dnsmark -s 192.0.2.1 --random -Q 5000 -l 60
 
-# Query file (dnsperf format)
+# Query file (one `name [type]` per line)
 dnsmark -s 192.0.2.1 -d queries.txt -l 30
 
 # Compare two servers side by side
@@ -129,8 +129,8 @@ worker runs per NIC-local physical core; each owns its own queue, UMEM and rings
 link (~12 M qps measured — see the [benchmarking guide](docs/benchmarking.md))** and
 scales per core, well beyond a kernel-socket generator.
 
-> **`--xdp` is opt-in.** The default transport is the UDP kernel socket (comparable to
-> dnsperf). Use `--xdp` only against a server that is *itself* AF_XDP (symmetric
+> **`--xdp` is opt-in.** The default transport is the UDP kernel socket (a standard
+> kernel UDP client). Use `--xdp` only against a server that is *itself* AF_XDP (symmetric
 > measurement) or for raw saturation throughput — never an XDP generator against a
 > kernel server. For latency comparisons against unbound/BIND, use the default UDP path.
 
@@ -253,8 +253,7 @@ The **median (p50)** is the saturation signal, not p95/p99: a small fraction of 
 cache-misses produces large tail outliers — the 9 ms values at low load above — that are a
 property of the workload, not server saturation, and would trip a tail-based test
 prematurely. Each step measures its own window (the latency histogram is reset per step),
-so the percentiles are the load *at that step*, never a cumulative blur. To our knowledge
-dnsmark is the only DNS benchmark that does this binary-search convergence.
+so the percentiles are the load *at that step*, never a cumulative blur.
 
 See **[WHITEPAPER.md §5b](docs/WHITEPAPER.md)** for the full algorithm.
 

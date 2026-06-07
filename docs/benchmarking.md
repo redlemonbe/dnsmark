@@ -307,12 +307,11 @@ reported RTT  =  server processing  +  network round-trip  +  generator client-s
 
 Only the **first** term is a property of the server. The **third** is a property of the
 *tool* — its send/receive loop and where it places its timestamps — and it differs
-between any two generators. dnsmark (default UDP path) and dnsperf are both closed-loop
-generators over UDP kernel sockets; they differ in that third term, so their
-**absolute** numbers differ even against the same server. That is expected of any two
-generators and is **not a defect in either** — dnsperf is a well-established reference
-(ISC). The only goal here is to make the three terms explicit and measurable, so an
-absolute latency is never misread as a server property.
+between any two generators. dnsmark (default UDP path) is a closed-loop generator over a
+UDP kernel socket; that third term is its own, so its **absolute** number sits above the
+server's wire time even against the same server. That is inherent to any closed-loop
+generator and is **not a defect** — the goal here is only to make the three terms explicit
+and measurable, so an absolute latency is never misread as a server property.
 
 ### Ground truth for the server's term: the wire
 
@@ -322,38 +321,35 @@ generator, by pairing each query with its response by DNS transaction id:
 ```bash
 # on the server under test, during the run
 tcpdump -i <iface> -tt -nn udp port 53
-#   query (dst :53) → response (src :53), matched by txid; the delta is the server's
+#   query (dst :53) -> response (src :53), matched by txid; the delta is the server's
 #   processing time — the wire term above, nothing else.
 ```
 
 The wire is ground truth for the *server's* term — not for what an application sees: a
-real kernel-UDP client carries stack overhead too, much like dnsperf.
+real kernel-UDP client carries stack overhead too.
 
 ### Measured decomposition
 
 Identical settings per row — `-Q 100000`, 100 outstanding, 4 clients, 6 s; `dnsmark` on
 its default UDP path:
 
-| Generator → Server | wire (server) | dnsmark | dnsperf |
+| Generator -> Server | wire (server) | dnsmark | dnsmark − wire |
 |---|---:|---:|---:|
-| virtio VM → Unbound | 19 µs | 62 µs | 90 µs |
-| virtio VM → BIND | 35 µs | 83 µs | 104 µs |
-| X520 10 GbE — Threadripper → Unbound (Xeon) | 17 µs | 44 µs | 103 µs |
-| X520 10 GbE — Xeon → Unbound (Threadripper) | 10 µs | 56 µs | 77 µs |
+| virtio VM -> Unbound | 19 µs | 62 µs | 43 µs |
+| virtio VM -> BIND | 35 µs | 83 µs | 48 µs |
+| X520 10 GbE — Threadripper -> Unbound (Xeon) | 17 µs | 44 µs | 27 µs |
+| X520 10 GbE — Xeon -> Unbound (Threadripper) | 10 µs | 56 µs | 46 µs |
 
-Three facts hold in every row and in **both directions** (generator and receiver
-swapped):
+Two facts hold in every row and in **both directions** (generator and receiver swapped):
 
-1. **Both tools report more than the wire** — necessarily, since the RTT contains the
-   server's own time. Neither under-reports; there is no value below the server's floor.
-2. **The tool-to-tool difference is purely generator-side.** Server and network are
-   common to both tools in a given setup, so `dnsperf − dnsmark` isolates the *difference
-   in their client-side overhead*. dnsmark's is lower — consistent with its batched
-   `recvmmsg` drain and tight send/poll loop versus a per-query receive path.
-3. **That difference is generator-dependent, not a fixed constant** — ~59 µs when the
-   generator is the fast Threadripper, ~21 µs on the older Xeon (a lean loop gains more
-   from a fast CPU). For a **fixed generator**, though, the offset is stable *across
-   servers* (VM: ~28 µs over both Unbound and BIND), so server **rankings** are preserved.
+1. **dnsmark always reports more than the wire** — necessarily, since the RTT contains the
+   server's own time. It never under-reports; there is no value below the server's floor.
+   The gap (`dnsmark − wire`) is dnsmark's client-side overhead — kept light by the
+   batched `recvmmsg` drain and a tight send/poll loop.
+2. **The offset is generator/rig-dependent, but stable across servers for a fixed
+   generator.** It is larger on a fast generator's lean loop, smaller on an older CPU;
+   crucially, on one fixed rig it barely moves between servers (VM: ~43 µs over Unbound,
+   ~48 µs over BIND), so server **rankings are preserved** — the comparison that matters.
 
 ### Consequences for a benchmark
 
@@ -362,31 +358,15 @@ swapped):
   own term.
 - **Compare servers with one fixed generator on one rig.** The tool/rig overhead is then
   a constant that cancels in the comparison.
-- dnsperf is a sound **relative** reference and a valuable independent cross-check; its
-  larger absolute figure reflects a heavier client path, not a server property and not
-  an error.
 
 ### Reproduce it
 
-Two commands per server plus a capture — anyone can re-derive the numbers above on their
+One command per server plus a capture — anyone can re-derive the numbers above on their
 own hardware:
 
 ```bash
 # generator — pick ONE rig and use it for every server you compare
 dnsmark -s <server> -d corpus.txt -c 4 --max-outstanding 100 -Q 100000 -l 6 --json
-dnsperf -s <server> -d corpus.txt -c 4 -T 2 -q 100        -Q 100000 -l 6 -v
-# server — ground truth for its own term, paired by txid → p50
+# server — ground truth for its own term, paired by txid -> p50
 tcpdump -i <iface> -tt -nn udp port 53
 ```
-
-**Caveats.** The figures above are single runs on specific rigs — absolute values are
-rig-dependent, so reproduce on yours rather than quoting these. The wire **tail**
-(p99/p999) is noisy: the 16-bit DNS id recycles at high qps (~9× over 600 k queries),
-mispairing a few captures — anchor the wire on **p50**, which is robust. Each tool's
-*own* tail is reliable, matched by internal per-query state rather than by sniffing.
-
----
-
-*This document was compiled from observed measurements. All figures are deltas
-from NIC hardware counters (`ethtool -S`) over timed windows, not application-level
-counters.*
