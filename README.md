@@ -309,3 +309,11 @@ Statistics:
 
 **Bitcoin** — `3FP8hkkiu4kwCD1PDFgAv2oq1ZTyXwy3yy`  
 **Ethereum** — `0xB5eEAf89edA4204Aa9305B068b37A93439cBb680`
+
+---
+
+## License
+
+AGPL v3 — see [LICENSE](LICENSE).
+
+---
