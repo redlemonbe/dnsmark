@@ -16,7 +16,7 @@ design bounds the measurement.
 ## 2. Methodology & Architecture
 
 - **Receiver (Runbound):** AMD Ryzen Threadripper PRO 5995WX (64c/128t), 125 GB RAM,
-  Intel X520 / 82599 `enp33s0f0` (`ixgbe`, PCIe 2.0 x8, MTU 1500), kernel 7.0.6-2-pve,
+  Intel X520 / 82599 `<nic>` (`ixgbe`, PCIe 2.0 x8, MTU 1500), kernel 7.0.6-2-pve,
   Runbound v0.16.6, **`xdp: no`** (kernel slow path). Real `forward-zone`, **no
   local-data**, `cache-min-ttl 3600`, `rate-limit: 0` (a single-source generator must not
   be throttled). Governor `performance`, flow-control off, RSS `udp4 sdfn`, NIC IRQs on
@@ -75,21 +75,21 @@ CPU.
 ## 5. Appendix — exact commands
 
 ```bash
-# Receiver (dragonrage) — runbound xdp:no, methodology host setup
+# Receiver (the receiver host) — runbound xdp:no, methodology host setup
 cpupower frequency-set -g performance
-ethtool -A enp33s0f0 rx off tx off
-ethtool -N enp33s0f0 rx-flow-hash udp4 sdfn
-ethtool -G enp33s0f0 rx 8192
-ss -ulpn | grep 10.10.20.1:53            # rule 5: only runbound owns :53
+ethtool -A <nic> rx off tx off
+ethtool -N <nic> rx-flow-hash udp4 sdfn
+ethtool -G <nic> rx 8192
+ss -ulpn | grep 10.0.0.1:53            # rule 5: only runbound owns :53
 runbound -c rb-single-noxdp.conf          # xdp:no, no local-data, cache-min-ttl 3600, rate-limit 0
 
-# Generator (dragonsage) — dnsperf 2.14.0 (DNS-OARC)
+# Generator (the generator host) — dnsperf 2.14.0 (DNS-OARC)
 awk '{print $1" A"}' top-10000-domains.txt > queries.txt   # dnsperf query format
 ethtool -A nic2 rx off tx off
-dnsperf -s 10.10.20.1 -p 53 -d queries.txt -c 60  -T 30 -q 100 -t 0.2 -l 25   # sustained max
-dnsperf -s 10.10.20.1 -p 53 -d queries.txt -c 200 -T 40 -q 100 -t 0.2 -l 22   # confirm ceiling
-dnsperf -s 10.10.20.1 -p 53 -d queries.txt -c 10  -T 10 -Q 50000 -q 100 -t 1 -l 10  # clean latency
+dnsperf -s 10.0.0.1 -p 53 -d queries.txt -c 60  -T 30 -q 100 -t 0.2 -l 25   # sustained max
+dnsperf -s 10.0.0.1 -p 53 -d queries.txt -c 200 -T 40 -q 100 -t 0.2 -l 22   # confirm ceiling
+dnsperf -s 10.0.0.1 -p 53 -d queries.txt -c 10  -T 10 -Q 50000 -q 100 -t 1 -l 10  # clean latency
 
 # Throughput truth = receiver NIC PHY counters
-ethtool -S enp33s0f0 | grep -wE 'tx_pkts_nic|rx_pkts_nic|rx_no_dma_resources|rx_missed_errors'
+ethtool -S <nic> | grep -wE 'tx_pkts_nic|rx_pkts_nic|rx_no_dma_resources|rx_missed_errors'
 ```
