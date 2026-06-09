@@ -95,5 +95,5 @@ jobs:
           name: dnsmark ${{ github.ref_name }}
           body_path: CHANGELOG.md
           draft: false
-          prerelease: ${{ contains(github.ref_name, "-") }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: release-assets/*
