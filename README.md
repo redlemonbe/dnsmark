@@ -318,3 +318,7 @@ Statistics:
 AGPL v3 — see [LICENSE](LICENSE).
 
 ---
+
+## Part of RunASM
+
+dnsmark is part of **[RunASM](https://www.runasm.com)** — high-performance infrastructure in Rust, with benchmarks measured at the NIC hardware counters, not asserted.
