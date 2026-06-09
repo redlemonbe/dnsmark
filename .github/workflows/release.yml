@@ -20,23 +20,33 @@ jobs:
           - target: x86_64-unknown-linux-musl
             apt: musl-tools
           - target: aarch64-unknown-linux-gnu
-            apt: gcc-aarch64-linux-gnu
+            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross
           - target: aarch64-unknown-linux-musl
-            apt: gcc-aarch64-linux-gnu musl-tools
+            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross musl-tools
     steps:
       - uses: actions/checkout@v4
       - name: Build dependencies (clang + libbpf for the eBPF object)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y clang libbpf-dev ${{ matrix.apt }}
-      - name: Toolchain
+      - name: Toolchain + cross env
         run: |
           rustup target add ${{ matrix.target }}
           case "${{ matrix.target }}" in
             aarch64-unknown-linux-gnu)
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV" ;;
+              {
+                echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+                echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+                echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+                echo "RING_HOST_CC=gcc"
+              } >> "$GITHUB_ENV" ;;
             aarch64-unknown-linux-musl)
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV" ;;
+              {
+                echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc"
+                echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc"
+                echo "AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar"
+                echo "RING_HOST_CC=gcc"
+              } >> "$GITHUB_ENV" ;;
           esac
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -67,15 +77,17 @@ jobs:
           mkdir -p release-assets
           find dl -type f -name "dnsmark-*" -exec cp {} release-assets/ \;
           [ -f sbom.cdx.json ] && cp sbom.cdx.json release-assets/ || true
-          ( cd release-assets && sha256sum * > SHA256SUMS.txt )
-          ls -lh release-assets
+          cd release-assets
+          sha256sum dnsmark-* > SHA256SUMS.txt
+          [ -f sbom.cdx.json ] && sha256sum sbom.cdx.json >> SHA256SUMS.txt || true
+          ls -lh
       - name: Sign assets with minisign (Run suite key)
         env:
           MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           if [ -z "$MINISIGN_SECRET" ]; then
-            echo "::warning::MINISIGN_SECRET not set in dnsmark — shipping SHA256SUMS without signatures"
+            echo "::warning::MINISIGN_SECRET not set — shipping SHA256SUMS without signatures"
             exit 0
           fi
           curl -sSL https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz | tar -xz -C /tmp
