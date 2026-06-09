@@ -48,6 +48,18 @@ jobs:
                 echo "RING_HOST_CC=gcc"
               } >> "$GITHUB_ENV" ;;
           esac
+      - name: aarch64 — expose asm/* headers for the eBPF clang compile
+        if: contains(matrix.target, 'aarch64')
+        run: |
+          # build.rs compiles the (arch-neutral) eBPF object with `clang -target bpf`
+          # and looks for /usr/include/aarch64-linux-gnu. The arm64-cross packages
+          # install under /usr/aarch64-linux-gnu/ instead, so expose the x86 asm/*
+          # headers at the expected path — the __u32/etc. typedefs are identical for
+          # a BPF-target compile.
+          if [ ! -e /usr/include/aarch64-linux-gnu/asm/types.h ]; then
+            sudo mkdir -p /usr/include/aarch64-linux-gnu
+            sudo ln -sfn /usr/include/x86_64-linux-gnu/asm /usr/include/aarch64-linux-gnu/asm
+          fi
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Stage artifact
