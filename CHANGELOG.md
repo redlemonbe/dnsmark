@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.2.1] - 2026-06-10
+
+### Fixed
+- **`--xdp` reported ~100% loss against a healthy AF_XDP server (#8).** Query frames use a fixed UDP source port (12345), so every response shares one 5-tuple and hashes to a single RSS queue. The generator binds its AF_XDP RX on a capped subset of queues (q0..N-1), but the NIC's default RSS indirection spans all HW queues, so the single response queue was frequently outside the bound set: responses landed on an unbound queue and were dropped before the XSK (false 100% loss), which also stalled the closed-loop sender. The generator now steers the RSS indirection table to span exactly the bound queues (`ethtool -X <if> equal <queue_count>` - RETA only, no channel reconfig, safe around an active zero-copy bind). Verified: round-trip completion 99.7-99.9% with the NIC's default multi-queue RSS. Above ~9 M qps the single active RX queue (one core) saturates and depresses the reported completion rate - a generator-side limit; read served throughput from the receiver NIC counters.
+
 ## [2.2.0] - 2026-06-10
 
 ### Added

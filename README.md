@@ -200,6 +200,18 @@ cores / 4.77M qps** just by enabling `udp4 sdfn` + the per-packet source-port
 variation (the 82599's RSS caps at 16 rings). Use `DNSMARK_FIXED_SPORT=1` to pin
 the source port (single-flow / single-core testing).
 
+**Generator-side AF_XDP RX (responses).** With `--xdp`, dnsmark also *receives*
+responses over AF_XDP, binding the socket on a subset of the generator NIC's queues.
+Because the NIC's default RSS indirection spans **all** hardware queues, a response
+could hash to an unbound queue and be dropped before the socket — observed as a false
+~100% loss (and, with the closed-loop sender, a throughput collapse). dnsmark now steers
+the generator NIC's RSS indirection table to span exactly the bound queues at setup
+(`ethtool -X <nic> equal <queue_count>` — RETA only, no channel reconfig, safe around an
+active zero-copy bind), so every response reaches a bound worker. No manual tuning is
+required. At very high offered rates the active RX can concentrate on one queue/core and
+cap the *measured* round-trip rate — in that regime read served throughput from the
+**receiver** NIC counters, not dnsmark's round-trip (#8).
+
 > 📖 **Full 10G benchmarking methodology** — NIC tuning checklist, how to read NIC
 > counters correctly (AF_XDP ZC TX bypasses standard `tx_packets`), CPU-bound vs.
 > fill-ring bottleneck diagnosis, gotchas and a reference result (8.83 M qps on a

@@ -22,8 +22,11 @@ history is in [CHANGELOG.md](../CHANGELOG.md).
 
 - One worker per NIC RX queue, pinned to NIC-local **physical** cores (no HT sibling, no
   real-time scheduling). Per-worker local in-flight table; **fixed source port per
-  worker** so RSS returns a worker's responses to the queue it owns. Queue count and
-  NUMA node are auto-detected.
+  worker**. The generator steers its own RSS indirection table to span exactly the
+  bound queues (`ethtool -X equal <queue_count>`) so every response lands on a bound
+  worker; without this, the NIC's default RSS (spanning all HW queues) drops responses
+  on unbound queues as a false ~100% loss (#8). Queue count and NUMA node are
+  auto-detected.
 - Requires a physical NIC, `CAP_NET_RAW`/`CAP_BPF` (or root), and flow control disabled
   on the sender to reach line rate.
 
@@ -34,3 +37,7 @@ history is in [CHANGELOG.md](../CHANGELOG.md).
   queues automatically.
 - Synthetic single-record workload: it isolates a server's data plane and is **not** a
   recursive-resolver or cache-miss workload.
+- At very high offered rates the generator's AF_XDP RX can concentrate on one
+  queue/core and cap the *measured* round-trip rate (a generator limit, not the
+  server's). Read served throughput from the **receiver** NIC counters in that
+  regime (#8).
