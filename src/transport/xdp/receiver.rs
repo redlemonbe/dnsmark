@@ -299,10 +299,10 @@ fn xdp_unified_worker(
                     let buf = unsafe {
                         std::slice::from_raw_parts_mut(area.add(addr as usize), FRAME_SIZE as usize)
                     };
-                    let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
+                    let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[hdr.outer()..]);
                     tmpl_idx += 1;
                     let total = hdr.write_header(buf, dns_len);
-                    frame::set_src_port(buf, sport);
+                    hdr.set_src_port(buf, sport);
                     descs.push(XdpDesc { addr, len: total as u32, options: 0 });
                     ids_to_register.push(id);
                 }
@@ -404,24 +404,31 @@ fn xdp_unified_worker(
 fn parse_dns_from_frame(frame: &[u8]) -> Option<(u16, u8)> {
     if frame.len() < ETH_HDR + 2 { return None; }
 
-    let eth_type = u16::from_be_bytes([frame[12], frame[13]]);
+    // Skip a single 802.1Q VLAN tag if present (#188 / dnsmark#7). With
+    // rx-vlan-offload off the response carries the tag; `l2` is the IP offset.
+    let (l2, eth_type) = if u16::from_be_bytes([frame[12], frame[13]]) == 0x8100 {
+        if frame.len() < ETH_HDR + 4 { return None; }
+        (ETH_HDR + 4, u16::from_be_bytes([frame[16], frame[17]]))
+    } else {
+        (ETH_HDR, u16::from_be_bytes([frame[12], frame[13]]))
+    };
     let ip_hdr_len = match eth_type {
         ETH_P_IP => {
-            if frame.len() < ETH_HDR + IPV4_HDR { return None; }
-            if frame[ETH_HDR + 9] != PROTO_UDP { return None; }
-            let ihl = ((frame[ETH_HDR] & 0xF) as usize) * 4;
+            if frame.len() < l2 + IPV4_HDR { return None; }
+            if frame[l2 + 9] != PROTO_UDP { return None; }
+            let ihl = ((frame[l2] & 0xF) as usize) * 4;
             if ihl < IPV4_HDR { return None; }
             ihl
         }
         ETH_P_IPV6 => {
-            if frame.len() < ETH_HDR + IPV6_HDR { return None; }
-            if frame[ETH_HDR + 6] != PROTO_UDP { return None; }
+            if frame.len() < l2 + IPV6_HDR { return None; }
+            if frame[l2 + 6] != PROTO_UDP { return None; }
             IPV6_HDR
         }
         _ => return None,
     };
 
-    let dns_off = ETH_HDR + ip_hdr_len + UDP_HDR;
+    let dns_off = l2 + ip_hdr_len + UDP_HDR;
     if frame.len() < dns_off + 12 { return None; }
 
     parse_response(&frame[dns_off..]).map(|r| (r.id, r.rcode))
@@ -734,8 +741,8 @@ fn xdp_tx_batch_inline(
             std::slice::from_raw_parts_mut(state.area.add(addr as usize), FRAME_SIZE as usize)
         };
         // Wire pool writes the DNS query straight into the frame payload region
-        // (after the 42-byte Eth/IP/UDP header) — no scratch buffer, no realloc.
-        let dns_len = wire_pool.write_with_index(*tmpl_idx, id, &mut buf[frame::OUTER_HDR..]);
+        // (after the 42- or 46-byte Eth(+VLAN)/IP/UDP header) — no scratch, no realloc.
+        let dns_len = wire_pool.write_with_index(*tmpl_idx, id, &mut buf[state.hdr.outer()..]);
         *tmpl_idx += 1;
         let total = state.hdr.write_header(buf, dns_len);
         descs.push(XdpDesc { addr, len: total as u32, options: 0 });
@@ -984,6 +991,26 @@ fn do_start_xdp_receive_path(
     shutdown:         Arc<AtomicBool>,
     timeout_dur:      Duration,
 ) -> Result<XdpHandle, String> {
+    // #188 / dnsmark#7: AF_XDP zero-copy is unsupported on a VLAN sub-interface
+    // (bind → errno 95). When a manual 802.1Q tag is injected (env `DNSMARK_VLAN`),
+    // bind the XDP datapath (prog load, XSK, NIC queues, NUMA) to the PHYSICAL
+    // parent; keep `addr_iface` (the routed sub-interface) for the source IP/MAC.
+    let addr_iface: &str = iface;
+    let phys_owned;
+    let iface: &str = if std::env::var("DNSMARK_VLAN")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&v| v != 0)
+        .is_some()
+    {
+        match super::socket::parent_interface(iface) {
+            Some(p) => { phys_owned = p; tracing::info!("[XDP] VLAN tag injection: binding physical parent '{}' (addr iface '{}')", phys_owned, addr_iface); &phys_owned }
+            None => iface,
+        }
+    } else {
+        iface
+    };
+
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
 
@@ -995,11 +1022,11 @@ fn do_start_xdp_receive_path(
             tracing::warn!("[XDP TX] server is IPv6 — AF_XDP TX unavailable, using sendmmsg");
             return None;
         };
-        let src_ip = match frame::local_ipv4(iface) {
+        let src_ip = match frame::local_ipv4(addr_iface) {
             Some(v) => v,
             None => { tracing::warn!("[XDP TX] no IPv4 on {} — using sendmmsg", iface); return None; }
         };
-        let src_mac = match frame::local_mac(iface) {
+        let src_mac = match frame::local_mac(addr_iface) {
             Some(v) => v,
             None => { tracing::warn!("[XDP TX] no MAC on {} — using sendmmsg", iface); return None; }
         };

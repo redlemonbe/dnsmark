@@ -11,12 +11,32 @@ use std::net::Ipv4Addr;
 pub const ETH_HDR:   usize = 14;
 pub const IPV4_HDR:  usize = 20;
 pub const UDP_HDR:   usize = 8;
-pub const OUTER_HDR: usize = ETH_HDR + IPV4_HDR + UDP_HDR; // 42 bytes
+pub const VLAN_HDR:  usize = 4;
+pub const OUTER_HDR: usize = ETH_HDR + IPV4_HDR + UDP_HDR;            // 42 (untagged)
+/// Template capacity: Eth + one optional 802.1Q tag + IPv4 + UDP.
+pub const OUTER_HDR_MAX: usize = OUTER_HDR + VLAN_HDR;                // 46 (tagged)
 
-/// Pre-built Ethernet+IPv4+UDP header template.
+/// VLAN id from env `DNSMARK_VLAN` (0 / unset = untagged), parsed once per call.
+fn vlan_from_env() -> Option<u16> {
+    std::env::var("DNSMARK_VLAN")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&v| v != 0)
+}
+
+/// Pre-built Ethernet(+802.1Q)+IPv4+UDP header template.
+///
+/// VLAN (#188 / dnsmark#7): when env `DNSMARK_VLAN=<vid>` is set, a single
+/// 802.1Q tag is baked into the template (no per-frame shift — the bench hot
+/// path stays a copy+patch). All offsets derive from `l2` (14 or 18) so the
+/// untagged path is byte-for-byte unchanged.
 #[derive(Clone)]
 pub struct FrameHeader {
-    tpl: [u8; OUTER_HDR],
+    tpl: [u8; OUTER_HDR_MAX],
+    /// Total L2+L3+L4 header length actually used: 42 (untagged) or 46 (tagged).
+    outer: usize,
+    /// IPv4 header offset: 14 (untagged) or 18 (one VLAN tag).
+    l2: usize,
     /// One's-complement sum of the constant IPv4 header words (total-length and
     /// checksum fields = 0). Per packet we add only the total-length and fold —
     /// no 10-word recompute on the hot path.
@@ -24,6 +44,7 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
+    /// Build a header template. `DNSMARK_VLAN=<vid>` injects one 802.1Q tag.
     pub fn new(
         src_mac:  [u8; 6],
         dst_mac:  [u8; 6],
@@ -32,40 +53,72 @@ impl FrameHeader {
         src_port: u16,
         dst_port: u16,
     ) -> Self {
-        let mut tpl = [0u8; OUTER_HDR];
-        // Ethernet
+        Self::new_with_vlan(src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port, vlan_from_env())
+    }
+
+    /// Like `new`, but with an explicit VLAN id: `Some(vid)` bakes one 802.1Q tag
+    /// into the template, `None` is untagged. `new` reads it from `DNSMARK_VLAN`;
+    /// tests call this directly (no env races).
+    pub fn new_with_vlan(
+        src_mac:  [u8; 6],
+        dst_mac:  [u8; 6],
+        src_ip:   Ipv4Addr,
+        dst_ip:   Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        vlan:     Option<u16>,
+    ) -> Self {
+        let l2 = if vlan.is_some() { ETH_HDR + VLAN_HDR } else { ETH_HDR };
+        let outer = l2 + IPV4_HDR + UDP_HDR;
+
+        let mut tpl = [0u8; OUTER_HDR_MAX];
+        // Ethernet MACs
         tpl[0..6].copy_from_slice(&dst_mac);
         tpl[6..12].copy_from_slice(&src_mac);
-        tpl[12..14].copy_from_slice(&[0x08, 0x00]);
+        if let Some(vid) = vlan {
+            // 802.1Q: TPID 0x8100, TCI = PCP(0)|DEI(0)|VID(12 bits), inner=IPv4.
+            tpl[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+            tpl[14..16].copy_from_slice(&(vid & 0x0FFF).to_be_bytes());
+            tpl[16..18].copy_from_slice(&[0x08, 0x00]);
+        } else {
+            tpl[12..14].copy_from_slice(&[0x08, 0x00]);
+        }
         // IPv4 (ver=4, IHL=5, TTL=64, proto=17=UDP, DF flag)
-        tpl[ETH_HDR]     = 0x45;
-        tpl[ETH_HDR + 6] = 0x40; // flags: DF
-        tpl[ETH_HDR + 8] = 64;
-        tpl[ETH_HDR + 9] = 17;
-        tpl[ETH_HDR + 12..ETH_HDR + 16].copy_from_slice(&src_ip.octets());
-        tpl[ETH_HDR + 16..ETH_HDR + 20].copy_from_slice(&dst_ip.octets());
+        tpl[l2]     = 0x45;
+        tpl[l2 + 6] = 0x40; // flags: DF
+        tpl[l2 + 8] = 64;
+        tpl[l2 + 9] = 17;
+        tpl[l2 + 12..l2 + 16].copy_from_slice(&src_ip.octets());
+        tpl[l2 + 16..l2 + 20].copy_from_slice(&dst_ip.octets());
         // UDP
-        tpl[ETH_HDR + IPV4_HDR]     = (src_port >> 8) as u8;
-        tpl[ETH_HDR + IPV4_HDR + 1] = src_port as u8;
-        tpl[ETH_HDR + IPV4_HDR + 2] = (dst_port >> 8) as u8;
-        tpl[ETH_HDR + IPV4_HDR + 3] = dst_port as u8;
+        tpl[l2 + IPV4_HDR]     = (src_port >> 8) as u8;
+        tpl[l2 + IPV4_HDR + 1] = src_port as u8;
+        tpl[l2 + IPV4_HDR + 2] = (dst_port >> 8) as u8;
+        tpl[l2 + IPV4_HDR + 3] = dst_port as u8;
         // IP checksum = 0 and UDP checksum = 0 until write_frame patches them.
         // Precompute the constant part of the IPv4 header checksum once.
         let mut ip_base_sum: u32 = 0;
         for i in 0..(IPV4_HDR / 2) {
-            ip_base_sum += u16::from_be_bytes([tpl[ETH_HDR + 2*i], tpl[ETH_HDR + 2*i + 1]]) as u32;
+            ip_base_sum += u16::from_be_bytes([tpl[l2 + 2*i], tpl[l2 + 2*i + 1]]) as u32;
         }
-        Self { tpl, ip_base_sum }
+        Self { tpl, outer, l2, ip_base_sum }
+    }
+
+    /// Total header length stamped before the DNS payload: 42 (untagged) or
+    /// 46 (one 802.1Q tag). The caller writes the DNS query at `out[outer()..]`.
+    #[inline(always)]
+    pub fn outer(&self) -> usize {
+        self.outer
     }
 
     /// Stamp a complete Ethernet frame into `out` for DNS payload `dns`.
     /// Returns total frame length. `out` must be >= OUTER_HDR + dns.len().
     #[inline]
     pub fn write_frame(&self, out: &mut [u8], dns: &[u8]) -> usize {
-        let total = OUTER_HDR + dns.len();
+        let total = self.outer + dns.len();
         debug_assert!(out.len() >= total);
         // DNS payload
-        out[OUTER_HDR..total].copy_from_slice(dns);
+        out[self.outer..total].copy_from_slice(dns);
         self.write_header(out, dns.len())
     }
 
@@ -76,39 +129,36 @@ impl FrameHeader {
     /// no double copy (the Runbound model).
     #[inline]
     pub fn write_header(&self, out: &mut [u8], dns_len: usize) -> usize {
-        let total   = OUTER_HDR + dns_len;
+        let l2      = self.l2;
+        let total   = self.outer + dns_len;
         let udp_len = (UDP_HDR + dns_len) as u16;
         let ip_tot  = (IPV4_HDR as u16) + udp_len;
 
-        out[..OUTER_HDR].copy_from_slice(&self.tpl);
+        out[..self.outer].copy_from_slice(&self.tpl[..self.outer]);
         // IP total length
-        out[ETH_HDR + 2] = (ip_tot >> 8) as u8;
-        out[ETH_HDR + 3] = ip_tot as u8;
+        out[l2 + 2] = (ip_tot >> 8) as u8;
+        out[l2 + 3] = ip_tot as u8;
         // IP checksum: constant base + this packet's total-length, folded once
         // (RFC 1071) — no per-packet 10-word sum.
         let mut sum = self.ip_base_sum + ip_tot as u32;
         sum = (sum & 0xFFFF) + (sum >> 16);
         sum = (sum & 0xFFFF) + (sum >> 16);
         let cksum = !(sum as u16);
-        out[ETH_HDR + 10] = (cksum >> 8) as u8;
-        out[ETH_HDR + 11] = cksum as u8;
+        out[l2 + 10] = (cksum >> 8) as u8;
+        out[l2 + 11] = cksum as u8;
         // UDP length
-        out[ETH_HDR + IPV4_HDR + 4] = (udp_len >> 8) as u8;
-        out[ETH_HDR + IPV4_HDR + 5] = udp_len as u8;
+        out[l2 + IPV4_HDR + 4] = (udp_len >> 8) as u8;
+        out[l2 + IPV4_HDR + 5] = udp_len as u8;
         total
     }
-}
 
-/// Patch the UDP source port in an already-stamped frame. Varying it per packet
-/// makes the receiver's NIC RSS spread the flow across its RX queues/cores — a
-/// fixed source port hashes to a single queue → a single core (measured: a 12M
-/// pps flood landed entirely on one RX queue / one core of a 40-core resolver).
-/// The UDP checksum is 0 (disabled for IPv4 UDP) so no recomputation is needed,
-/// and the IP checksum does not cover the UDP header.
-#[inline]
-pub fn set_src_port(out: &mut [u8], port: u16) {
-    out[ETH_HDR + IPV4_HDR]     = (port >> 8) as u8;
-    out[ETH_HDR + IPV4_HDR + 1] = port as u8;
+    /// Patch the UDP source port in an already-stamped frame (RSS spread). VLAN
+    /// aware via `self.l2`; the UDP checksum is 0 so no recomputation is needed.
+    #[inline]
+    pub fn set_src_port(&self, out: &mut [u8], port: u16) {
+        out[self.l2 + IPV4_HDR]     = (port >> 8) as u8;
+        out[self.l2 + IPV4_HDR + 1] = port as u8;
+    }
 }
 
 #[inline]
@@ -229,5 +279,59 @@ mod tests {
     fn parse_mac_ok() {
         assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff").unwrap(),
                    [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    // #188: a tagged frame must match the 802.1Q wire layout EXACTLY (checked
+    // against the spec, not against the code's own constants), or the receiver
+    // NIC / resolver will drop it. This is the offset-bug guard.
+    #[test]
+    fn vlan_frame_layout_matches_8021q_spec() {
+        let dst = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let src = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let hdr = FrameHeader::new_with_vlan(
+            src, dst,
+            "10.8.0.2".parse().unwrap(), "10.8.0.1".parse().unwrap(),
+            12345, 53, Some(2126),
+        );
+        assert_eq!(hdr.outer(), 46, "tagged outer header = 14+4+20+8");
+        let dns = b"q";
+        let mut buf = vec![0u8; hdr.outer() + dns.len()];
+        let n = hdr.write_frame(&mut buf, dns);
+        assert_eq!(n, buf.len());
+        // L2: dst MAC, src MAC, then the 802.1Q tag — NOT the EtherType.
+        assert_eq!(&buf[0..6],  &dst, "dst MAC");
+        assert_eq!(&buf[6..12], &src, "src MAC");
+        assert_eq!(&buf[12..14], &[0x81, 0x00], "TPID 0x8100");
+        // TCI: PCP=0, DEI=0, VID=2126=0x84E
+        assert_eq!(u16::from_be_bytes([buf[14], buf[15]]), 2126 & 0x0FFF, "VID");
+        assert_eq!(&buf[16..18], &[0x08, 0x00], "inner EtherType IPv4");
+        // L3 starts at 18 (14 + 4-byte tag), not 14.
+        assert_eq!(buf[18] >> 4, 4, "IPv4 version");
+        assert_eq!(buf[18] & 0xF, 5, "IHL=5");
+        assert_eq!(buf[18 + 9], 17, "proto UDP");
+        // IPv4 header checksum valid at the shifted offset.
+        assert_eq!(ipv4_checksum(&buf[18..18 + IPV4_HDR]), 0, "IPv4 checksum");
+        // DNS payload sits after the full 46-byte tagged header.
+        assert_eq!(&buf[46..], dns.as_slice(), "DNS payload at offset 46");
+    }
+
+    // Tagging must shift L3+ by exactly 4 and change nothing else (idempotent IP).
+    #[test]
+    fn vlan_only_shifts_by_four() {
+        let dst = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let src = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let a = "10.8.0.2".parse().unwrap();
+        let b = "10.8.0.1".parse().unwrap();
+        let untag = FrameHeader::new_with_vlan(src, dst, a, b, 12345, 53, None);
+        let tag   = FrameHeader::new_with_vlan(src, dst, a, b, 12345, 53, Some(100));
+        let dns = b"payload!";
+        let mut bu = vec![0u8; 64];
+        let mut bt = vec![0u8; 64];
+        let nu = untag.write_frame(&mut bu, dns);
+        let nt = tag.write_frame(&mut bt, dns);
+        assert_eq!(untag.outer(), 42);
+        assert_eq!(nt, nu + 4, "tagged frame is exactly 4 bytes longer");
+        // The IPv4 header is identical, just at offset 14 vs 18.
+        assert_eq!(&bu[14..14 + IPV4_HDR], &bt[18..18 + IPV4_HDR], "IPv4 header unchanged by tagging");
     }
 }

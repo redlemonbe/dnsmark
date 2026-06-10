@@ -350,6 +350,8 @@ pub async fn run_with_shutdown(
         if srvs.is_empty() { srvs.push(config.server); }
         for srv in srvs {
             let i = crate::transport::xdp::iface_for_benchmark(srv);
+            // #188: PHY tx counter lives on the physical NIC, not the VLAN sub-iface.
+            let i = crate::transport::xdp::parent_interface(&i).unwrap_or(i);
             if !ifs.contains(&i) { ifs.push(i); }
         }
         let tx0: u64 = ifs.iter().filter_map(|i| nic_wire_tx_packets(i)).sum();

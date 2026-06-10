@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.2.0] - 2026-06-10
+
+### Added
+- **802.1Q VLAN support for AF_XDP (`DNSMARK_VLAN=<vid>`)** *(experimental — see
+  Validation)*. With `--xdp`, one 802.1Q tag is baked into the frame template (no
+  per-frame shift; the hot path stays copy+patch), an optional tag is skipped on
+  RX, and the AF_XDP socket **binds the physical parent** of a VLAN sub-interface
+  while reading src IP/MAC from the sub-interface. Rationale: AF_XDP zero-copy is
+  unsupported on a VLAN sub-interface (`bind … : errno 95`), so generation must
+  use the physical NIC and inject the tag itself. Needed for providers that
+  deliver the private network tagged (e.g. Latitude). Companion to Runbound #188.
+- Wire-truth PHY tx counter resolves to the physical parent when a VLAN is used.
+
+### Validation
+- Frame layout **unit-tested against the 802.1Q wire spec** (TPID/VID, inner
+  EtherType, L3 shifted +4, IPv4 checksum — the offset guard). Physical-parent
+  bind confirmed (XSK `ifindex` = physical NIC). The
+  resolver-side round trip is proven end-to-end (`dig` over a tagged VLAN →
+  `NOERROR`). **The dnsmark tagged `--xdp` data path is not yet validated at line
+  rate**: the only available 100G NIC (Broadcom BCM57508, `bnxt_en`) has **no
+  AF_XDP zero-copy in any Linux kernel** (verified against mainline `bnxt_xdp.c` —
+  no `xsk_pool`/`XDP_ZEROCOPY`), so generation fell back to copy mode and could not
+  be rate-tested. Full validation pends a zero-copy-capable NIC (Intel
+  `ice`/`i40e`/`ixgbe`, Mellanox `mlx5`). I cannot confirm tagged generation at rate.
+
 ## [2.1.0] - 2026-06-07
 
 ### Added
