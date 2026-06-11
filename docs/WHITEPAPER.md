@@ -223,7 +223,18 @@ small fraction of forwarded cache-misses produces large tail outliers that are a
 of the *workload*, not of server saturation, and would trip a tail-based test
 prematurely. Each step measures its own window: the latency histogram is reset at the
 start of every step (`ramp_step_latency()`), so the percentiles are the load *at that
-step*, never a cumulative blur.
+step*, never a cumulative blur. The criterion is **latency-only**: `advance()` also
+computes an achieved-vs-target ratio (`offer_ok`, 80 %) but does not gate on it.
+
+**The SLO test cannot tell *whose* saturation it is.** A closed-loop generator at its
+own limit inflates the measured RTT exactly like a saturating server, so a `--ramp`
+knee is the knee of the *whole path*, generator included. Attribute it before quoting
+it: if the breaking step's achieved q/s falls well short of its target (the per-step
+`offered q/s` column stops tracking the doubling/bisection targets), or the reported
+"Send throughput (egress)" plateaus below target while the receiver's NIC counters
+confirm everything offered is being served, the knee is the **generator's**, not the
+server's. Re-run on a faster rig (or split across NICs) before publishing the number
+as a server maximum.
 
 **Worked example** — Runbound v0.15.3 over a single 10 GbE X520 link, warm real cache
 (99.5 % hit, no local-data), generator = dual Xeon E5-2690 v2:

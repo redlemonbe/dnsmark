@@ -160,6 +160,22 @@ dnsmark -s 10.0.0.2 -d queries.txt --xdp -c 8 --max-outstanding 0
    ip neigh replace 10.0.0.2 lladdr <server-mac> dev <nic> nud permanent
    ```
 
+**CPU governor.** With `--xdp`, dnsmark pins every CPU to the `performance` governor
+for the run and restores the previous governor on exit, including Ctrl-C. After a
+hard kill or a crash (the binary is built with `panic = "abort"`) the restore cannot
+run — if a crashed run left cores pinned, reset them:
+`echo schedutil | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`.
+
+### Tagged VLAN (experimental)
+
+`DNSMARK_VLAN=<vid>` injects one 802.1Q tag into the generated frames (needed when
+the provider delivers the private network tagged). AF_XDP zero-copy cannot bind a
+VLAN sub-interface, so dnsmark binds the **physical parent** and bakes the tag into
+the frame template. **Experimental**: the frame layout is unit-tested and a tagged
+resolver round trip is proven end-to-end, but tagged generation has not been
+validated at line rate (no zero-copy-capable tagged NIC was available — see
+CHANGELOG 2.2.0).
+
 ### Link bonding is not supported (XDP limitation)
 
 AF_XDP cannot transmit over a Linux **bond** — a bond is a virtual interface, and
