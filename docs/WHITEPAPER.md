@@ -29,14 +29,22 @@ chosen explicitly; dnsmark never silently changes datapath
 
 A run spawns **N worker threads**, each pinned to a CPU core
 (`tokio::task::spawn_blocking` + `pin_to_cpu(worker_id)`). Workers share nothing on
-the hot path except one atomic counter for the global outstanding gate; each owns its
-own socket, its own in-flight table, and its own send/receive loop.
+the hot path except one atomic counter for the global outstanding gate (kernel paths;
+the AF_XDP unified path shares nothing at all — see §5); each owns its own socket, its
+own in-flight table, and its own send/receive loop.
 
 - For UDP/TCP/DoT, N = `--clients` (`-c`).
-- For AF_XDP, N is **auto-detected** from the NIC: one worker per RX queue
-  (`get_rx_queue_count`), each pinned to a **physical** core on the NIC's NUMA node
-  (`numa_node_for_iface`) — the lower half of that node's logical CPUs, never an HT
-  sibling; if there are more queues than physical cores the pinning wraps.
+- For AF_XDP, N is **auto-detected** from the NIC and **capped to NIC-local physical
+  cores** (v2.1.0): N = min(RX queue count, per-NIC core budget). Binding one XSK per
+  HW queue oversubscribed the few NIC-local cores and collapsed throughput (measured:
+  40 workers on 10 cores = 265 k qps vs 1.3 M with 10 — the pre-2.1.0 "peak then
+  collapse"). The budget is topology-dependent: on a 2-socket Intel (Xeon-v2 + X520)
+  the NIC-local physical cores plus at most 6 cross-NUMA cores (the inter-socket QPI
+  saturates beyond that); on many-node AMD, 12 per port. Workers are pinned to
+  **physical** cores (`autodetect.rs::physical_cores_numa_sorted`), NIC-local node
+  first, never an HT sibling; a global cross-NIC cursor gives a second NIC distinct
+  cores, and when the core pool is spent no further workers spawn
+  (`transport/xdp/receiver.rs`).
 
 The target rate is divided by the number of **actually spawned** workers, not by
 `--clients`, so a low-queue NIC still drives the full target
@@ -175,7 +183,9 @@ Two independent limits shape the send side:
   thundering send and a distorted tail.
 - **Outstanding** — a shared atomic `global_in_flight` is gated against
   `--max-outstanding` (default 100). This bounds how many queries can be in flight at
-  once — a standard closed-loop outstanding window.
+  once — a standard closed-loop outstanding window. (On the AF_XDP unified path the
+  gate is **per worker** — each worker bounds its own in-flight at `--max-outstanding`;
+  there is no shared atomic on the XDP hot path.)
 
 `--ramp` replaces the fixed rate with the two-phase saturation search described in
 §5b (`engine/ramp.rs`): it climbs QPS until a latency SLO breaks, then binary-searches
@@ -270,14 +280,29 @@ socket-buffer copy.
 
 Design points that make this fast *and* correct:
 
-- **One worker per NIC RX queue**, each owning its queue's socket, UMEM and rings — no
-  shared per-packet state.
-- **Workers pinned to NIC-local physical cores** (the lower half of the NUMA node's
-  CPUs, never an HT sibling) so the DMA and the response handling stay on the memory
-  controller closest to the NIC.
-- **Fixed source port per worker** (`2048 + worker_id`): the receiver's RSS hashes a
-  worker's responses back to a single queue, which the same worker owns — so each
-  worker matches its own replies, with no cross-worker traffic.
+- **One worker per bound RX queue, capped to NIC-local physical cores** (see §2): one
+  busy-poll worker per physical core is the stable point — more than that overdrives
+  the ixgbe zero-copy datapath and collapses throughput. Each worker owns its queue's
+  socket, UMEM and rings — no shared per-packet state.
+- **Workers pinned to NIC-local physical cores** (never an HT sibling) so the DMA and
+  the response handling stay on the memory controller closest to the NIC; at most a
+  small cross-NUMA budget is used after the local cores.
+- **Fixed source port per worker** (`2048 + worker_id`) on the unified path, plus a
+  partitioned DNS-id space, so replies are matched per worker with no shared state.
+  (The legacy split path sends from one fixed port, 12345.) Which generator RX queue a
+  reply lands on is decided by the generator NIC's own RSS — see the next point; it is
+  *not* guaranteed to be the sending worker's queue, and a reply on another worker's
+  queue is unmatched and counted as a loss. Measured round-trip completion with RSS
+  steering in place: 99.7–99.9 % (#8).
+- **Generator-side RSS steering** (v2.2.1, #8). Only queues `0..N-1` are bound to
+  XSKs, but the NIC's default RSS indirection spans **all** HW queues, so replies
+  frequently hashed to an unbound queue and were dropped before the socket — a false
+  ~100 % loss that also stalled the closed-loop sender. On startup dnsmark rewrites the
+  RSS indirection table to span exactly the bound queues
+  (`ethtool -X <if> equal <N>` — RETA only, no channel reconfig, safe around an active
+  zero-copy bind; best-effort, warns on failure). Above ~9 M qps the active RX can
+  concentrate on one queue/core and depress the *measured* round-trip rate — a
+  generator-side limit; read served throughput at the receiver's NIC counters.
 - **`XDP_USE_NEED_WAKEUP`** kick semantics so the driver is only signalled when it needs
   to be.
 - **No real-time scheduling.** Workers run `SCHED_OTHER`; the kernel can always preempt
@@ -297,7 +322,26 @@ Operational hardening (so a benchmark is repeatable without a setup ritual):
   prints the PHY-confirmed egress next to the submitted-descriptor egress; if they
   diverge it shouts and refuses to present a fictional rate. It never falls back to the
   netdev `tx_packets` counter, which counts *submissions*, not transmissions, under
-  zero-copy — exactly the fiction the guard exists to catch.
+  zero-copy — exactly the fiction the guard exists to catch. The sent counter itself is
+  the **submitted**-descriptor count (v2.1.0): the completion ring under-reports at
+  multi-Mpps, so it is not used for throughput.
+- **Auto warm-up** (v2.1.0). The first seconds of a run (default 3 s, `DNSMARK_WARMUP`)
+  are excluded from the measurement window, so XSK bind, ring fill and NIC ramp do not
+  pollute the reported steady-state rate (`engine/mod.rs`).
+- **CPU governor guard** (v2.1.0). With `--xdp`, every CPU is pinned to the
+  `performance` governor for the run and restored on exit (`governor.rs`) — DVFS is the
+  #1 benchmark confounder.
+- **Huge-page UMEM** (v2.1.0). The UMEM is backed by 2 MiB huge pages when available,
+  with a 4 KiB fallback (`transport/xdp/umem.rs`) — fewer dTLB misses at multi-Mpps.
+- **802.1Q VLAN — experimental** (v2.2.0). `DNSMARK_VLAN=<vid>` bakes one 802.1Q tag
+  into the frame template (the hot path stays copy+patch), an optional tag is skipped
+  on RX, and the AF_XDP socket binds the **physical parent** of a VLAN sub-interface
+  (AF_XDP zero-copy cannot bind a sub-interface) while reading src IP/MAC from the
+  sub-interface; the wire-truth PHY counter also resolves to the parent
+  (`transport/xdp/frame.rs`). The frame layout is unit-tested against the 802.1Q wire
+  spec and a resolver round trip over a tagged VLAN is proven end-to-end, but tagged
+  generation has not been rate-tested (no zero-copy-capable NIC was available). I
+  cannot confirm tagged generation at line rate.
 
 On an Intel X520 (82599) this saturates a 10 GbE link; see
 [benchmarking.md](benchmarking.md) for the throughput methodology (measured at NIC
@@ -367,7 +411,8 @@ startup.
   internal per-query state and is reliable.
 - **AF_XDP needs a physical NIC.** It cannot bind a bond/bridge/veth; it requires
   `CAP_NET_RAW`/`CAP_BPF` (or root) and flow control disabled on the sender to reach line
-  rate (see benchmarking.md).
+  rate (see benchmarking.md). A VLAN sub-interface is handled by binding its physical
+  parent and injecting the tag (`DNSMARK_VLAN`, experimental — see §6).
 
 ### Known caveats (write them down rather than hide them)
 
@@ -394,9 +439,12 @@ startup.
   the same runtime, so a side-by-side compare is fair at controlled rates but not a clean
   isolation at saturation (the tasks contend for the runtime). For saturation
   comparisons, run each server separately on the same rig.
-- **`--ramp` is a doubling search.** It can overshoot the true maximum by up to one step
-  before the loss criterion trips; read the reported max as the top of the last
-  *sustained* step, and narrow with a fixed-rate sweep if you need a tight figure.
+- **`--ramp` steps are short windows.** The dichotomic phase (§5b) narrows the bracket
+  to within 5 %, so the coarse-resolution caveat of a pure doubling ramp no longer
+  applies — but each step's verdict is the p50-vs-SLO test over that step's own 4 s
+  paced window, so an effect slower than a step (cache pollution, thermal throttling)
+  can pass a step it would fail at steady state. Confirm a published figure with a
+  fixed-rate run at the reported maximum.
 - **IPv6 + `--xdp`.** NUMA-local pinning is derived from the IPv4 route; an IPv6 target
   skips it — workers still run, just without NUMA pinning.
 - **The XDP capability probe is advisory.** A successful `AF_XDP` socket open means the
@@ -464,6 +512,6 @@ template in-place), not to re-introduce a hand-rolled loop.
 
 ---
 
-*This document describes the implementation as of v2.0.1. Mechanisms are referenced to
-their source files so the description can be checked against the code rather than taken
-on trust.*
+*This document describes the implementation as of v2.2.1 (2026-06-10). Mechanisms are
+referenced to their source files so the description can be checked against the code
+rather than taken on trust.*

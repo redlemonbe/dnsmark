@@ -184,10 +184,14 @@ roadmap — see the issues.
 
 ### Benchmarking a DNS server (spread across its cores)
 
-dnsmark varies the UDP **source port** per packet by default so the server's NIC
-RSS can spread the load across its RX queues/cores. For that to work the **server's
-NIC must hash UDP on L4 ports** — most NICs default to hashing IPs only, which pins
-the whole single-source flood to one queue → one core:
+dnsmark spreads load across the server's RX queues/cores through **source-port
+diversity across workers**: each worker sends from its own UDP source port — one
+kernel socket per `-c` worker on the default path, a fixed per-worker port
+(`2048 + worker_id`) with `--xdp` — so a run with N workers offers N distinct flows
+to the server's NIC RSS. Use enough workers to light up the server's queues. For RSS
+to use ports at all, the **server's NIC must hash UDP on L4 ports** — most NICs
+default to hashing IPs only, which pins the whole single-source flood to one
+queue → one core:
 
 ```bash
 # on the SERVER under test
@@ -196,9 +200,10 @@ ethtool -A <nic> rx off tx off            # no PAUSE-frame throttling
 ```
 
 Measured impact: an Intel X520 resolver went from **1 core / 448k qps** to **16
-cores / 4.77M qps** just by enabling `udp4 sdfn` + the per-packet source-port
-variation (the 82599's RSS caps at 16 rings). Use `DNSMARK_FIXED_SPORT=1` to pin
-the source port (single-flow / single-core testing).
+cores / 4.77M qps** just by enabling `udp4 sdfn` so the source-port diversity
+reaches all rings (the 82599's RSS caps at 16; measured on v1.x, which varied the
+port per packet — since v2.0.4 the port is fixed per worker). For a single-flow /
+single-core test, run a single worker (`-c 1`).
 
 **Generator-side AF_XDP RX (responses).** With `--xdp`, dnsmark also *receives*
 responses over AF_XDP, binding the socket on a subset of the generator NIC's queues.

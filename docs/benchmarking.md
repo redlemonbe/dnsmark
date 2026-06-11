@@ -82,9 +82,12 @@ Measured impact (receiver side, before/after):
 | IP only (`sd`) | 1 | 448 k qps |
 | IP + L4 ports (`sdfn`) | 16 | 4.77 M qps |
 
-dnsmark varies the UDP source port per packet by default so the receiver can
-spread load. Use `DNSMARK_FIXED_SPORT=1` to pin to a single port (single-queue /
-single-core testing).
+dnsmark offers one flow per worker — each worker sends from its own UDP source
+port (a kernel socket per `-c` worker; a fixed `2048 + worker_id` port with
+`--xdp`) — so run enough workers to light up the receiver's queues. (The table
+above was measured on v1.x, which varied the port per packet; since v2.0.4 the
+port is fixed per worker.) For single-queue / single-core testing, run a single
+worker (`-c 1`).
 
 ### 2.3 RSS — spread across queues
 
