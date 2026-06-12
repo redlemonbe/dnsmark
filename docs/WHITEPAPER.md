@@ -64,7 +64,7 @@ hand-off. The loop, each iteration:
      timestamp = clock.now()        ← taken BEFORE send(), the conventional timestamp point
      send(fd, query, MSG_DONTWAIT)
      in_flight.insert(id, timestamp)
-     global_in_flight += 1
+     in_flight_count += 1           (per-worker counter — the § 5 gate)
      advance next_send by send_interval   (no burst catch-up after a stall)
 
 2. WAIT  poll(fd, POLLIN, µs_until_next_send)
@@ -76,7 +76,7 @@ hand-off. The loop, each iteration:
      for each response:
        timestamp = clock.now()
        rtt = timestamp − in_flight.take(id)
-       histogram.record(rtt); global_in_flight −= 1
+       histogram.record(rtt); in_flight_count −= 1
 
 4. SWEEP (every 10 ms) expire in-flight entries older than the timeout
 ```
@@ -135,6 +135,19 @@ tx_packets):**
 In pure kernel mode the throughput path lifts the single-send rate by ~36 %. Per-query user-space cost
 fell from ~17 k to ~340 cycles; total cost from ~128 k to ~94 k cycles/query.
 
+On a modern 10 GbE NIC (Intel X710, same Xeon v2 host) the throughput path reaches **~5 M qps** —
+now squarely **CPU-bound on the 20 physical cores**, each contributing ~250 k qps of irreducible
+kernel skb/UDP traversal (`sendmmsg` is non-blocking, so the cores busy-loop at ~100 % system
+time). Two levers that look promising change nothing here: the kernel already maps a TX queue per
+core (XPS + an `mq` qdisc by default), and NUMA placement is within run-to-run noise (cross-socket
+TX costs no measurable throughput for this workload). A third actively **lowers** the rate —
+spreading the workers onto the HyperThread siblings (40 logical vs 20 physical) drops ~5.0 M to
+~4.6 M, because the SIMD wire-build and the TX syscall contend for the same physical core — which
+is why dnsmark pins **physical cores only**. The single way past the per-skb cost is the AF_XDP
+datapath (§6): it reaches **~13 M qps** (near 10 GbE line rate for ~70 B DNS) by never building an
+skb. Rule of thumb: reach for `--xdp` to saturate a server faster than ~5 M qps; kernel mode is the
+portable default for everything below.
+
 > **This mode is NOT a latency measurement.** Send timestamps are per-batch, so the
 > p50/p99 reported under `--max-outstanding 0` are throughput-mode figures, not
 > comparable to a closed-loop latency figure. For any latency comparison use
@@ -181,11 +194,17 @@ Two independent limits shape the send side:
   `now ≥ next_send`, then advances `next_send`. After a stall it does **not** burst to
   catch up (`next_send = now + interval`), so a scheduler hiccup cannot produce a
   thundering send and a distorted tail.
-- **Outstanding** — a shared atomic `global_in_flight` is gated against
-  `--max-outstanding` (default 100). This bounds how many queries can be in flight at
-  once — a standard closed-loop outstanding window. (On the AF_XDP unified path the
-  gate is **per worker** — each worker bounds its own in-flight at `--max-outstanding`;
-  there is no shared atomic on the XDP hot path.)
+- **Outstanding** — each worker bounds its **own** in-flight at `--max-outstanding`
+  (default 100) with a purely local counter: a per-client closed-loop window, exactly the
+  semantics of dnsperf's `-q`. This holds on **both** datapaths (kernel-UDP and AF_XDP);
+  there is no shared atomic on either hot path.
+
+  > Versions up to 2.2.2 gated the kernel-UDP path on a **single shared** `global_in_flight`
+  > atomic. With `--max-outstanding 100` split across *N* workers that left only ~`100/N` in
+  > flight *per worker* (~5 on a 20-worker host) — a starved closed loop that read **1 845 qps**
+  > against a server actually serving ~940 k in the same mode: a generator artefact misread as a
+  > slow server. The gate is now per-worker (2.2.3); a shared `global_in_flight` is still kept,
+  > but only as a reported statistic, never as the hot-path gate.
 
 `--ramp` replaces the fixed rate with the two-phase saturation search described in
 §5b (`engine/ramp.rs`): it climbs QPS until a latency SLO breaks, then binary-searches

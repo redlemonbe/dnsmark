@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.2.3] - 2026-06-13
+
+### Fixed
+- **No-xdp latency mode — the default invocation — was ~512× too slow.** The closed-loop
+  outstanding gate on the kernel-UDP datapath checked a single **shared** `global_in_flight`
+  atomic, so `--max-outstanding 100` (the default) was split across all *N* workers: only
+  ~`100/N` queries in flight per worker (~5 on a 20-worker host). `dnsmark -s <server> -d
+  <queries>` with no flags therefore read **1 845 qps** against a server serving ~940 k in the
+  same mode — a starved generator misreported as a slow server. The gate is now **per-worker**
+  (a local counter, matching dnsperf's per-client `-q` and the AF_XDP path); the shared atomic
+  is kept only as a reported statistic, never as the hot-path gate. Measured: **1 845 → 944 k
+  qps**. Flood mode (`--max-outstanding 0`) and `--xdp` are unaffected.
+
+### Changed
+- WHITEPAPER §5 / §3b updated to match reality: the outstanding gate is per-worker on **both**
+  datapaths; documented the kernel-UDP throughput ceiling (~5 M qps, CPU-bound on the physical
+  cores — XPS/`mq` and NUMA are already optimal, and HyperThreading *lowers* the rate) and that
+  AF_XDP (~13 M, near 10 GbE line rate) is the only path past the per-skb cost.
+- Removed dead `InFlight::sweep` (superseded by `sweep_with_ages`).
+
 ## [2.2.2] - 2026-06-13
 
 ### Fixed
