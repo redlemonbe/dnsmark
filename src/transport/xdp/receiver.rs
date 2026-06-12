@@ -75,22 +75,6 @@ impl InFlight {
         let now = self.base.elapsed().as_nanos() as u64;
         Some(now.saturating_sub(prev) / 1000)
     }
-    /// Expire slots older than `timeout`; returns the count expired.
-    #[allow(dead_code)]
-    pub fn sweep(&self, timeout: Duration) -> usize {
-        let now = self.base.elapsed().as_nanos() as u64;
-        let to  = timeout.as_nanos() as u64;
-        let mut n = 0;
-        for s in self.slots.iter() {
-            let v = s.load(Ordering::Relaxed);
-            if v != 0 && now.saturating_sub(v) > to
-                && s.compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
-            {
-                n += 1;
-            }
-        }
-        n
-    }
     /// Expire slots older than `timeout`; returns ages in µs for each expired slot.
     /// Used to record timed-out queries into the latency histogram (honest tail).
     pub fn sweep_with_ages(&self, timeout: Duration) -> Vec<u64> {
