@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.2.2] - 2026-06-13
+
+### Fixed
+- **--xdp emitted only ~nworkers (~12) distinct flows, capping the server under test.**
+  v2.2.1 routed each worker's responses correctly but still stamped one fixed UDP source port
+  per worker, so query traffic carried only ~12 distinct 5-tuples - the server's RSS collapsed
+  onto ~6 receive queues and the measured throughput was a generator artefact, not the server's
+  ceiling. Each worker now cycles its source port over a wide range (SPORT_SPREAD=2048), fanning
+  queries across the receiver's full RSS. Response matching stays per-worker (lock-free, no
+  cross-core contention); in --xdp flood mode the per-query latency stats become approximate
+  (responses scatter across the bound RX queues) while served throughput stays exact. Measured:
+  a kernel-UDP server that read 2.4 Mqps under the 12-flow generator reads 6.5 Mqps with the
+  spread; an AF_XDP server reaches the generator's ~11 Mqps single-fibre ceiling.
+
 ## [2.2.1] - 2026-06-10
 
 ### Fixed

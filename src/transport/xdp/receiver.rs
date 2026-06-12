@@ -192,7 +192,11 @@ fn xdp_unified_worker(
     let nw      = num_workers.max(1);
     let id_span = (65536usize / nw).max(1);
     let id_base = ((worker_id % nw) * id_span) as u16;
-    // Per-worker local in-flight table — zero shared state, zero aliasing inter-worker.
+    // Per-worker in-flight table (lock-free, zero cross-core contention). NOTE: with the
+    // #flow-spread source-port range, responses scatter across bound queues, so a worker only
+    // matches the subset of its own replies that happened to return on its queue — dnsmark's
+    // LATENCY stats are therefore approximate in --xdp flood mode. THROUGHPUT (server-side qps)
+    // is unaffected: the flood is open-loop. (A correct shared table contends on scattered RX.)
     let in_flight = InFlight::new();
     let mut local_in_flight: usize = 0;
     let mut id_ctr:   usize = 0;
@@ -210,10 +214,14 @@ fn xdp_unified_worker(
     let mut stall_warned: bool  = false;
     let mut stall_window  = std::time::Instant::now();
 
-    // Fixed src port per worker: RSS on the receiver hashes (src_ip, dst_ip, sport, dport=53)
-    // → each worker's responses land on one RX queue of the receiver, which maps back
-    // to this worker's XSK via symmetric RSS. Zero cross-worker aliasing.
-    let sport: u16 = 2048u16.wrapping_add(worker_id as u16);
+    // #flow-spread: cycle the UDP source port over a WIDE range so the SERVER's RSS fans
+    // queries across ALL its RX queues. A fixed port-per-worker emitted only `nworkers` (12)
+    // distinct flows, collapsing the receiver onto ~6 queues at ~2.4M. Response matching is
+    // now by global DNS id (GLOBAL_INFLIGHT), so a reply may return on any of our bound queues
+    // and still match. Per-worker phase offset so workers do not emit the same port in lockstep.
+    const SPORT_BASE: u16 = 10000;
+    const SPORT_SPREAD: usize = 2048;
+    let mut sport_ctr: usize = worker_id.wrapping_mul(257);
 
     let mut descs:    Vec<XdpDesc> = Vec::with_capacity(TX_BATCH);
     let mut ids_to_register: Vec<u16> = Vec::with_capacity(TX_BATCH);
@@ -302,6 +310,8 @@ fn xdp_unified_worker(
                     let dns_len = wire_pool.write_with_index(tmpl_idx, id, &mut buf[hdr.outer()..]);
                     tmpl_idx += 1;
                     let total = hdr.write_header(buf, dns_len);
+                    let sport = SPORT_BASE + (sport_ctr % SPORT_SPREAD) as u16;
+                    sport_ctr = sport_ctr.wrapping_add(1);
                     hdr.set_src_port(buf, sport);
                     descs.push(XdpDesc { addr, len: total as u32, options: 0 });
                     ids_to_register.push(id);
