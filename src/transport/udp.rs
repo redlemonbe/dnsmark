@@ -112,6 +112,11 @@ fn unified_udp_worker(
     let base = Instant::now();
 
     let mut in_flight = InFlight::new(max_outstanding.max(1024));
+    // #noxdp-perf: PER-WORKER in-flight gate. Was a GLOBAL atomic shared across all
+    // workers, so --max-outstanding=100 meant ~100/N_workers each (~5 on a 20-worker
+    // host) — a starved closed loop (measured 1845 qps). Per-worker matches dnsperf's
+    // per-client -q and keeps the hot path free of a contended shared atomic.
+    let mut local_inflight: usize = 0;
     let mut next_id: u16 = rand::random();
     let mut tmpl_idx: usize = rand::random();
 
@@ -164,7 +169,7 @@ fn unified_udp_worker(
 
         // ── 1. Send if slot available ─────────────────────────────────────────
         let outstanding_ok = if max_outstanding > 0 {
-            global_in_flight.load(Ordering::Relaxed) < max_outstanding
+            local_inflight < max_outstanding
         } else {
             true
         };
@@ -186,9 +191,10 @@ fn unified_udp_worker(
                     // completion — so `lost` reflects it and `sent == completed + lost`.
                     if in_flight.insert(next_id, send_ns).is_some() {
                         stats.inc_timeout();
-                        global_in_flight.fetch_sub(1, Ordering::Relaxed);
+                        global_in_flight.fetch_sub(1, Ordering::Relaxed); local_inflight = local_inflight.saturating_sub(1);
                     }
                     global_in_flight.fetch_add(1, Ordering::Relaxed);
+                    local_inflight += 1;
                     stats.inc_sent();
                     if verbose { tracing::debug!(id = next_id, "sent query"); }
                     next_id = next_id.wrapping_add(1);
@@ -246,7 +252,7 @@ fn unified_udp_worker(
                             let rcode = if len >= 4 { buf[3] & 0x0f } else { 0 };
                             if let Some(rtt_ns) = in_flight.take(id, recv_ns) {
                                 stats.record_response(rcode, (rtt_ns / 1000).max(1));
-                                global_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                global_in_flight.fetch_sub(1, Ordering::Relaxed); local_inflight = local_inflight.saturating_sub(1);
                             }
                         }
                         break;
@@ -273,7 +279,7 @@ fn unified_udp_worker(
                 if let Some(rtt_ns) = in_flight.take(id, recv_ns) {
                     let rtt_us = (rtt_ns / 1000).max(1);
                     stats.record_response(rcode, rtt_us);
-                    global_in_flight.fetch_sub(1, Ordering::Relaxed);
+                    global_in_flight.fetch_sub(1, Ordering::Relaxed); local_inflight = local_inflight.saturating_sub(1);
                     if verbose { tracing::debug!(id, rtt_us, rcode, "response"); }
                 }
             }
@@ -293,6 +299,7 @@ fn unified_udp_worker(
             if n_exp > 0 {
                 global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
                     |x| Some(x.saturating_sub(n_exp))).ok();
+                local_inflight = local_inflight.saturating_sub(n_exp);
             }
             last_timeout_check = now;
         }
