@@ -148,10 +148,17 @@ datapath (§6): it reaches **~13 M qps** (near 10 GbE line rate for ~70 B DNS) b
 skb. Rule of thumb: reach for `--xdp` to saturate a server faster than ~5 M qps; kernel mode is the
 portable default for everything below.
 
-> **This mode is NOT a latency measurement.** Send timestamps are per-batch, so the
-> p50/p99 reported under `--max-outstanding 0` are throughput-mode figures, not
-> comparable to a closed-loop latency figure. For any latency comparison use
-> `--max-outstanding > 0` (the closed-loop path of section 3), which is unchanged.
+**The `--ramp` saturation search (§5b) also runs on this worker**, with two additions enabled only in
+ramp mode: each batch is **rate-paced** to the ramp's current per-worker target QPS, and per-query
+**RTT is sampled** into the histogram via a per-worker in-flight table keyed by DNS id. The dichotomy
+therefore drives load on the fast batched path *and* reads real latency — the per-query unified worker
+(§3) caps near ~1.2 M qps on older CPUs and would undersell a fast server. Pure flood
+(`--max-outstanding 0` without `--ramp`) keeps both off for raw maximum offered load.
+
+> **Pure flood (`--max-outstanding 0` without `--ramp`) is NOT a latency measurement.** There, send
+> timestamps are per-batch, so the p50/p99 reported are throughput-mode figures, not comparable to a
+> closed-loop latency figure. For an exact per-query latency comparison use `--max-outstanding > 0`
+> (the closed-loop unified path of §3); `--ramp` reports a sampled latency at each offered load (§5b).
 
 ---
 
@@ -324,15 +331,19 @@ Design points that make this fast *and* correct:
   *not* guaranteed to be the sending worker's queue, and a reply on another worker's
   queue is unmatched and counted as a loss. Measured round-trip completion with RSS
   steering in place: 99.7–99.9 % (#8).
-- **Generator-side RSS steering** (v2.2.1, #8). Only queues `0..N-1` are bound to
-  XSKs, but the NIC's default RSS indirection spans **all** HW queues, so replies
-  frequently hashed to an unbound queue and were dropped before the socket — a false
-  ~100 % loss that also stalled the closed-loop sender. On startup dnsmark rewrites the
-  RSS indirection table to span exactly the bound queues
-  (`ethtool -X <if> equal <N>` — RETA only, no channel reconfig, safe around an active
-  zero-copy bind; best-effort, warns on failure). Above ~9 M qps the active RX can
-  concentrate on one queue/core and depress the *measured* round-trip rate — a
-  generator-side limit; read served throughput at the receiver's NIC counters.
+- **Generator-side RSS steering to a single RX queue** (#8; q0 since v2.3.0). Replies must land on a
+  queue whose XSK worker drains it *promptly*. The NIC's default RSS spans **all** HW queues, so replies
+  frequently hashed to an unbound queue and were dropped before the socket — a false ~100 % loss that
+  also stalled the closed-loop sender. v2.2.1 first steered the RETA to span the bound queues
+  (`ethtool -X equal <N>`), but the unified RX+TX workers spend most cycles on TX and poll a thinly-filled
+  RX queue rarely: matched replies then sat ~10 ms (a measurement artefact) and the dichotomy never
+  found the real knee. **v2.3.0 steers RSS to one queue (`ethtool -X <if> equal 1`)** — all replies
+  concentrate on q0, which is therefore drained continuously, while TX still spreads across all bound
+  queues. Verified end-to-end: the `--xdp` ramp then climbs cleanly to the server's saturation knee
+  (~11 M qps) at sub-ms p50. (RETA only, no channel reconfig, safe around a live zero-copy bind;
+  best-effort, warns on failure.) The single RX queue samples a *fraction* of replies at flood rate —
+  enough for the latency knee, not a throughput count: read served throughput at the **receiver's**
+  NIC counters.
 - **`XDP_USE_NEED_WAKEUP`** kick semantics so the driver is only signalled when it needs
   to be.
 - **No real-time scheduling.** Workers run `SCHED_OTHER`; the kernel can always preempt
