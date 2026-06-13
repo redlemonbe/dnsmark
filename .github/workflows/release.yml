@@ -112,12 +112,22 @@ jobs:
           cd release-assets
           for f in $(ls | grep -v "\.minisig$"); do sign "$f"; done
           rm -f /tmp/minisign.key
+      - name: Extract release notes for this tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VER" '
+            $0 ~ "^## \\[" ver "\\]" {f=1; print; next}
+            f && /^## \[/ {exit}
+            f {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then echo "dnsmark ${GITHUB_REF_NAME}" > RELEASE_NOTES.md; fi
+          echo "---- extracted release notes ----"; cat RELEASE_NOTES.md
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: dnsmark ${{ github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: release-assets/*
