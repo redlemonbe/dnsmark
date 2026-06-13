@@ -133,6 +133,14 @@ impl StatsCollector {
         let _ = h.record(rtt_us.max(1));
     }
 
+    /// Record a latency sample only — no completed/rcode bump. The throughput worker
+    /// (flood/ramp path) counts completions and rcodes in batches itself, but in ramp
+    /// mode it still needs RTTs in the histogram so the p50 SLO has data. Mirrors what
+    /// the AF_XDP receiver does at high rate (parking_lot lock, cheap uncontended).
+    pub fn record_latency_us(&self, rtt_us: u64) {
+        let _ = self.histogram.lock().record(rtt_us.max(1));
+    }
+
     /// Per-ramp-step latency window: p50/p95/p99 (microseconds) and sample count for
     /// the RTTs recorded since the last call, then clears the histogram so the next
     /// step measures its own load only. This is what makes `--ramp` emit a

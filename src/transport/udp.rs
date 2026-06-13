@@ -345,6 +345,8 @@ fn throughput_udp_worker(
     wire_pool: Arc<WireQueryPool>,
     stats: Arc<StatsCollector>,
     shutdown: Arc<AtomicBool>,
+    qps_per_worker: Arc<AtomicU64>,
+    track_latency: bool, // ramp: rate-pace to qps_per_worker + sample RTT. flood: false (qps ignored).
 ) {
     // ── TX buffers (allocated once) ──────────────────────────────────────────
     let mut tx_flat: Vec<u8> = vec![0u8; TX_BATCH * MAX_QUERY];
@@ -392,34 +394,82 @@ fn throughput_udp_worker(
     let mut tmpl_idx: usize = rand::random();
     let mut batch_ctr: usize = 0;
 
+    // ── Latency sampling + rate pacing (ramp mode only) ──────────────────────
+    // The ramp drives THIS fast batched path (not the per-query unified worker, which
+    // caps ~1.2M on old CPUs and would undersell a fast server). We pace batches to the
+    // ramp's qps target so each step — including the Dichotomic Saturation Discovery
+    // binary-search points — measures latency at a known offered load, and we sample RTT
+    // into the shared histogram via a per-worker InFlight keyed by DNS id (full 16-bit
+    // space → no collision at flood-rate id wrap). This is what lets the p50 SLO break at
+    // the real saturation point so the dichotomy can refine the true knee. Mirrors AF_XDP.
+    let base = Instant::now();
+    let mut in_flight = InFlight::new(if track_latency { 65536 } else { 1 });
+    let mut next_batch = Instant::now();
+    let mut last_qps: u64 = 0;
+    let mut batch_interval = Duration::ZERO;
+
     loop {
         if shutdown.load(Ordering::Relaxed) { break; }
 
-        // ── Build + send one TX batch (sendmmsg, 1 syscall for TX_BATCH pkts) ─
-        let mut built = 0usize;
-        for i in 0..TX_BATCH {
-            let slot = &mut tx_flat[i * MAX_QUERY..(i + 1) * MAX_QUERY];
-            let qlen = wire_pool.write_with_index(tmpl_idx, next_id, slot);
-            tx_iovecs[i].iov_len  = qlen;
-            tx_msgs[i].msg_hdr.msg_iov    = &mut tx_iovecs[i] as *mut libc::iovec;
-            tx_msgs[i].msg_hdr.msg_iovlen = 1;
-            tmpl_idx = tmpl_idx.wrapping_add(1);
-            next_id  = next_id.wrapping_add(1);
-            built += 1;
+        // ── Pacing (ramp): is a batch due now? Non-blocking — we drain RX while waiting ─
+        let mut due = true;
+        if track_latency {
+            let qps = qps_per_worker.load(Ordering::Relaxed);
+            if qps != last_qps {
+                batch_interval = if qps > 0 {
+                    Duration::from_secs_f64(TX_BATCH as f64 / qps as f64)
+                } else { Duration::ZERO };
+                next_batch = Instant::now();
+                last_qps = qps;
+            }
+            // qps==0 (burst phase) floods; qps>0 sends only when the next slot is due.
+            due = qps == 0 || Instant::now() >= next_batch;
         }
 
-        // Single sendmmsg syscall for the whole batch
-        let sent = unsafe {
-            libc::sendmmsg(fd, tx_msgs.as_mut_ptr(), built as libc::c_uint, libc::MSG_DONTWAIT as _)
-        };
-        if sent > 0 {
-            local_sent += sent as u64;
+        if due {
+            // ── Build + send one TX batch (sendmmsg, 1 syscall for TX_BATCH pkts) ─
+            let batch_start_id = next_id;
+            let mut built = 0usize;
+            for i in 0..TX_BATCH {
+                let slot = &mut tx_flat[i * MAX_QUERY..(i + 1) * MAX_QUERY];
+                let qlen = wire_pool.write_with_index(tmpl_idx, next_id, slot);
+                tx_iovecs[i].iov_len  = qlen;
+                tx_msgs[i].msg_hdr.msg_iov    = &mut tx_iovecs[i] as *mut libc::iovec;
+                tx_msgs[i].msg_hdr.msg_iovlen = 1;
+                tmpl_idx = tmpl_idx.wrapping_add(1);
+                next_id  = next_id.wrapping_add(1);
+                built += 1;
+            }
+
+            // Timestamp just before the send syscall (per-batch granularity in ramp mode).
+            let send_ns = if track_latency { base.elapsed().as_nanos() as u64 } else { 0 };
+            let sent = unsafe {
+                libc::sendmmsg(fd, tx_msgs.as_mut_ptr(), built as libc::c_uint, libc::MSG_DONTWAIT as _)
+            };
+            if sent > 0 {
+                local_sent += sent as u64;
+                if track_latency {
+                    // Register each sent id with this batch's send time so the drain can
+                    // match the response and record a real RTT (per-batch send granularity).
+                    let mut id = batch_start_id;
+                    for _ in 0..sent as usize {
+                        in_flight.insert(id, send_ns);
+                        id = id.wrapping_add(1);
+                    }
+                }
+            }
+
+            batch_ctr += 1;
+            if track_latency && last_qps > 0 {
+                next_batch += batch_interval;
+                let now = Instant::now();
+                if next_batch < now { next_batch = now; } // behind: no burst-catch-up
+            }
         }
 
-        batch_ctr += 1;
-
-        // ── Drain RX every DRAIN_EVERY batches ───────────────────────────────
-        if batch_ctr % DRAIN_EVERY == 0 {
+        // ── Drain RX: continuous in ramp (responses timestamped as they arrive → real
+        //    RTT), periodic in flood (cheap). ────────────────────────────────────────
+        if track_latency || batch_ctr % DRAIN_EVERY == 0 {
             loop {
                 let n = unsafe {
                     libc::recvmmsg(
@@ -435,10 +485,20 @@ fn throughput_udp_worker(
                 for i in 0..n as usize {
                     let len = (rx_msgs[i].msg_len as usize).min(MAX_MSG_SIZE);
                     let off = i * MAX_MSG_SIZE;
-                    let idx = match crate::dns::response::parse_response(&rx_flat[off..off + len]).map(|r| r.rcode) {
+                    let buf = &rx_flat[off..off + len];
+                    let idx = match crate::dns::response::parse_response(buf).map(|r| r.rcode) {
                         Some(0) => 0, Some(3) => 1, Some(2) => 2, Some(5) => 3, _ => 4,
                     };
                     rc[idx] += 1;
+                    if track_latency && len >= 2 {
+                        // Match response id → recorded send time, sample the RTT into the
+                        // shared histogram (latency-only; rcodes are counted in rc[] above).
+                        let id = u16::from_be_bytes([buf[0], buf[1]]);
+                        let recv_ns = base.elapsed().as_nanos() as u64;
+                        if let Some(rtt_ns) = in_flight.take(id, recv_ns) {
+                            stats.record_latency_us((rtt_ns / 1000).max(1));
+                        }
+                    }
                 }
                 local_completed += n as u64;
             }
@@ -476,6 +536,7 @@ pub async fn run_udp_worker(
     verbose: bool,
     worker_id: usize,
     max_outstanding: usize,
+    ramp: bool,
     global_in_flight: Arc<AtomicUsize>,
 ) {
     let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -500,9 +561,12 @@ pub async fn run_udp_worker(
         super::pin_to_cpu(worker_id);
         let _sock = socket;
         if max_outstanding == 0 {
-            // Throughput / flood mode: sendmmsg batch, no poll, no per-pkt atomic.
-            // NOT suitable for latency measurement — timestamps are per-batch.
-            throughput_udp_worker(fd, wire_pool, stats, shutdown);
+            // Flood / ramp: fast batched sendmmsg path. In ramp mode (track_latency=ramp)
+            // it rate-paces to qps_per_worker and samples RTT into the histogram so the
+            // ramp can drive the server to its real saturation knee with a p50 SLO — the
+            // per-query unified worker caps ~1.2M on old CPUs and would undersell. Pure
+            // flood (track_latency=false) skips pacing + sampling for raw max offered load.
+            throughput_udp_worker(fd, wire_pool, stats, shutdown, qps_per_worker, ramp);
         } else {
             // Closed-loop / latency mode: single send, timestamp per query,
             // poll-with-deadline, HDR histogram. Comparable to dnsperf.

@@ -226,7 +226,7 @@ pub async fn run_with_shutdown(
             let handle = match config.protocol {
                 Protocol::Udp => tokio::spawn(sender::run_udp_worker(
                     server_addr, wp, st, sd, cfg.timeout_ms, qps, cfg.verbose, i,
-                    cfg.max_outstanding, gif,
+                    cfg.max_outstanding, cfg.ramp, gif,
                 )),
                 Protocol::Tcp => tokio::spawn(sender::run_tcp_worker(
                     server_addr, qs, st, sd, cfg.timeout_ms, qps, cfg.verbose, i,

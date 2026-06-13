@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.3.0] - 2026-06-13
+
+### Fixed
+- **`--ramp` now works reliably in BOTH transports.** The saturation ramp (Dichotomic
+  Saturation Discovery) was effectively unusable:
+  - **kernel-UDP**: `--ramp` ran on the throughput worker, which has no per-query latency,
+    so the p50 SLO never tripped and the ramp just flooded (no knee).
+  - **AF_XDP**: the RSS RETA was steered across all bound queues (`equal queue_count`), but the
+    unified RX+TX workers — busy on TX — polled each thinly-filled RX queue rarely, so matched
+    replies sat ~10 ms (a measurement artefact) and the dichotomy never found the real knee.
+
+  Fixes:
+  - kernel-UDP: the throughput worker now rate-paces to the ramp target **and** samples RTT
+    into the histogram (per-worker InFlight keyed by DNS id) — it drives load on the fast batched
+    path while measuring latency, so the dichotomy finds the server's real knee.
+  - AF_XDP: RSS is steered to a **single** RX queue (`ethtool -X equal 1`) so it is drained
+    continuously; TX still spreads across all bound queues.
+
+  Verified end-to-end on a dual-Xeon-v2 / X710 bench: kernel-UDP ramp ~3.8 M qps, AF_XDP ramp
+  ~11.0 M qps (the server's real saturation knee), vs 0 / a 10 ms artefact before.
+
+### Notes
+- `--ramp` stays an opt-in flag; the default remains the closed-loop latency probe
+  (`--max-outstanding 100`). Throughput (flood) and closed-loop latency are unchanged.
+
 ## [2.2.3] - 2026-06-13
 
 ### Fixed

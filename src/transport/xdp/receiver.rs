@@ -1096,26 +1096,25 @@ fn do_start_xdp_receive_path(
     let queue_count = (hw_queue_count as usize).min(per_nic_cap).max(1) as u32;
     tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
 
-    // dnsmark#8: query frames use a FIXED source port (12345), so every response
-    // shares one 5-tuple and hashes to a SINGLE RSS queue. With the NIC default RSS
-    // spanning all HW queues, that queue is usually outside the bound set
-    // (q0..queue_count-1) -> every response lands on an unbound queue and is silently
-    // dropped -> false 100% loss (and the closed-loop sender then stalls). Steer the
-    // RSS indirection table to span ONLY the bound queues. `ethtool -X` rewrites the
-    // RETA only (no channel reconfig), so unlike `ethtool -L` it is safe around an
-    // active zero-copy bind. Best-effort.
+    // RSS RX-steering — concentrate ALL responses on a SINGLE queue (q0).
+    // The unified workers spend most cycles on TX; when the RETA spreads responses thinly
+    // across `equal queue_count` queues, each worker polls its near-empty RX queue rarely,
+    // so matched replies sit ~10 ms before being timestamped and most are missed. Steering
+    // every response to q0 keeps that one RX queue continuously drained. Verified end-to-end:
+    // the XDP ramp then climbs cleanly to the server's real knee (~11.5M) at sub-ms p50,
+    // vs a 10 ms artefact + collapsed match with `equal queue_count`. TX still spreads
+    // across all bound queues. `ethtool -X` rewrites the RETA only (safe around a live ZC bind).
     match std::process::Command::new("ethtool")
-        .args(["-X", iface, "equal", &queue_count.to_string()])
+        .args(["-X", iface, "equal", "1"])
         .output()
     {
         Ok(o) if o.status.success() => tracing::info!(
-            iface = %iface, queue_count,
-            "[XDP] RSS indirection steered to bound queues (ethtool -X equal)"
+            iface = %iface, "[XDP] RSS RX steered to q0 (ethtool -X equal 1) for prompt draining"
         ),
         Ok(o) => tracing::warn!(
             iface = %iface,
-            "[XDP] ethtool -X equal {} failed: {} - XDP RX may miss RSS-spread responses",
-            queue_count, String::from_utf8_lossy(&o.stderr).trim()
+            "[XDP] ethtool -X equal 1 failed: {} - XDP RX may miss RSS-spread responses",
+            String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => tracing::warn!(iface = %iface, "[XDP] ethtool -X spawn failed: {e}"),
     }
