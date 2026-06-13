@@ -22,6 +22,12 @@
   than assumed.
 - **Deterministic placement.** Workers pin to NIC-local **physical** cores (no HT, no
   real-time scheduling) for repeatable results.
+- **Proven at scale.** In multi-NIC mode (repeat `-s`, one AF_XDP stack per card),
+  dnsmark drove a single DNS node to **~20.28 M qps measured at the receiver's NIC
+  counters** (two direct 10 GbE links, 2026-06-13 rig — dual Xeon E5-2690 v2 generator),
+  and sustains **~13 M pps of AF_XDP generation per card**. Throughput is always read at
+  the receiver NIC hardware counters, never self-reported, and is cross-validated against
+  `dnsperf` (DNS-OARC) — see [docs/cross-validation-dnsperf.md](docs/cross-validation-dnsperf.md).
 
 The trade-offs and exact measurement methodology are written down, not glossed over —
 see the [whitepaper](docs/WHITEPAPER.md).
