@@ -82,12 +82,14 @@ Measured impact (receiver side, before/after):
 | IP only (`sd`) | 1 | 448 k qps |
 | IP + L4 ports (`sdfn`) | 16 | 4.77 M qps |
 
-dnsmark offers one flow per worker — each worker sends from its own UDP source
-port (a kernel socket per `-c` worker; a fixed `2048 + worker_id` port with
-`--xdp`) — so run enough workers to light up the receiver's queues. (The table
-above was measured on v1.x, which varied the port per packet; since v2.0.4 the
-port is fixed per worker.) For single-queue / single-core testing, run a single
-worker (`-c 1`).
+dnsmark fans queries across the receiver's RSS queues. In **kernel mode** each
+worker sends from its own UDP source port (a kernel socket per `-c` worker). With
+**`--xdp`**, each worker **cycles its source port over a wide range**
+(`SPORT_SPREAD=2048`, **since v2.2.2**), so query traffic carries thousands of
+distinct 5-tuples and spreads across the receiver's full RSS — run enough workers
+to light up the queues. (The table above was measured on v1.x, which varied the
+port per packet.) For single-queue / single-core testing, run a single worker
+(`-c 1`).
 
 ### 2.3 RSS — spread across queues
 
@@ -97,6 +99,13 @@ ethtool -X <nic> equal 16
 
 The 82599 caps RSS at **16 queues** (hardware limit — you cannot go higher).
 Set this explicitly; the default spread may not be uniform.
+
+> **Note (`--ramp --xdp`):** the ramp temporarily re-steers the RSS indirection
+> table to a **single** RX queue (`ethtool -X <nic> equal 1`) for the duration of
+> the ramp — it needs one continuously-drained queue to find the saturation knee,
+> and it overrides the `equal 16` setting above without restoring it. This affects
+> **ramp mode only**; flood and closed-loop modes use the full spread. Re-apply
+> `ethtool -X <nic> equal 16` afterward if you continue with other modes.
 
 ### 2.4 Ring buffers at maximum
 
