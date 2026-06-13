@@ -93,3 +93,66 @@ dnsperf -s 10.0.0.1 -p 53 -d queries.txt -c 10  -T 10 -Q 50000 -q 100 -t 1 -l 10
 # Throughput truth = receiver NIC PHY counters
 ethtool -S <nic> | grep -wE 'tx_pkts_nic|rx_pkts_nic|rx_no_dma_resources|rx_missed_errors'
 ```
+
+---
+
+## 6. 2026-06-13 — dnsperf vs dnsmark, three resolvers, new X710 + X510 rig
+
+A broader head-to-head: the same three resolvers (BIND 9.20.23, unbound 1.22.0, Runbound
+v0.18.1 `xdp: no`) measured on the same rig by **both** tools, to show *where the two
+generators agree and where each one's design bounds the result*. Full per-run reports live in
+the Runbound repo (`docs/benchmark/`, the 2026-06-13 round). Receiver: AMD Threadripper PRO
+5995WX (64c/128t), two direct 10 GbE DACs — Intel **X710 (i40e)** and **X510 (ixgbe)**;
+generator: dual Xeon E5-2690 v2. Truth = receiver NIC counters. dnsperf is closed-loop
+kernel-UDP (`-T 20 -c 500 -q 100000`); dnsmark `--ramp` is open-loop (served read at the NIC),
+with a bounded closed-loop pass (`--max-outstanding 1500`) for the latency point. Both
+generators are **non-XDP (kernel UDP)** in this comparison.
+
+### Throughput — what each tool reads (same receiver, same link)
+
+| Resolver / link | dnsperf avg QPS (closed-loop) | dnsmark served peak (open-loop, NIC) | dnsmark / dnsperf |
+|---|--:|--:|--:|
+| BIND 9.20.23 — X710 | 786 k | 1.84 M | 2.3× |
+| BIND 9.20.23 — X510 | 432 k | 1.46 M | 3.4× |
+| unbound 1.22.0 — X710 | 579 k | 2.09 M | 3.6× |
+| unbound 1.22.0 — X510 | 131 k | 1.65 M | 12.6× |
+| Runbound v0.18.1 `xdp: no` — X710 | 1.99 M | 3.71 M | 1.9× |
+| Runbound v0.18.1 `xdp: no` — X510 | 676 k | 2.51 M | 3.7× |
+
+### Latency & success — where they overlap
+
+| Resolver / link | dnsperf NOERROR / lost / avg lat | dnsmark closed-loop p50 / p99 / NOERROR |
+|---|---|---|
+| BIND — X710 | 94.9 % / 2.6 % / 5.63 ms | 0.320 / 8.791 ms / 92.0 % |
+| BIND — X510 | 95.5 % / 5.0 % / 1.7 ms | 1.051 / 1.388 ms / 99.7 % |
+| unbound — X710 | 99.7 % / 1.3 % / 97.5 ms* | 0.227 / 7.123 ms / 99.7 % |
+| unbound — X510 | 99.8 % / 14.7 % / 3.4 ms | 1.026 / 1.125 ms / 99.7 % |
+| Runbound — X710 | 99.7 % / 0.5 % / 4.66 ms | 0.066 / 0.371 ms / 99.7 % |
+| Runbound — X510 | 99.7 % / 3.5 % / 0.585 ms | 1.013 / 1.113 ms / 99.7 % |
+
+\* dnsperf's `-q 100000` keeps up to 100 k queries outstanding; by Little's law a deep queue at
+~579 k QPS yields ~97 ms *average* even when per-query service is sub-millisecond. It is a
+property of the closed-loop depth, not of the server — dnsmark's bounded closed-loop p50
+(0.227 ms) is the clean per-query figure.
+
+### What this shows
+
+1. **dnsmark open-loop reads the true served ceiling; dnsperf closed-loop reads a fraction of
+   it.** dnsperf is one kernel-UDP process bounded by `outstanding × threads × syscall rate`,
+   so it tops out at 0.13–2.0 M here while the *same receiver* serves 1.5–3.7 M (NIC-confirmed).
+   The gap is the tool, not the server — exactly the limit documented for the X520 rig in §4.
+2. **Closed-loop is sensitive to NIC RX drops; open-loop NIC-truth is not.** unbound on the
+   ixgbe X510 shows dnsperf **14.7 % lost** (it waits on queries the NIC dropped at RX), which
+   reads like a broken server — yet dnsmark's open-loop NIC counters show the link **healthy at
+   1.65 M served** in the same session. A closed-loop tool conflates "RX-dropped" with "server
+   slow"; the receiver NIC counters separate them.
+3. **Where the two tools overlap — correctness and cache-hit latency — they agree.** Both report
+   ~99.7 % NOERROR for the well-behaved paths, and dnsperf's average latency tracks dnsmark's
+   closed-loop p50 once the queue-depth caveat (note *) is removed. The numbers are not a dnsmark
+   artifact.
+4. **Neither closed-loop tool can reach a kernel-bypass fast path at all.** dnsperf and any
+   kernel-UDP generator cap at ~6 M offered on this generator; Runbound's AF_XDP fast path serves
+   **~10.1 M on one link and ~20.3 M across two** (measured by dnsmark `--xdp`, receiver at
+   ≤24 % CPU). Reaching a modern resolver's actual ceiling requires an open-loop AF_XDP generator
+   — which is why dnsmark exists. dnsperf remains the right tool for an independent correctness
+   and low-rate-latency cross-check, and it agrees with dnsmark there.
