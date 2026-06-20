@@ -148,12 +148,19 @@ datapath (§6): it reaches **~13 M qps** (near 10 GbE line rate for ~70 B DNS) b
 skb. Rule of thumb: reach for `--xdp` to saturate a server faster than ~5 M qps; kernel mode is the
 portable default for everything below.
 
-**The `--ramp` saturation search (§5b) also runs on this worker**, with two additions enabled only in
-ramp mode: each batch is **rate-paced** to the ramp's current per-worker target QPS, and per-query
-**RTT is sampled** into the histogram via a per-worker in-flight table keyed by DNS id. The dichotomy
-therefore drives load on the fast batched path *and* reads real latency — the per-query unified worker
-(§3) caps near ~1.2 M qps on older CPUs and would undersell a fast server. Pure flood
-(`--max-outstanding 0` without `--ramp`) keeps both off for raw maximum offered load.
+**The `--ramp` saturation search (§5b) also runs on this path**, rate-paced to the ramp's current
+target QPS with per-query **RTT sampled** into the histogram. So that latency tracking never caps the
+offered load, the kernel-UDP throughput path **splits TX and RX across two threads** (since 2.4.0): a
+TX thread floods/paces and records each send time into a lock-free in-flight table (one `AtomicU64`
+slot per 16-bit DNS id — the id is the index, so no lock and no collision), while a **dedicated RX
+thread** drains responses (`poll`+`recvmmsg`), matches ids and records RTT + completions. A single
+shared clock keeps `RTT = recv - send` exact. Draining RX in the TX thread (as before 2.4.0) capped
+the kernel-UDP ramp at ~440 k — the per-iteration `recvmmsg` starved TX; the split lets the dichotomy
+offer up to the flood rate and find the server's real knee (measured: 442 k -> 2.37 M on X710/i40e).
+The AF_XDP ramp needs **no** split — its ring-based RX drain is cheap enough to run inside the unified
+worker (§6), with q0 RSS concentration keeping that one queue continuously drained (verified to a
+9.36 M sub-ms knee). Pure flood (`--max-outstanding 0` without `--ramp`) skips the RTT sampling for
+raw maximum offered load.
 
 > **Pure flood (`--max-outstanding 0` without `--ramp`) is NOT a latency measurement.** There, send
 > timestamps are per-batch, so the p50/p99 reported are throughput-mode figures, not comparable to a

@@ -1,5 +1,34 @@
 # Changelog
 
+## [2.4.0] - 2026-06-18
+
+### Fixed
+- **`--ramp` self-cap on kernel-UDP — the offered load now reaches the server's real knee (#14).**
+  The 2.3.0 ramp work let the throughput worker rate-pace and sample RTT, but the worker still
+  drained RX **in the TX thread**: at a high offered rate the per-iteration `recvmmsg` + in-flight
+  bookkeeping capped TX at ~440k, so the dichotomy concluded "max sustainable ~440k" and never
+  reached a fast server's knee (the same generator floods 5.9M kernel-UDP).
+
+  Fix: the kernel-UDP throughput path (flood **and** ramp) is now split into a **TX thread** that
+  floods/paces and records send times into a lock-free `SharedInFlight` (one `AtomicU64` slot per
+  16-bit DNS id — the id is the index, so no lock and no collision), and a **dedicated RX thread**
+  that drains via `poll()`+`recvmmsg`, matches ids and records RTT + completions. A single shared
+  clock keeps `RTT = recv - send` exact.
+
+  Verified on X710 / i40e vs a kernel-slow-path server: `--ramp` NIC tx peaked at **2.37M** (was
+  442k) and found a real **p50<1ms knee at 1.3M**; p50 rises correctly with load and the SLO breaks
+  at saturation. Flood egress unchanged at 5.82M; the closed-loop latency path
+  (`--max-outstanding > 0`) is bit-for-bit unchanged.
+
+### Notes
+- The AF_XDP `--ramp` was already correct and is unchanged — verified end-to-end to a **9.36M
+  sub-ms knee** against a fast XDP server. Its ring-based RX drain is cheap enough to run in the
+  unified worker, so the TX/RX split is not needed there.
+- The AF_XDP **flood** self-report under-count is **by design** (#5): the unified TX+RX-per-queue
+  worker with single-queue (q0) RSS concentration is exactly what lets the XDP `--ramp` reach the
+  real knee at sub-ms p50. In flood, read served throughput from the receiver NIC counters (the
+  methodology already does); `--ramp` self-report is accurate.
+
 ## [2.3.0] - 2026-06-13
 
 ### Fixed
