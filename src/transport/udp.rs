@@ -367,7 +367,6 @@ fn unified_udp_worker(
 // The closed-loop path (max_outstanding > 0) is BIT-FOR-BIT unchanged.
 
 const TX_BATCH: usize = 64;         // sendmmsg batch size
-const DRAIN_EVERY: usize = 4;       // drain RX every N TX batches (= every 256 pkts)
 const FLUSH_STATS: usize = 16;      // flush local counters to Arc<StatsCollector> every N batches
 
 #[allow(clippy::too_many_arguments)]
