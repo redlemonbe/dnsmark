@@ -170,19 +170,22 @@ fn xdp_unified_worker(
     num_workers:      usize,
     max_outstanding:  usize,
     timeout_dur:      Duration,
+    in_flight:        Arc<InFlight>,
+    global_in_flight: Arc<AtomicUsize>,
+    firehose:         bool,
 ) {
     let area = sock.umem.ptr_at(0);
     let fd   = sock.fd;
     let nw      = num_workers.max(1);
     let id_span = (65536usize / nw).max(1);
     let id_base = ((worker_id % nw) * id_span) as u16;
-    // Per-worker in-flight table (lock-free, zero cross-core contention). NOTE: with the
-    // #flow-spread source-port range, responses scatter across bound queues, so a worker only
-    // matches the subset of its own replies that happened to return on its queue — dnsmark's
-    // LATENCY stats are therefore approximate in --xdp flood mode. THROUGHPUT (server-side qps)
-    // is unaffected: the flood is open-loop. (A correct shared table contends on scattered RX.)
-    let in_flight = InFlight::new();
-    let mut local_in_flight: usize = 0;
+    // SHARED in-flight table (#15-P1 fix): every worker inserts its own (globally unique,
+    // disjoint-range) ids and ANY worker can match ANY reply that RSS scattered onto its
+    // queue. The table is a 65536-slot lock-free atomic array, so cross-queue matching is a
+    // single atomic swap per reply (no mutex). This is what makes round-trip == the server's
+    // real reply rate once the RETA spreads RX across all worker queues. `global_in_flight`
+    // (shared atomic) carries the max_outstanding backpressure; in firehose (max_outstanding
+    // == 0) it is never touched, so the TX hot path keeps zero shared per-packet state.
     let mut id_ctr:   usize = 0;
     let mut tmpl_idx: usize = worker_id;
     const FLUSH_N: usize = 1024;
@@ -211,6 +214,15 @@ fn xdp_unified_worker(
     let mut ids_to_register: Vec<u16> = Vec::with_capacity(TX_BATCH);
     let mut rx_addrs: Vec<u64>     = Vec::with_capacity(2048);
     let mut last_timeout = Instant::now();
+
+    // Firehose RX: count responses by rcode locally (NO in_flight match, NO shared
+    // per-packet state) and flush in batches. This is the #15-P1 throughput path —
+    // each worker drains its own RSS-assigned RX queue and the per-queue counts sum
+    // to the server's real reply rate, while the TX hot path stays contention-free.
+    // (Latency is not measured in firehose — open-loop; use closed-loop for p50.)
+    let mut rc_no=0u64; let mut rc_nx=0u64; let mut rc_sf=0u64; let mut rc_rf=0u64; let mut rc_ot=0u64;
+    let mut rc_acc: usize = 0;
+    const RC_FLUSH: usize = 4096;
 
     // qps pacing as a token bucket (0 = unlimited flood). Tokens accrue at the
     // target rate independently of how fast this loop spins, so the send rate is
@@ -275,7 +287,9 @@ fn xdp_unified_worker(
             TX_BATCH
         };
         if max_outstanding > 0 {
-            headroom = headroom.min(max_outstanding.saturating_sub(local_in_flight));
+            headroom = headroom.min(
+                max_outstanding.saturating_sub(global_in_flight.load(Ordering::Relaxed))
+            );
         }
 
         // 3) TX a batch straight into UMEM (one SIMD copy, one produce_tx, one kick).
@@ -320,12 +334,16 @@ fn xdp_unified_worker(
                     // mode (max_outstanding==0). stats.sent stays sharded (no gate role).
                     // Timestamp AFTER the kick: comparable to dnsperf which timestamps
                     // at sendmsg(), not at buffer preparation.
-                    for &id in ids_to_register.iter().take(enq) {
-                        in_flight.insert(id);
-                    }
-                    if max_outstanding > 0 {
-                        local_in_flight += enq;
-                        stats.record_inflight(local_in_flight);
+                    // Closed-loop only: register ids for matching/RTT + backpressure.
+                    // Firehose skips this entirely (responses are counted, not matched).
+                    if !firehose {
+                        for &id in ids_to_register.iter().take(enq) {
+                            in_flight.insert(id);
+                        }
+                        if max_outstanding > 0 {
+                            let cur = global_in_flight.fetch_add(enq, Ordering::Relaxed) + enq;
+                            stats.record_inflight(cur);
+                        }
                     }
                     _local_submitted += enq;
                     stall_sub       += enq;
@@ -336,7 +354,7 @@ fn xdp_unified_worker(
             }
         }
 
-        // 4) Drain RX responses → match in_flight → stats → refill the fill ring.
+        // 4) Drain RX responses → count (firehose) or match (closed-loop) → refill fill ring.
         let rxds = sock.rx.consume_rx();
         if !rxds.is_empty() {
             rx_addrs.clear();
@@ -344,13 +362,25 @@ fn xdp_unified_worker(
             for desc in &rxds {
                 let frame = unsafe { sock.umem.frame(desc.addr, desc.len as usize) };
                 if let Some((id, rcode)) = parse_dns_from_frame(frame) {
-                    if let Some(rtt_us) = in_flight.take(id) { stats.record_response(rcode, rtt_us); completed += 1; }
+                    if firehose {
+                        // Count by rcode, no match: this queue's share of the server's replies.
+                        match rcode { 0 => rc_no+=1, 3 => rc_nx+=1, 2 => rc_sf+=1, 5 => rc_rf+=1, _ => rc_ot+=1 }
+                        rc_acc += 1;
+                    } else if let Some(rtt_us) = in_flight.take(id) {
+                        stats.record_response(rcode, rtt_us); completed += 1;
+                    }
                 }
                 rx_addrs.push(desc.addr);
             }
             sock.umem.fill.enqueue_batch(&rx_addrs);
-            if completed > 0 && max_outstanding > 0 {
-                local_in_flight = local_in_flight.saturating_sub(completed);
+            if firehose {
+                if rc_acc >= RC_FLUSH {
+                    stats.record_rcodes(rc_no, rc_nx, rc_sf, rc_rf, rc_ot);
+                    rc_no=0; rc_nx=0; rc_sf=0; rc_rf=0; rc_ot=0; rc_acc=0;
+                }
+            } else if completed > 0 && max_outstanding > 0 {
+                global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                    |x| Some(x.saturating_sub(completed))).ok();
             }
         } else if sock.umem.fill.needs_wakeup() {
             unsafe {
@@ -364,31 +394,33 @@ fn xdp_unified_worker(
         // it, but do not record it as a completion or a latency sample. The histogram
         // holds real response latencies only — slow responses still count (default
         // timeout is 3 s), genuine timeouts do not pollute the latency distribution.
+        // Shared table: only worker 0 sweeps it (one scan, no double-counting across workers).
         let now = Instant::now();
-        if now.duration_since(last_timeout) >= Duration::from_millis(10) {
+        if worker_id == 0 && now.duration_since(last_timeout) >= Duration::from_millis(10) {
             let ages = in_flight.sweep_with_ages(timeout_dur);
             if !ages.is_empty() {
                 for _ in &ages {
                     stats.inc_timeout();
                 }
                 if max_outstanding > 0 {
-                    local_in_flight = local_in_flight.saturating_sub(ages.len());
+                    global_in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                        |x| Some(x.saturating_sub(ages.len()))).ok();
                 }
             }
             last_timeout = now;
         }
     }
     // End-of-run: queries still in flight never got a response → losses.
-    {
+    // Only worker 0 drains the SHARED table (others would find it already empty).
+    if worker_id == 0 {
         let remaining = in_flight.drain_all();
         for _ in &remaining {
             stats.inc_timeout();
         }
-        // DIAGNOSTIC: print raw egress total so caller can compare to
-        // ethtool -S <nic> tx_packets at the same instant.
-        // This is the ONLY honest number — compare to ASIC to diagnose +9% residual.
-        if sub_acc > 0 { stats.inc_sent_n(sub_acc); }
     }
+    // Every worker flushes its OWN remaining sent + response accumulators.
+    if sub_acc > 0 { stats.inc_sent_n(sub_acc); }
+    if rc_acc > 0 { stats.record_rcodes(rc_no, rc_nx, rc_sf, rc_rf, rc_ot); }
 }
 
 // ── Frame parser ──────────────────────────────────────────────────────────
@@ -1096,25 +1128,39 @@ fn do_start_xdp_receive_path(
     let queue_count = (hw_queue_count as usize).min(per_nic_cap).max(1) as u32;
     tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
 
-    // RSS RX-steering — concentrate ALL responses on a SINGLE queue (q0).
-    // The unified workers spend most cycles on TX; when the RETA spreads responses thinly
-    // across `equal queue_count` queues, each worker polls its near-empty RX queue rarely,
-    // so matched replies sit ~10 ms before being timestamped and most are missed. Steering
-    // every response to q0 keeps that one RX queue continuously drained. Verified end-to-end:
-    // the XDP ramp then climbs cleanly to the server's real knee (~11.5M) at sub-ms p50,
-    // vs a 10 ms artefact + collapsed match with `equal queue_count`. TX still spreads
-    // across all bound queues. `ethtool -X` rewrites the RETA only (safe around a live ZC bind).
+    // RSS RX-steering — mode-dependent, this is the #15-P1 fix.
+    //
+    // Two regimes, because one RETA cannot serve both:
+    //
+    //  * Closed-loop / latency (max_outstanding > 0): the offered rate is bounded
+    //    (≤ a few hundred k), so a SINGLE always-hot RX queue (q0) drains it with
+    //    sub-ms p50 — and concentrating the few replies on one queue avoids the
+    //    ~10 ms "thinly-spread, rarely-polled" artefact. → `equal 1`.
+    //
+    //  * Firehose / throughput (max_outstanding == 0): a unified worker spends almost
+    //    all its cycles in the TX batch, so the q0 worker drains only ~350k resp/s
+    //    while ~5–12M arrive on q0 — every fast server then reports ~3% round-trip
+    //    (issue #15-P1, the 14× under-count). Spreading the RETA across ALL bound
+    //    worker queues lets every worker drain its own ~1/N share in parallel, so the
+    //    aggregate round-trip tracks the server's real reply rate. → `equal queue_count`.
+    //
+    // TX always spreads across all bound queues regardless. `ethtool -X` rewrites the
+    // RETA only (safe around a live zero-copy bind).
+    let firehose = matches!(UNIFIED_CFG.get(), Some(cfg) if cfg.max_outstanding == 0);
+    let rss_queues = if firehose { queue_count.max(1) } else { 1 };
     match std::process::Command::new("ethtool")
-        .args(["-X", iface, "equal", "1"])
+        .args(["-X", iface, "equal", &rss_queues.to_string()])
         .output()
     {
         Ok(o) if o.status.success() => tracing::info!(
-            iface = %iface, "[XDP] RSS RX steered to q0 (ethtool -X equal 1) for prompt draining"
+            iface = %iface, rss_queues,
+            "[XDP] RSS RX steered across {} queue(s) ({} mode) for parallel draining",
+            rss_queues, if firehose { "firehose/throughput" } else { "closed-loop/latency" }
         ),
         Ok(o) => tracing::warn!(
             iface = %iface,
-            "[XDP] ethtool -X equal 1 failed: {} - XDP RX may miss RSS-spread responses",
-            String::from_utf8_lossy(&o.stderr).trim()
+            "[XDP] ethtool -X equal {} failed: {} - XDP RX may miss RSS-spread responses",
+            rss_queues, String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => tracing::warn!(iface = %iface, "[XDP] ethtool -X spawn failed: {e}"),
     }
@@ -1169,7 +1215,8 @@ fn do_start_xdp_receive_path(
                 .name(format!("xdp-worker-q{q}"))
                 .spawn(move || {
                     if let Some(c) = core { pin_thread_to(c); }
-                    xdp_unified_worker(sock, hdr, sa, wp, st, sd, qps, q as usize, qc, mo, timeout_dur);
+                    let firehose = mo == 0;
+                    xdp_unified_worker(sock, hdr, sa, wp, st, sd, qps, q as usize, qc, mo, timeout_dur, ifl, gif, firehose);
                 })
                 .map_err(|e| format!("thread spawn: {e}"))?;
             continue;

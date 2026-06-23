@@ -73,9 +73,28 @@ pub fn print_result(snap: &StatsSnapshot, config: &Config) {
                  (ixgbe X520: try a host reboot; modprobe reload is insufficient.)\x1b[0m",
                 snap.send_qps, wire);
         }
-    }    // Round-trip metric = responses received back (latency/loss tool)
-    println!("  Round-trip completed:      {:.0} qps  ({:.1}% of egress)", snap.avg_qps,
-        if snap.send_qps > 0.0 { snap.avg_qps / snap.send_qps * 100.0 } else { 0.0 });
+    }
+    // Round-trip metric = responses matched/counted in userspace (latency/loss tool).
+    let rt_pct = if snap.send_qps > 0.0 { snap.avg_qps / snap.send_qps * 100.0 } else { 0.0 };
+    println!("  Round-trip completed:      {:.0} qps  ({:.1}% of egress, userspace)", snap.avg_qps, rt_pct);
+
+    // Authoritative server throughput: replies that physically arrived on the NIC.
+    // In kernel-UDP the socket can drop replies (RcvbufErrors) so userspace round-trip
+    // under-counts; the NIC rx counter is the truth. In XDP it confirms round-trip.
+    if let Some(rx) = snap.server_rx_qps {
+        println!("  Server throughput (NIC rx):  {:.0} qps  (authoritative — replies on the wire)", rx);
+        if snap.avg_qps > 1_000.0 && rx > snap.avg_qps * 1.10 {
+            let dropped = rx - snap.avg_qps;
+            eprintln!(
+                "\x1b[33m[dnsmark] NOTE: the SERVER answered {:.0} qps (counted at the NIC, \
+                 incl. ring-overflow drops), but the kernel-UDP receive path only delivered \
+                 {:.0} qps to userspace — the generator dropped ~{:.0} qps of replies on its \
+                 OWN side (NIC ring + socket buffer overflow at multi-Mpps). The SERVER is \
+                 fine; this is a generator kernel-stack limit. Use --xdp for loss-free \
+                 high-rate reception.\x1b[0m",
+                rx, snap.avg_qps, dropped);
+        }
+    }
     println!();
     println!("  Latency:");
     println!("    min:       {:.3} ms", snap.min_us as f64 / 1000.0);

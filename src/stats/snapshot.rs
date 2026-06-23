@@ -22,4 +22,10 @@ pub struct StatsSnapshot {
     pub inflight_max: u64,
     /// PHY-confirmed wire egress (NIC tx_pkts_nic delta / run). None if not measured.
     pub wire_qps: Option<f64>,
+    /// Authoritative server throughput: replies that physically arrived on the egress
+    /// NIC (rx_packets delta / run). Counts every reply on the wire, even those the
+    /// kernel later drops at the socket (RcvbufErrors) — so it is the true server reply
+    /// rate regardless of how lossy the userspace recv path is. None if not measured.
+    /// Assumes a dedicated benchmark link (rx is ~all DNS replies, negligible noise).
+    pub server_rx_qps: Option<f64>,
 }

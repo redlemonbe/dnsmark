@@ -124,9 +124,11 @@ struct Cli {
     #[arg(long)]
     no_xdp: bool,
 
-    /// Max outstanding queries total across all workers, 0 = unlimited (mirrors dnsperf -q N×clients)
-    #[arg(long, default_value_t = 100)]
-    max_outstanding: usize,
+    /// Max outstanding queries total across all workers, 0 = unlimited (mirrors dnsperf -q N×clients).
+    /// Default depends on mode (#16 auto-config): --xdp ⇒ 0 (firehose/throughput), kernel-UDP ⇒ 100
+    /// (closed-loop, dnsperf-like). Pass an explicit value to override either default.
+    #[arg(long)]
+    max_outstanding: Option<usize>,
 
     /// Show per-NIC stats breakdown in multi-NIC mode
     #[arg(long)]
@@ -259,7 +261,15 @@ fn main() -> anyhow::Result<()> {
         no_tui: cli.no_tui || cli.quiet,
         force_xdp: cli.xdp,
         no_xdp: cli.no_xdp,
-        max_outstanding: if cli.ramp { 0 } else { cli.max_outstanding }, // ramp paces via qps token-bucket; no in-flight gate (RX completions unreliable under XDP-ZC)
+        // #16 auto-config: ramp paces via qps token-bucket (no gate); --xdp defaults to
+        // firehose (0 = unlimited, the throughput regime — was a footgun at the old 100
+        // default which silently throttled --xdp to closed-loop); kernel-UDP keeps 100
+        // (dnsperf-like). An explicit --max-outstanding always wins.
+        max_outstanding: if cli.ramp {
+            0
+        } else {
+            cli.max_outstanding.unwrap_or(if cli.xdp { 0 } else { 100 })
+        },
         nic_stats: cli.nic_stats,
     });
 

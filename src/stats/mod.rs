@@ -220,6 +220,7 @@ impl StatsCollector {
             inflight_mean: ifl_mean,
             inflight_max:  ifl_max,
             wire_qps:      None,
+            server_rx_qps: None,
         }
     }
 }

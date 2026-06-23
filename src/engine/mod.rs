@@ -46,6 +46,42 @@ fn nic_wire_tx_packets(iface: &str) -> Option<u64> {
     None
 }
 
+/// Replies that physically ARRIVED on `iface` = rx_packets + NIC ring-overflow drops.
+///
+/// This is the authoritative server reply rate on a dedicated benchmark link, in EVERY
+/// mode. The subtlety the user flagged: in kernel-UDP at multi-Mpps the NIC ring overflows
+/// (the softirq cannot drain it), so `rx_packets` alone under-counts — the dropped frames
+/// land in `rx_missed_errors` (i40e) / `rx_fifo_errors` / `rx_over_errors`. Adding those
+/// back recovers the true number of replies the server put on the wire (it equals the
+/// SERVER's tx counter), without needing to read the remote server. In XDP the ring is
+/// drained zero-copy so the drop counters stay ~0 and this equals rx_packets. Reads /sys
+/// (portable, no ethtool parsing). rx_dropped is excluded (it also counts non-overflow drops).
+#[cfg(feature = "xdp")]
+fn nic_rx_packets(iface: &str) -> Option<u64> {
+    let read = |f: &str| -> u64 {
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
+            .ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
+    };
+    let pkts = std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/rx_packets"))
+        .ok().and_then(|s| s.trim().parse::<u64>().ok())?;
+    Some(pkts + read("rx_missed_errors") + read("rx_fifo_errors") + read("rx_over_errors"))
+}
+
+/// Resolve the egress/return NIC(s) for the configured server(s) — where queries leave
+/// and replies come back. Used to read the authoritative rx counter in both modes.
+#[cfg(feature = "xdp")]
+fn return_ifaces(config: &Config) -> Vec<String> {
+    let mut srvs = config.servers.clone();
+    if srvs.is_empty() { srvs.push(config.server); }
+    let mut ifs: Vec<String> = Vec::new();
+    for srv in srvs {
+        let i = crate::transport::xdp::iface_for_benchmark(srv);
+        let i = crate::transport::xdp::parent_interface(&i).unwrap_or(i);
+        if !ifs.contains(&i) { ifs.push(i); }
+    }
+    ifs
+}
+
 pub async fn run(config: Arc<Config>) -> anyhow::Result<StatsSnapshot> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let result = run_with_shutdown(config, shutdown.clone()).await;
@@ -358,6 +394,17 @@ pub async fn run_with_shutdown(
         Some((ifs, tx0))
     } else { None };
 
+    // Authoritative server throughput: replies arriving on the return NIC(s). Works in
+    // BOTH kernel-UDP and XDP — in kernel mode it counts replies the socket later drops
+    // (the RcvbufErrors that make userspace round-trip under-count); in XDP it cross-checks
+    // the count-only round-trip. Captured over the same steady-state window.
+    #[cfg(feature = "xdp")]
+    let rx_baseline: Option<(Vec<String>, u64)> = {
+        let ifs = return_ifaces(&config);
+        let rx0: u64 = ifs.iter().filter_map(|i| nic_rx_packets(i)).sum();
+        if rx0 > 0 || !ifs.is_empty() { Some((ifs, rx0)) } else { None }
+    };
+
     tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)), if !config.ramp => {
             shutdown.store(true, Ordering::Relaxed);
@@ -384,6 +431,12 @@ pub async fn run_with_shutdown(
         let tx1: u64 = ifs.iter().filter_map(|i| nic_wire_tx_packets(i)).sum();
         let secs = elapsed.max(1e-9);
         snap.wire_qps = Some(tx1.saturating_sub(tx0) as f64 / secs);
+    }
+    #[cfg(feature = "xdp")]
+    if let Some((ifs, rx0)) = rx_baseline {
+        let rx1: u64 = ifs.iter().filter_map(|i| nic_rx_packets(i)).sum();
+        let secs = elapsed.max(1e-9);
+        snap.server_rx_qps = Some(rx1.saturating_sub(rx0) as f64 / secs);
     }
     Ok(snap)
 }

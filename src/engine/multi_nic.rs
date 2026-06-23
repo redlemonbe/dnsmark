@@ -56,6 +56,7 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
             inflight_mean: 0.0,
             inflight_max: 0,
             wire_qps: None,
+            server_rx_qps: None,
         };
     }
 
@@ -98,7 +99,15 @@ fn merge_snapshots(snaps: &[StatsSnapshot]) -> StatsSnapshot {
         max_us,
         inflight_mean: snaps.iter().map(|s| s.inflight_mean).sum::<f64>() / snaps.len().max(1) as f64,
         inflight_max:  snaps.iter().map(|s| s.inflight_max).max().unwrap_or(0),
-        wire_qps: None,
+        wire_qps: {
+            let w: f64 = snaps.iter().filter_map(|s| s.wire_qps).sum();
+            if w > 0.0 { Some(w) } else { None }
+        },
+        // Authoritative server throughput sums across NICs (each NIC counts its own replies).
+        server_rx_qps: {
+            let r: f64 = snaps.iter().filter_map(|s| s.server_rx_qps).sum();
+            if r > 0.0 { Some(r) } else { None }
+        },
     }
 }
 
@@ -254,6 +263,7 @@ mod tests {
             inflight_mean:     0.0,
             inflight_max:      0,
             wire_qps: None,
+            server_rx_qps: None,
         }
     }
 
