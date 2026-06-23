@@ -199,6 +199,12 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     transport::init_cpu_pinning(primary);
+    // Auto-NUMA (single-NIC): confine CPUs+memory to the NIC's node so the user never
+    // needs `numactl --cpunodebind=N --membind=N`. Multi-NIC NICs live on different
+    // nodes → confining would starve one, so per-stack pinning handles that case.
+    if servers.len() == 1 {
+        transport::confine_to_nic_node(primary);
+    }
 
     // Auto-detection
     let auto = autodetect::detect();

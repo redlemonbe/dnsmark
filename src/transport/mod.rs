@@ -52,6 +52,46 @@ pub fn init_cpu_pinning(server: std::net::IpAddr) {
     let _ = server;
 }
 
+/// Auto-NUMA: confine the whole process to the NIC's NUMA node — CPUs and memory —
+/// so the user never needs `numactl --cpunodebind=N --membind=N`. Without this, a
+/// 20-worker auto run on a 2-node host spreads half its TX threads onto the remote
+/// node (QPI-bound, slower egress); the manual numactl recovered it. This makes it
+/// automatic. SINGLE-NIC ONLY: with multiple NICs on different nodes, confining to one
+/// node would starve the others — there each stack must pin to its own NIC's node.
+#[cfg(target_os = "linux")]
+pub fn confine_to_nic_node(server: std::net::IpAddr) {
+    let Some(iface) = crate::autodetect::iface_for_addr(server) else { return; };
+    let Some(node)  = crate::autodetect::numa_node_for_iface(&iface) else { return; };
+
+    // CPUs: restrict process affinity to all logical CPUs of the NIC node (= --cpunodebind).
+    let cpus = crate::autodetect::logical_cpus_for_node(node);
+    if !cpus.is_empty() {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            for &c in &cpus { if c < libc::CPU_SETSIZE as usize { libc::CPU_SET(c, &mut set); } }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+    // Memory: bind allocations to the NIC node (= --membind). MPOL_BIND, single-node mask.
+    // Set on the main thread before any worker spawns → child threads inherit the policy.
+    if node < 64 {
+        let nodemask: u64 = 1u64 << node;
+        const MPOL_BIND: libc::c_int = 2;
+        unsafe {
+            libc::syscall(libc::SYS_set_mempolicy, MPOL_BIND,
+                &nodemask as *const u64, 64u64);
+        }
+    }
+    tracing::info!(
+        "[CPU] auto-NUMA: process confined to NIC node {} ({} logical CPUs) + membind \
+         — no numactl needed", node, cpus.len()
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn confine_to_nic_node(_server: std::net::IpAddr) {}
+
 /// Pin the calling OS thread to a physical core (HT siblings excluded).
 /// Uses the NUMA-sorted core list from `init_cpu_pinning()` if called first,
 /// otherwise falls back to plain physical core order.

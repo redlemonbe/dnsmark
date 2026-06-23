@@ -87,11 +87,12 @@ pub fn print_result(snap: &StatsSnapshot, config: &Config) {
             let dropped = rx - snap.avg_qps;
             eprintln!(
                 "\x1b[33m[dnsmark] NOTE: the SERVER answered {:.0} qps (counted at the NIC, \
-                 incl. ring-overflow drops), but the kernel-UDP receive path only delivered \
-                 {:.0} qps to userspace — the generator dropped ~{:.0} qps of replies on its \
-                 OWN side (NIC ring + socket buffer overflow at multi-Mpps). The SERVER is \
-                 fine; this is a generator kernel-stack limit. Use --xdp for loss-free \
-                 high-rate reception.\x1b[0m",
+                 incl. ring-overflow drops) — that is the authoritative throughput. The \
+                 generator's receive path only delivered {:.0} qps to userspace; ~{:.0} qps \
+                 of replies were dropped on the GENERATOR side (kernel socket/NIC-ring overflow, \
+                 or an RX queue not drained fast enough — e.g. a non-NUMA-local stack in \
+                 multi-NIC). The SERVER is fine. In kernel-UDP, use --xdp; in --xdp multi-NIC, \
+                 ensure each stack is NUMA-local to its NIC.\x1b[0m",
                 rx, snap.avg_qps, dropped);
         }
     }

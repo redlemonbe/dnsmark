@@ -176,6 +176,25 @@ pub fn iface_for_addr(addr: std::net::IpAddr) -> Option<String> {
     default_iface
 }
 
+/// All logical CPUs (incl. HT siblings) belonging to NUMA `node`, from
+/// `/sys/devices/system/node/nodeN/cpulist` (e.g. "1,3,5-9,41-49").
+pub fn logical_cpus_for_node(node: usize) -> Vec<usize> {
+    let s = std::fs::read_to_string(format!("/sys/devices/system/node/node{node}/cpulist"))
+        .unwrap_or_default();
+    let mut v = Vec::new();
+    for part in s.trim().split(',') {
+        if part.is_empty() { continue; }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                v.extend(a..=b);
+            }
+        } else if let Ok(a) = part.trim().parse::<usize>() {
+            v.push(a);
+        }
+    }
+    v
+}
+
 /// Physical cores sorted by NUMA locality to `preferred_node`.
 /// NUMA-local cores come first; remote cores follow.
 /// Falls back to `physical_cores()` when NUMA info is unavailable.
