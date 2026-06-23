@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.5.0] - 2026-06-23
+
+### Fixed
+- **Round-trip under-counted a fast server by ~14× (#15-P1).** In `--xdp` the unified
+  workers steered all RSS responses onto q0 (`ethtool -X equal 1`) and matched per-worker,
+  so one TX-busy worker drained ~350k resp/s while millions arrived — every healthy XDP
+  server looked broken (~3% success; round-trip 335k vs 11.24M served). The firehose RX now
+  spreads the RETA across **all** worker queues and counts responses per queue by rcode (no
+  cross-core match, no shared per-packet state), so the TX hot path stays at line rate and
+  round-trip tracks the server's real reply rate. Closed-loop now shares one lock-free
+  in-flight table + a global backpressure counter (warmup 950k → 2.77M). Validated at the
+  NIC: **335k → 11.19M** (single-NIC) vs 11.24M truth (0.5%).
+- **Multi-NIC NUMA pinning (#15-P2).** Worker cores were assigned through one shared global
+  cursor that assumed a single-node generator, so the 2nd NIC's stack landed on the remote
+  node (QPI-bound) — dual-fibre capped ~17.7M. Each NIC now pins strictly to **its own**
+  NUMA-local cores via a per-node cursor (disjoint pools across nodes; shared within a node).
+  Dual-NIC XDP: **17.7M → 21.7M** wire (X710 ~10.7M + X520 ~10M).
+
+### Added
+- **`Server throughput (NIC rx)` — authoritative reply rate.** dnsmark reads the return
+  NIC(s)' `rx_packets + rx_missed_errors` over the measurement window and reports it as the
+  truth, in **both** kernel-UDP and XDP. In kernel mode the NIC ring overflows at multi-Mpps
+  and the socket drops replies, so the userspace round-trip under-counts; adding the
+  ring-overflow counters recovers the server's true reply rate (= its tx counter) without
+  reading the remote host. When round-trip < NIC-rx, a NOTE explains the loss is
+  generator-side (kernel socket / NIC ring / non-NUMA-local stack), not the server.
+- **Auto-NUMA (single-NIC).** The process is confined to the NIC's NUMA node — CPUs
+  (`sched_setaffinity`) and memory (`set_mempolicy` MPOL_BIND) — at startup, the equivalent
+  of `numactl --cpunodebind=N --membind=N`, automatically. Kernel-UDP single-NIC egress
+  4.82M → 5.05M with no numactl (the rig's kernel ceiling).
+
+### Changed
+- **#16 auto-config.** `--max-outstanding` now defaults by mode: `--xdp` ⇒ `0`
+  (firehose/throughput), kernel-UDP ⇒ `100` (closed-loop, dnsperf-like), `--ramp` ⇒ `0`.
+  `dnsmark --xdp -s <ip> -d <corpus>` floods out-of-the-box (was silently throttled to 100
+  outstanding = closed-loop). `DNSMARK_SPORT_SPREAD` is internal and no longer read.
+
 ## [2.4.0] - 2026-06-18
 
 ### Fixed

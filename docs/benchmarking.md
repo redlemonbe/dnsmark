@@ -46,6 +46,14 @@ regardless of core count).
 
 ## 2. NIC & Host Tuning
 
+> **What `--xdp` now does for you (v2.5.0), generator-side:** CPU governor → `performance`,
+> auto-confine to the NIC's NUMA node (CPU + memory, single-NIC — replaces `numactl
+> --cpunodebind=N --membind=N`), source-port spread (internal, no `DNSMARK_SPORT_SPREAD`),
+> RSS RETA spread across the worker queues, one busy-poll worker per NIC-local core, and
+> firehose by default (`--max-outstanding 0`). So a generator run is just
+> `dnsmark -s <ip> --xdp -d <corpus>`. The items below you still set **once** per host
+> (flow control, ring size) and on the **receiver** (RSS, port :53) — they are not per-run.
+
 Apply the following on **both** the generator and the receiver.
 Each step has measurable impact — skipping any one will cap your throughput.
 
@@ -137,15 +145,21 @@ window. Sample only after the throughput curve flattens.
 
 ## 3. Measuring Receiver Throughput Correctly
 
-> **Do NOT trust dnsmark's round-trip counter when the receiver is faster than
-> dnsmark's own RX path.**
+> **Since v2.5.0 dnsmark reports this for you.** The summary line
+> **`Server throughput (NIC rx)`** = `rx_packets + rx_missed_errors` on the generator's
+> return NIC(s) — the authoritative server reply rate (it counts replies the kernel later
+> drops at the socket, and adds back NIC ring-overflow drops). You no longer need the
+> manual `ethtool -S` delta below; it is kept as the explanation of *why* that line is the
+> truth and how to cross-check it on the **receiver** side.
 
-dnsmark's XSK RX ring peaks around **1–2 M pps**. When the receiver processes
-packets faster than dnsmark can receive replies, the round-trip counter massively
-under-reports:
-
-- dnsmark showed **~1 M qps** (round-trip)
-- receiver was actually processing **8.3 M qps** (measured at NIC)
+> **Historical note (pre-2.5.0):** the `Round-trip completed` counter under-reported a fast
+> server because all responses were funnelled onto one XSK queue (~350k resp/s drain) while
+> millions arrived — e.g. round-trip showed ~1M while the receiver processed 8.3M, and at
+> 11M it read ~335k (a 14× error, #15). Fixed in v2.5.0: the firehose RX spreads the RETA
+> across all worker queues and counts per-queue, so round-trip now tracks the NIC-rx truth
+> (validated 5M→11M→21.7M). If round-trip is still below `Server throughput (NIC rx)` you are
+> generator-RX-bound (kernel socket / NIC-ring overflow, or a non-NUMA-local stack) — dnsmark
+> prints a NOTE and the NIC-rx figure is authoritative.
 
 ### 3.1 Ground truth: receiver NIC counters
 

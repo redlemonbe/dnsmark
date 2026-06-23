@@ -23,10 +23,11 @@
 - **Deterministic placement.** Workers pin to NIC-local **physical** cores (no HT, no
   real-time scheduling) for repeatable results.
 - **Proven at scale.** In multi-NIC mode (repeat `-s`, one AF_XDP stack per card),
-  dnsmark drove a single DNS node to **~20.28 M qps measured at the receiver's NIC
-  counters** (two direct 10 GbE links, 2026-06-13 rig — dual Xeon E5-2690 v2 generator),
-  and sustains **~13 M pps of AF_XDP generation per card**. Throughput is always read at
-  the receiver NIC hardware counters, never self-reported, and is cross-validated against
+  dnsmark drove a single DNS node to **~21.7 M qps** (two direct 10 GbE links on separate
+  PCIe buses, dual Xeon E5-2690 v2 generator — X710 ~10.7M + X520 ~10M), and **~11.2 M
+  single-NIC**. Throughput is read at the NIC hardware counters and, since v2.5.0,
+  reported by dnsmark itself as **`Server throughput (NIC rx)`** (`rx_packets +
+  rx_missed_errors`) — no longer a manual `ethtool -S` step. Cross-validated against
   `dnsperf` (DNS-OARC) — see [docs/cross-validation-dnsperf.md](docs/cross-validation-dnsperf.md).
 
 The trade-offs and exact measurement methodology are written down, not glossed over —
@@ -145,7 +146,9 @@ scales per core, well beyond a kernel-socket generator.
 sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which dnsmark)
 
 # zero-copy flood, all NIC-local cores
-dnsmark -s 10.0.0.2 -d queries.txt --xdp -c 8 --max-outstanding 0
+# --xdp defaults to firehose (--max-outstanding 0) and auto-confines to the NIC's NUMA
+# node — no numactl, no DNSMARK_SPORT_SPREAD, no ethtool tuning needed (since v2.5.0).
+dnsmark -s 10.0.0.2 -d queries.txt --xdp
 ```
 
 **Requirements to reach line rate (all matter):**
@@ -188,21 +191,20 @@ AF_XDP cannot transmit over a Linux **bond** — a bond is a virtual interface, 
 the kernel XDP layer binds a physical NIC + queue, so it has no way to spread
 frames across bond members (the second member becomes a black hole).
 
-**Workaround — saturate 2×10G with two independent paths:** take each port out of
-the bond, give each its own subnet, and run **one dnsmark instance per physical
-port**:
+**Native multi-NIC — saturate 2×10G from one process.** Repeat `-s`, one target per
+physical port (each on its own subnet routed via its own NIC). A single dnsmark instance
+drives one AF_XDP stack per card; since v2.5.0 each stack pins to **its own NIC's NUMA
+node** (per-node core cursor), so two cards on separate PCIe buses / sockets scale
+independently — the dual-fibre case reaches ~21.7M:
 
 ```bash
-# port A
-ethtool -A enp1s0f0 rx off tx off
-dnsmark -s 10.0.0.2 -d queries.txt --xdp --max-outstanding 0   # uses enp1s0f0
-# port B (second terminal / host)
-ethtool -A enp1s0f1 rx off tx off
-dnsmark -s 10.1.0.2 -d queries.txt --xdp --max-outstanding 0   # uses enp1s0f1
+# one instance, two cards (X710 on node 1 + X520 on node 0) — no numactl, no per-NIC tuning
+dnsmark -s 10.71.10.1 -s 10.51.10.1 -d queries.txt --xdp --nic-stats
 ```
 
-A native multi-NIC mode (one process driving several physical ports) is on the
-roadmap — see the issues.
+Each target must route via a distinct NIC (dnsmark refuses two targets on the same
+interface). Link **bonding** is still unsupported (a bond is virtual; XDP binds a physical
+NIC+queue) — use the per-port targets above instead of a bond.
 
 ### Benchmarking a DNS server (spread across its cores)
 
@@ -227,17 +229,21 @@ reaches all rings (the 82599's RSS caps at 16; measured on v1.x, which varied th
 port per packet — since v2.0.4 the port is fixed per worker). For a single-flow /
 single-core test, run a single worker (`-c 1`).
 
-**Generator-side AF_XDP RX (responses).** With `--xdp`, dnsmark also *receives*
-responses over AF_XDP, binding the socket on a subset of the generator NIC's queues.
-Because the NIC's default RSS indirection spans **all** hardware queues, a response
-could hash to an unbound queue and be dropped before the socket — observed as a false
-~100% loss (and, with the closed-loop sender, a throughput collapse). dnsmark now steers
-the generator NIC's RSS indirection table to span exactly the bound queues at setup
-(`ethtool -X <nic> equal <queue_count>` — RETA only, no channel reconfig, safe around an
-active zero-copy bind), so every response reaches a bound worker. No manual tuning is
-required. At very high offered rates the active RX can concentrate on one queue/core and
-cap the *measured* round-trip rate — in that regime read served throughput from the
-**receiver** NIC counters, not dnsmark's round-trip (#8).
+**Generator-side AF_XDP RX (responses) — accurate since v2.5.0.** With `--xdp`, dnsmark
+also *receives* responses over AF_XDP. Earlier versions funnelled all responses onto a
+single queue (`ethtool -X equal 1`) and matched them per-worker, so one TX-busy worker
+drained only ~350k resp/s while millions arrived → the headline round-trip under-counted a
+fast server by ~14× (#15). Since v2.5.0 the firehose path spreads the RETA across **all**
+worker queues, and each worker counts the responses on its own queue (no cross-core match),
+so the round-trip tracks the server's real reply rate — validated at the NIC from 5M
+(kernel) to 11M (single-NIC XDP) to 21.7M (dual-NIC XDP). No manual tuning is required.
+
+In addition, dnsmark reports an **authoritative `Server throughput (NIC rx)`** =
+`rx_packets + rx_missed_errors` on the return NIC(s): this counts every reply that reached
+the wire, even those the kernel later drops at the socket, so it equals the server's real
+reply rate without reading the remote host. When the userspace round-trip is lower (kernel
+socket / NIC-ring overflow, or a non-NUMA-local stack), dnsmark prints a NOTE and the NIC-rx
+figure is the truth.
 
 > 📖 **Full 10G benchmarking methodology** — NIC tuning checklist, how to read NIC
 > counters correctly (AF_XDP ZC TX bypasses standard `tx_packets`), CPU-bound vs.
