@@ -300,6 +300,11 @@ pub fn log_host_info(target: std::net::IpAddr) {
 /// QPI bottleneck that collapses the AF_XDP zero-copy datapath beyond ~16 busy
 /// cores (10 NIC-local + 6 cross-NUMA), so the worker budget is capped to 16 for
 /// it specifically. Every other CPU/NIC keeps the normal per-port budget.
+///
+/// Retained for reference / future tuning: since #15-P2 each NIC pins strictly to its
+/// own NUMA-local physical cores (no cross-node spill), so the special-case cap is no
+/// longer wired into the worker budget.
+#[allow(dead_code)]
 pub fn is_xeon_v2_x520(iface: &str) -> bool {
     let xeon_v2 = std::fs::read_to_string("/proc/cpuinfo").map(|s| {
         let f6 = s.lines().any(|l| l.starts_with("cpu family")

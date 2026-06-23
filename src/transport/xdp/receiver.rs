@@ -131,9 +131,17 @@ static XDP_TX_STATES: OnceLock<Vec<Arc<XdpTxState>>> = OnceLock::new();
 /// the rings (the HT-contending 2-thread-per-queue model is what capped scaling
 /// to the 8 NIC-local physical cores). This is the Runbound worker model.
 static XDP_UNIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-// Global physical-core cursor across ALL NICs: NIC1 takes its node, NIC2 spills
-// to the next node, so dual fibre uses distinct cores (no oversubscription).
-static GLOBAL_CORE_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// Per-NUMA-node core cursors (#15-P2 multi-NIC fix). Each NIC pins to ITS OWN node's
+// local cores starting at 0, so dual fibre on two nodes (X710@node1 + X520@node0) uses
+// each node's local cores INDEPENDENTLY — the old single global cursor pushed the 2nd
+// NIC's workers onto the remote node (QPI-bound), capping combined egress well below the
+// 2×10G line rate. NICs on the SAME node share that node's cursor (no oversubscription).
+const MAX_NUMA_NODES: usize = 8;
+#[allow(clippy::declare_interior_mutable_const)]
+static NODE_CORE_IDX: [std::sync::atomic::AtomicUsize; MAX_NUMA_NODES] = {
+    const Z: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    [Z; MAX_NUMA_NODES]
+};
 
 /// Config the engine hands to the unified workers (set before start_xdp_receive_path).
 pub struct UnifiedCfg {
@@ -1119,13 +1127,20 @@ fn do_start_xdp_receive_path(
     //  - 2-socket Intel (Xeon-v2 + X520): inter-socket QPI collapses the ixgbe ZC
     //    datapath beyond ~6 cross-NUMA workers => 10 local + 6 remote = 16 total.
     //  - many-node AMD (Infinity Fabric, cheap cross-CCX) => 12 per port, 24 total.
-    let (per_nic_cap, total_cap) = if crate::autodetect::is_xeon_v2_x520(iface) {
-        (n_local, n_local + 6)
+    // #15-P2: pin STRICTLY to this NIC's NUMA-local physical cores. The old remote
+    // "spill" (10+6) shared cores across NICs via a global cursor and collided in
+    // multi-NIC; with one busy-poll worker per NIC-local physical core each fibre runs
+    // on its own node and two 10G links scale independently (clean 10+10). On a
+    // single-NUMA host nic_node is None → all physical cores are "local".
+    let core_pool: Vec<usize> = if nic_node.is_some() {
+        phys_sorted.into_iter()
+            .filter(|&c| crate::autodetect::numa_node_for_cpu(c) == nic_node)
+            .collect()
     } else {
-        (12usize, 24usize)
+        phys_sorted
     };
-    let core_pool: Vec<usize> = phys_sorted.into_iter().take(total_cap).collect();
-    let queue_count = (hw_queue_count as usize).min(per_nic_cap).max(1) as u32;
+    let queue_count = (hw_queue_count as usize).min(core_pool.len()).max(1) as u32;
+    let _ = n_local;
     tracing::info!("[XDP] {} HW queues, spawning {} worker(s) (NIC-local physical cores)", hw_queue_count, queue_count);
 
     // RSS RX-steering — mode-dependent, this is the #15-P1 fix.
@@ -1165,10 +1180,12 @@ fn do_start_xdp_receive_path(
         Err(e) => tracing::warn!(iface = %iface, "[XDP] ethtool -X spawn failed: {e}"),
     }
 
+    let node_idx = nic_node.unwrap_or(0).min(MAX_NUMA_NODES - 1);
     for q in 0..queue_count {
-        // Global cross-NIC cursor: NIC1 fills its node-local cores, NIC2 takes the
-        // remaining cross-NUMA budget; stop once the 10+6 pool is spent (no wrap).
-        let gi = GLOBAL_CORE_IDX.fetch_add(1, Ordering::Relaxed);
+        // Per-node cursor: this NIC consumes its OWN node's local cores from 0. Two NICs
+        // on different nodes never collide (disjoint core pools); two on the same node
+        // share the cursor (no oversubscription). Stop once this node's cores are spent.
+        let gi = NODE_CORE_IDX[node_idx].fetch_add(1, Ordering::Relaxed);
         if gi >= core_pool.len() { break; }
         let assigned_core = core_pool[gi];
         let mut sock = match unsafe { create_xsk_socket(ifidx, q, true) } {
