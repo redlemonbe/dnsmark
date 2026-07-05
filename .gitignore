@@ -1,0 +1,4 @@
+/target
+
+# compiled binaries belong in GitHub Release assets, not in git
+release-binaries/

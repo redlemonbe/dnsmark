@@ -1,0 +1,322 @@
+#[allow(dead_code)]
+pub struct AutoConfig {
+    pub cpus: usize,
+    pub mem_mb: u64,
+    /// True if an `AF_XDP` socket can be *opened*. This is a capability hint, **not** a
+    /// guarantee that XDP attach will succeed (a container, missing BPF privileges, or a
+    /// virtual interface can still fail later) — `--xdp` falls back / errors clearly if so.
+    pub af_xdp_socket_available: bool,
+}
+
+pub fn detect() -> AutoConfig {
+    let cpus = num_cpus::get();
+    let mem_mb = read_proc_meminfo_avail_mb();
+    let af_xdp_socket_available = probe_xdp_support();
+    AutoConfig { cpus, mem_mb, af_xdp_socket_available }
+}
+
+fn read_topo(cpu_id: usize, file: &str) -> Option<usize> {
+    std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu_id}/topology/{file}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Returns one logical CPU id per **physical** core, HT siblings excluded.
+///
+/// Enumerates the real `/sys/devices/system/cpu/cpuN` entries — so it is correct for
+/// any SMT width (2/4/8) and for sparse/high CPU ids (e.g. a cgroup cpuset), unlike a
+/// `0..N*2` scan. Dedups by **(package, core)**, not `core_id` alone, so cores on a
+/// second socket (where `core_id` repeats) are not collapsed.
+///
+/// Falls back to `0..num_cpus::get_physical()` if `/sys` is unavailable.
+pub fn physical_cores() -> Vec<usize> {
+    let mut ids: Vec<usize> = match std::fs::read_dir("/sys/devices/system/cpu") {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let digits = name.strip_prefix("cpu")?;
+                if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                    digits.parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => return (0..num_cpus::get_physical()).collect(),
+    };
+    ids.sort_unstable();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut cores = Vec::new();
+    for cpu_id in ids {
+        if let Some(core) = read_topo(cpu_id, "core_id") {
+            let pkg = read_topo(cpu_id, "physical_package_id").unwrap_or(0);
+            if seen.insert((pkg, core)) {
+                cores.push(cpu_id);
+            }
+        }
+    }
+
+    if cores.is_empty() {
+        cores = (0..num_cpus::get_physical()).collect();
+    }
+    cores
+}
+
+fn read_proc_meminfo_avail_mb() -> u64 {
+    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return kb / 1024;
+        }
+    }
+    0
+}
+
+pub fn read_proc_meminfo_total_and_avail_kb() -> (u64, u64) {
+    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut total = 0u64;
+    let mut avail = 0u64;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            avail = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    (total, avail)
+}
+
+fn probe_xdp_support() -> bool {
+    // AF_XDP = 44 on Linux
+    let fd = unsafe { libc::socket(44, libc::SOCK_RAW, 0) };
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        true
+    } else {
+        false
+    }
+}
+
+/// Returns the NUMA node of a logical CPU ID by reading sysfs topology links.
+/// `/sys/devices/system/cpu/cpuN/node*` — the matching symlink gives the node.
+pub fn numa_node_for_cpu(cpu_id: usize) -> Option<usize> {
+    let dir = format!("/sys/devices/system/cpu/cpu{}", cpu_id);
+    for entry in std::fs::read_dir(&dir).ok()? {
+        let name = entry.ok()?.file_name();
+        let s = name.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("node") {
+            if let Ok(n) = rest.parse::<usize>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Returns the NUMA node closest to a network interface's PCIe slot.
+/// Reads `/sys/class/net/<iface>/device/numa_node`.
+/// Returns `None` for loopback, virtual interfaces, or single-NUMA systems.
+pub fn numa_node_for_iface(iface: &str) -> Option<usize> {
+    let path = format!("/sys/class/net/{}/device/numa_node", iface);
+    let s = std::fs::read_to_string(&path).ok()?;
+    let n: i32 = s.trim().parse().ok()?;
+    if n < 0 { None } else { Some(n as usize) }
+}
+
+/// Find the network interface that routes to `addr` via `/proc/net/route`.
+/// Returns the default-route interface if no specific route matches.
+pub fn iface_for_addr(addr: std::net::IpAddr) -> Option<String> {
+    let content = std::fs::read_to_string("/proc/net/route").ok()?;
+    // loopback — always lo, no useful NUMA info
+    if addr.is_loopback() { return None; }
+    let v4 = match addr {
+        std::net::IpAddr::V4(a) => u32::from(a),
+        std::net::IpAddr::V6(_) => {
+            // The /proc/net/route lookup is IPv4-only, so we cannot map an IPv6 target
+            // to its NIC/NUMA node — NUMA-local pinning is skipped. Warn once.
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| eprintln!(
+                "[dnsmark] IPv6 target: NUMA-local CPU pinning skipped (route lookup is \
+                 IPv4-only); workers still run, just not NUMA-pinned"));
+            return None;
+        }
+    };
+    let mut default_iface: Option<String> = None;
+    for line in content.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 { continue; }
+        let iface = cols[0];
+        let dest = u32::from_be(u32::from_str_radix(cols[1], 16).unwrap_or(u32::MAX));
+        let mask = u32::from_be(u32::from_str_radix(cols[7], 16).unwrap_or(0));
+        if dest == 0 && mask == 0 {
+            default_iface = Some(iface.to_string());
+            continue;
+        }
+        if (v4 & mask) == (dest & mask) {
+            return Some(iface.to_string());
+        }
+    }
+    default_iface
+}
+
+/// All logical CPUs (incl. HT siblings) belonging to NUMA `node`, from
+/// `/sys/devices/system/node/nodeN/cpulist` (e.g. "1,3,5-9,41-49").
+pub fn logical_cpus_for_node(node: usize) -> Vec<usize> {
+    let s = std::fs::read_to_string(format!("/sys/devices/system/node/node{node}/cpulist"))
+        .unwrap_or_default();
+    let mut v = Vec::new();
+    for part in s.trim().split(',') {
+        if part.is_empty() { continue; }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                v.extend(a..=b);
+            }
+        } else if let Ok(a) = part.trim().parse::<usize>() {
+            v.push(a);
+        }
+    }
+    v
+}
+
+/// Physical cores sorted by NUMA locality to `preferred_node`.
+/// NUMA-local cores come first; remote cores follow.
+/// Falls back to `physical_cores()` when NUMA info is unavailable.
+pub fn physical_cores_numa_sorted(preferred_node: Option<usize>) -> Vec<usize> {
+    let cores = physical_cores();
+    let Some(preferred) = preferred_node else { return cores; };
+    let mut local: Vec<usize> = Vec::new();
+    let mut remote: Vec<usize> = Vec::new();
+    for &cpu in &cores {
+        match numa_node_for_cpu(cpu) {
+            Some(n) if n == preferred => local.push(cpu),
+            _ => remote.push(cpu),
+        }
+    }
+    local.extend(remote);
+    local
+}
+
+// ── Host environment capture (issue #6) ─────────────────────────────────────
+
+/// First "model name" line from /proc/cpuinfo (x86); None on arches without it.
+pub fn cpu_model_name() -> Option<String> {
+    let txt = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    for line in txt.lines() {
+        if let Some(v) = line.strip_prefix("model name") {
+            return Some(v.trim_start_matches([':', ' ', '\t']).trim().to_string());
+        }
+    }
+    None
+}
+
+/// Number of NUMA nodes (`/sys/devices/system/node/nodeN`); 1 if unknown.
+pub fn numa_node_count() -> usize {
+    let mut n = 0usize;
+    if let Ok(rd) = std::fs::read_dir("/sys/devices/system/node") {
+        for e in rd.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if name.len() > 4 && name.starts_with("node")
+                    && name[4..].chars().all(|c| c.is_ascii_digit())
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n.max(1)
+}
+
+/// Kernel driver bound to `iface` (basename of `.../device/driver`).
+pub fn nic_driver(iface: &str) -> Option<String> {
+    let link = std::fs::read_link(format!("/sys/class/net/{iface}/device/driver")).ok()?;
+    link.file_name()?.to_str().map(|s| s.to_string())
+}
+
+/// Link speed in Mb/s from `/sys/class/net/<if>/speed` (None if down/unknown).
+pub fn nic_speed_mbps(iface: &str) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/speed")).ok()?;
+    match s.trim().parse::<i64>().ok()? {
+        v if v > 0 => Some(v as u64),
+        _ => None,
+    }
+}
+
+/// JSON snapshot of the **generator** host + the egress NIC toward `target`.
+pub fn host_info_json(target: std::net::IpAddr) -> serde_json::Value {
+    let (mem_total_kb, _) = read_proc_meminfo_total_and_avail_kb();
+    let nic = iface_for_addr(target).map(|ifc| serde_json::json!({
+        "iface":      ifc,
+        "driver":     nic_driver(&ifc),
+        "speed_mbps": nic_speed_mbps(&ifc),
+        "numa_node":  numa_node_for_iface(&ifc),
+    }));
+    serde_json::json!({
+        "role": "generator (the host running dnsmark)",
+        "cpu": {
+            "model":           cpu_model_name(),
+            "physical_cores":  num_cpus::get_physical(),
+            "logical_threads": num_cpus::get(),
+        },
+        "numa_nodes":   numa_node_count(),
+        "mem_total_mb": mem_total_kb / 1024,
+        "nic":          nic,
+    })
+}
+
+/// One-line host banner at startup (stderr), companion to `log_simd_info()`.
+pub fn log_host_info(target: std::net::IpAddr) {
+    let model = cpu_model_name().unwrap_or_else(|| "unknown CPU".into());
+    let nic = iface_for_addr(target)
+        .map(|i| format!("{} ({}, {})",
+            i,
+            nic_driver(&i).unwrap_or_else(|| "?".into()),
+            nic_speed_mbps(&i).map(|s| format!("{s}Mb/s")).unwrap_or_else(|| "?".into())))
+        .unwrap_or_else(|| "n/a".into());
+    eprintln!(
+        "[dnsmark] host: {} ({}c/{}t, {} NUMA) | egress NIC: {}",
+        model, num_cpus::get_physical(), num_cpus::get(), numa_node_count(), nic
+    );
+}
+
+/// True iff this host is a Xeon E5 v2 (Ivy Bridge-EP, CPU family 6 model 62) AND
+/// `iface` is driven by ixgbe (Intel 82599 / X520). That exact combination has a
+/// QPI bottleneck that collapses the AF_XDP zero-copy datapath beyond ~16 busy
+/// cores (10 NIC-local + 6 cross-NUMA), so the worker budget is capped to 16 for
+/// it specifically. Every other CPU/NIC keeps the normal per-port budget.
+///
+/// Retained for reference / future tuning: since #15-P2 each NIC pins strictly to its
+/// own NUMA-local physical cores (no cross-node spill), so the special-case cap is no
+/// longer wired into the worker budget.
+#[allow(dead_code)]
+pub fn is_xeon_v2_x520(iface: &str) -> bool {
+    let xeon_v2 = std::fs::read_to_string("/proc/cpuinfo").map(|s| {
+        let f6 = s.lines().any(|l| l.starts_with("cpu family")
+            && l.split(':').nth(1).map(|v| v.trim() == "6").unwrap_or(false));
+        let m62 = s.lines().any(|l| l.starts_with("model") && !l.starts_with("model name")
+            && l.split(':').nth(1).map(|v| v.trim() == "62").unwrap_or(false));
+        f6 && m62
+    }).unwrap_or(false);
+    if !xeon_v2 { return false; }
+    if iface.is_empty() || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return false;
+    }
+    std::fs::read_link(format!("/sys/class/net/{iface}/device/driver/module"))
+        .map(|pth| pth.to_string_lossy().contains("ixgbe")).unwrap_or(false)
+}

@@ -1,0 +1,349 @@
+===================================================================
+dnsmark multi-server comparison — Wed Jun 24 06:32:43 PM UTC 2026
+Rig: dragonsage X710 (10.71.20.2) → vm-dr ens19 (10.71.20.50/192.168.8.242)
+Tools: [dnsmark] CPU SIMD: SSE4.2 | sse4.2=true avx2=false avx512f=false, dnsperf DNS Performance Testing Tool
+Corpus: /root/corpus-dnsperf.txt (10000 domains)
+===================================================================
+
+=== [BASELINE] ping RTT ===
+10 packets transmitted, 10 received, 0% packet loss, time 940ms
+rtt min/avg/max/mdev = 0.079/0.091/0.172/0.027 ms
+
+===================================================================
+SERVER: unbound-1.22.0
+===================================================================
+UNCONN 0      0            0.0.0.0:5355      0.0.0.0:*    users:(("systemd-resolve",pid=6378,fd=11))
+UNCONN 0      0        10.71.20.50:53        0.0.0.0:*    users:(("unbound",pid=9752,fd=17))        
+  [pre-warm] unbound-1.22.0: dnsperf 5K q/s × 120s (all 10K domains → cache)
+  Response codes:       NOERROR 106134 (21.04%), SERVFAIL 397962 (78.90%), NXDOMAIN 306 (0.06%)
+  Queries per second:   4203.348564
+  [pre-warm] wait 10s for cache to settle
+
+=== [A] DSD reproducibility (unbound-1.22.0, 3 runs) ===
+
+--- DSD run 1/3 [ts=1782326101] ---
+  Idle latency:  0.070 ms   (floor — minimum p50 observed)
+  Capacity:            307.0K  (NIC-verified — max replies/s on the wire)
+  Within SLO:          307.0K  (p50 stays under 1.07 ms at this rate)
+  DSD done [ts=1782326206]
+
+--- DSD run 2/3 [ts=1782326209] ---
+  Idle latency:  0.072 ms   (floor — minimum p50 observed)
+  Capacity:            323.8K  (NIC-verified — max replies/s on the wire)
+  Within SLO:          323.8K  (p50 stays under 1.07 ms at this rate)
+  DSD done [ts=1782326314]
+
+--- DSD run 3/3 [ts=1782326317] ---
+  Idle latency:  0.068 ms   (floor — minimum p50 observed)
+  Capacity:            376.3K  (NIC-verified — max replies/s on the wire)
+  Within SLO:          376.3K  (p50 stays under 1.07 ms at this rate)
+  DSD done [ts=1782326422]
+
+=== [B] Load-latency curve (unbound-1.22.0, 9 QPS points) ===
+
+--- 50000 q/s [ts=1782326425] ---
+  Send throughput (egress):  50000 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      50000 qps  (100.0% of egress, userspace)
+    min:       0.034 ms
+    avg:       0.060 ms
+    p50:       0.059 ms
+    p99:       0.083 ms
+  done [ts=1782326448]
+
+--- 100000 q/s [ts=1782326448] ---
+  Send throughput (egress):  100000 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      100000 qps  (100.0% of egress, userspace)
+    min:       0.033 ms
+    avg:       0.070 ms
+    p50:       0.069 ms
+    p99:       0.103 ms
+  done [ts=1782326471]
+
+--- 150000 q/s [ts=1782326471] ---
+  Send throughput (egress):  150001 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      150000 qps  (100.0% of egress, userspace)
+    min:       0.033 ms
+    avg:       0.120 ms
+    p50:       0.106 ms
+    p99:       0.259 ms
+  done [ts=1782326494]
+
+--- 200000 q/s [ts=1782326494] ---
+  Send throughput (egress):  199775 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      199750 qps  (100.0% of egress, userspace)
+    min:       0.038 ms
+    avg:       0.245 ms
+    p50:       0.141 ms
+    p99:       3.419 ms
+  done [ts=1782326517]
+
+--- 250000 q/s [ts=1782326517] ---
+  Send throughput (egress):  248537 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      248506 qps  (100.0% of egress, userspace)
+    min:       0.045 ms
+    avg:       0.319 ms
+    p50:       0.224 ms
+    p99:       3.413 ms
+  done [ts=1782326540]
+
+--- 290000 q/s [ts=1782326540] ---
+  Send throughput (egress):  251101 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      251065 qps  (100.0% of egress, userspace)
+    min:       0.037 ms
+    avg:       0.654 ms
+    p50:       0.256 ms
+    p99:       5.819 ms
+  done [ts=1782326563]
+
+--- 310000 q/s [ts=1782326563] ---
+  Send throughput (egress):  309964 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      309953 qps  (100.0% of egress, userspace)
+    min:       0.096 ms
+    avg:       0.883 ms
+    p50:       0.830 ms
+    p99:       1.776 ms
+  done [ts=1782326586]
+
+--- 330000 q/s [ts=1782326586] ---
+  Send throughput (egress):  314564 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      314570 qps  (100.0% of egress, userspace)
+    min:       0.072 ms
+    avg:       4.001 ms
+    p50:       3.983 ms
+    p99:       4.663 ms
+  done [ts=1782326610]
+
+--- 380000 q/s [ts=1782326610] ---
+  Send throughput (egress):  306038 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      306038 qps  (100.0% of egress, userspace)
+    min:       0.146 ms
+    avg:       5.055 ms
+    p50:       5.027 ms
+    p99:       5.467 ms
+  done [ts=1782326633]
+
+=== [C] dnsperf concurrency sweep (unbound-1.22.0) ===
+(shows how the reported QPS varies with -c, before knowing the ceiling)
+
+--- dnsperf -c 5 -T 5 -l 20 [ts=1782326633] ---
+  Response codes:       NOERROR 240163 (4.32%), SERVFAIL 5315443 (95.63%), NXDOMAIN 2780 (0.05%)
+  Queries per second:   277915.756574
+  Average Latency (s):  0.000345 (min 0.000078, max 0.001058)
+  done [ts=1782326653]
+
+--- dnsperf -c 20 -T 20 -l 20 [ts=1782326653] ---
+  Response codes:       NOERROR 239980 (4.31%), SERVFAIL 5322719 (95.64%), NXDOMAIN 2785 (0.05%)
+  Queries per second:   278269.845077
+  Average Latency (s):  0.000335 (min 0.000080, max 0.001732)
+  done [ts=1782326673]
+
+--- dnsperf -c 50 -T 50 -l 20 [ts=1782326673] ---
+  Response codes:       NOERROR 234457 (4.29%), SERVFAIL 5234329 (95.67%), NXDOMAIN 2293 (0.04%)
+  Queries per second:   273545.880397
+  Average Latency (s):  0.000340 (min 0.000061, max 0.004672)
+  done [ts=1782326693]
+
+--- dnsperf -c 200 -T 200 -l 20 [ts=1782326693] ---
+  Response codes:       NOERROR 229663 (4.23%), SERVFAIL 5198853 (95.73%), NXDOMAIN 2173 (0.04%)
+  Queries per second:   271464.792134
+  Average Latency (s):  0.000338 (min 0.000000, max 0.005563)
+  done [ts=1782326713]
+
+=== [D] dnsperf fixed QPS (unbound-1.22.0) ===
+
+--- dnsperf -Q 50000 -l 20 [ts=1782326713] ---
+  Queries per second:   49999.912500
+  Average Latency (s):  0.000099 (min 0.000053, max 0.000371)
+  Latency StdDev (s):   0.000011
+  done [ts=1782326733]
+
+--- dnsperf -Q 100000 -l 20 [ts=1782326733] ---
+  Queries per second:   99999.235003
+  Average Latency (s):  0.000084 (min 0.000044, max 0.000786)
+  Latency StdDev (s):   0.000012
+  done [ts=1782326753]
+
+--- dnsperf -Q 200000 -l 20 [ts=1782326753] ---
+  Queries per second:   185066.122061
+  Average Latency (s):  0.000226 (min 0.000040, max 0.003093)
+  Latency StdDev (s):   0.000224
+  done [ts=1782326773]
+
+--- dnsperf -Q 280000 -l 20 [ts=1782326773] ---
+  Queries per second:   245040.636000
+  Average Latency (s):  0.000257 (min 0.000043, max 0.003750)
+  Latency StdDev (s):   0.000190
+  done [ts=1782326793]
+
+===================================================================
+SERVER: bind9-9.20.23
+===================================================================
+UNCONN 0      0            0.0.0.0:5355      0.0.0.0:*    users:(("systemd-resolve",pid=6378,fd=11))
+UNCONN 0      0        10.71.20.50:53        0.0.0.0:*    users:(("named",pid=10317,fd=95))         
+  [pre-warm] bind9-9.20.23: dnsperf 5K q/s × 120s (all 10K domains → cache)
+  Response codes:       NOERROR 1966 (99.85%), SERVFAIL 1 (0.05%), NXDOMAIN 2 (0.10%)
+  Queries per second:   16.139672
+  [pre-warm] wait 10s for cache to settle
+
+=== [A] DSD reproducibility (bind9-9.20.23, 3 runs) ===
+
+--- DSD run 1/3 [ts=1782326935] ---
+  Idle latency:  0.106 ms   (floor — minimum p50 observed)
+  Capacity:               161  (NIC-verified — max replies/s on the wire)
+  Within SLO:             161  (p50 stays under 1.11 ms at this rate)
+  DSD done [ts=1782327040]
+
+--- DSD run 2/3 [ts=1782327043] ---
+  Idle latency:  0.087 ms   (floor — minimum p50 observed)
+  Capacity:              2.4K  (NIC-verified — max replies/s on the wire)
+  Within SLO:             114  (p50 stays under 1.09 ms at this rate)
+Knee bracket (DSD bisection): [198400000 ; 204800000] q/s  (±1.6%)
+  DSD done [ts=1782327128]
+
+--- DSD run 3/3 [ts=1782327131] ---
+  Idle latency:  0.060 ms   (floor — minimum p50 observed)
+  Capacity:               957  (NIC-verified — max replies/s on the wire)
+  Within SLO:             957  (p50 stays under 1.06 ms at this rate)
+  DSD done [ts=1782327236]
+
+=== [B] Load-latency curve (bind9-9.20.23, 9 QPS points) ===
+
+--- 50000 q/s [ts=1782327239] ---
+  Send throughput (egress):  39332 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      39264 qps  (99.8% of egress, userspace)
+    min:       0.041 ms
+    avg:       16.169 ms
+    p50:       0.073 ms
+    p99:       511.231 ms
+  done [ts=1782327262]
+
+--- 100000 q/s [ts=1782327262] ---
+  Send throughput (egress):  97540 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      97462 qps  (99.9% of egress, userspace)
+    min:       0.039 ms
+    avg:       7.248 ms
+    p50:       0.085 ms
+    p99:       214.271 ms
+  done [ts=1782327285]
+
+--- 150000 q/s [ts=1782327285] ---
+  Send throughput (egress):  130962 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      130800 qps  (99.9% of egress, userspace)
+    min:       0.040 ms
+    avg:       5.603 ms
+    p50:       0.109 ms
+    p99:       74.495 ms
+  done [ts=1782327308]
+
+--- 200000 q/s [ts=1782327308] ---
+  Send throughput (egress):  123627 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      123506 qps  (99.9% of egress, userspace)
+    min:       0.038 ms
+    avg:       6.346 ms
+    p50:       0.118 ms
+    p99:       121.343 ms
+  done [ts=1782327331]
+
+--- 250000 q/s [ts=1782327331] ---
+  Send throughput (egress):  114050 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      113766 qps  (99.8% of egress, userspace)
+    min:       0.037 ms
+    avg:       1.700 ms
+    p50:       0.118 ms
+    p99:       7.263 ms
+  done [ts=1782327354]
+
+--- 290000 q/s [ts=1782327354] ---
+  Send throughput (egress):  116896 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      116565 qps  (99.7% of egress, userspace)
+    min:       0.038 ms
+    avg:       2.772 ms
+    p50:       0.132 ms
+    p99:       12.967 ms
+  done [ts=1782327377]
+
+--- 310000 q/s [ts=1782327377] ---
+  Send throughput (egress):  115314 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      115100 qps  (99.8% of egress, userspace)
+    min:       0.036 ms
+    avg:       4.738 ms
+    p50:       0.124 ms
+    p99:       20.127 ms
+  done [ts=1782327400]
+
+--- 330000 q/s [ts=1782327400] ---
+  Send throughput (egress):  152900 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      152683 qps  (99.9% of egress, userspace)
+    min:       0.038 ms
+    avg:       2.678 ms
+    p50:       0.246 ms
+    p99:       9.191 ms
+  done [ts=1782327424]
+
+--- 380000 q/s [ts=1782327424] ---
+  Send throughput (egress):  170347 qps  ← match this to rx_packets on receiver NIC
+  Round-trip completed:      170193 qps  (99.9% of egress, userspace)
+    min:       0.039 ms
+    avg:       2.635 ms
+    p50:       0.210 ms
+    p99:       6.595 ms
+  done [ts=1782327447]
+
+=== [C] dnsperf concurrency sweep (bind9-9.20.23) ===
+(shows how the reported QPS varies with -c, before knowing the ceiling)
+
+--- dnsperf -c 5 -T 5 -l 20 [ts=1782327447] ---
+  Response codes:       NOERROR 2441 (94.39%), SERVFAIL 139 (5.38%), NXDOMAIN 6 (0.23%)
+  Queries per second:   128.539573
+  Average Latency (s):  0.086203 (min 0.000066, max 4.945700)
+  done [ts=1782327467]
+
+--- dnsperf -c 20 -T 20 -l 20 [ts=1782327467] ---
+  Response codes:       NOERROR 2223 (99.73%), NXDOMAIN 6 (0.27%)
+  Queries per second:   110.309505
+  Average Latency (s):  0.000216 (min 0.000062, max 0.000611)
+  done [ts=1782327487]
+
+--- dnsperf -c 50 -T 50 -l 20 [ts=1782327487] ---
+  Response codes:       NOERROR 2138 (99.77%), NXDOMAIN 5 (0.23%)
+  Queries per second:   106.538294
+  Average Latency (s):  0.000201 (min 0.000062, max 0.001025)
+  done [ts=1782327507]
+
+--- dnsperf -c 200 -T 200 -l 20 [ts=1782327507] ---
+  Response codes:       NOERROR 696 (99.86%), NXDOMAIN 1 (0.14%)
+  Queries per second:   34.662604
+  Average Latency (s):  0.000191 (min 0.000000, max 0.000942)
+  done [ts=1782327528]
+
+=== [D] dnsperf fixed QPS (bind9-9.20.23) ===
+
+--- dnsperf -Q 50000 -l 20 [ts=1782327528] ---
+  Queries per second:   32.366530
+  Average Latency (s):  0.000225 (min 0.000061, max 0.000876)
+  Latency StdDev (s):   0.000169
+  done [ts=1782327548]
+
+--- dnsperf -Q 100000 -l 20 [ts=1782327548] ---
+  Queries per second:   30.133945
+  Average Latency (s):  0.000204 (min 0.000061, max 0.000600)
+  Latency StdDev (s):   0.000129
+  done [ts=1782327568]
+
+--- dnsperf -Q 200000 -l 20 [ts=1782327568] ---
+  Queries per second:   28.893358
+  Average Latency (s):  0.000225 (min 0.000056, max 0.000568)
+  Latency StdDev (s):   0.000134
+  done [ts=1782327588]
+
+--- dnsperf -Q 280000 -l 20 [ts=1782327588] ---
+  Queries per second:   26.258729
+  Average Latency (s):  0.000274 (min 0.000065, max 0.000811)
+  Latency StdDev (s):   0.000155
+  done [ts=1782327609]
+
+=== [CLEANUP] restoring unbound ===
+
+===================================================================
+Campaign complete — Wed Jun 24 07:00:11 PM UTC 2026
+===================================================================

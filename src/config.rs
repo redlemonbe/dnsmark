@@ -1,0 +1,63 @@
+use std::net::IpAddr;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protocol {
+    Udp,
+    Tcp,
+    Dot,
+}
+
+impl Protocol {
+    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "udp" => Ok(Self::Udp),
+            "tcp" => Ok(Self::Tcp),
+            "dot" => Ok(Self::Dot),
+            other => anyhow::bail!("unknown protocol '{}', use udp|tcp|dot", other),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Udp => "UDP",
+            Self::Tcp => "TCP",
+            Self::Dot => "DoT",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Config {
+    /// Primary target (first -s). Kept for backward-compat with mono-NIC code paths.
+    pub server: IpAddr,
+    /// All targets including primary. Multi-NIC: one XDP stack per entry.
+    /// Single entry = legacy mono-NIC behaviour (no code-path change).
+    pub servers: Vec<IpAddr>,
+    pub port: u16,
+    pub query_file: Option<PathBuf>,
+    pub concurrent: usize,
+    pub qps: u64,
+    pub duration_secs: u64,
+    pub timeout_ms: u64,
+    pub threads: usize,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub stats_interval_secs: u64,
+    pub ramp: bool,
+    pub random: bool,
+    pub random_domain: String,
+    pub random_qtype: u16,
+    pub compare: Option<IpAddr>,
+    pub protocol: Protocol,
+    pub json_output: bool,
+    pub csv_file: Option<PathBuf>,
+    pub no_tui: bool,
+    pub force_xdp: bool,
+    pub no_xdp: bool,
+    /// Max outstanding queries per worker (0 = unlimited). Mirrors dnsperf -q.
+    pub max_outstanding: usize,
+    /// Show per-NIC stats breakdown in multi-NIC mode.
+    pub nic_stats: bool,
+}
