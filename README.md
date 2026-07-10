@@ -17,13 +17,13 @@
 - **Line-rate generation.** An optional zero-copy AF_XDP datapath drives a NIC at line
   rate when you need to saturate a fast server — beyond what a kernel-socket generator
   reaches.
-- **Line-rate awareness (v2.7.1).** dnsmark states, from its own hardware observations,
+- **Line-rate awareness.** dnsmark states, from its own hardware observations,
   whether a run is limited by the Ethernet link or by the server. It divides the
   authoritative rate (`server_rx_qps`) by the line-rate ceiling computed from the average
   on-wire reply size and the egress-NIC link speed, and reports a **`% of line rate`** with
   a verdict: **wire-bound** (≥ 90 % — the link is the wall) or **link-headroom** (< 90 % —
   the server or the generator is the limit, not the wire). Self-contained: no receiver-side
-  reading, works in AF_XDP and kernel-UDP. Since v2.7.2 the line-rate verdict is emitted
+  reading, works in AF_XDP and kernel-UDP. The line-rate verdict is emitted
   **only for fixed/flood runs, not in `--ramp`** — under `--ramp` the DSD Capacity / Within
   SLO / Knee bracket is the throughput answer.
 - **Honest latency.** Timeouts and end-of-run in-flight queries are counted as **losses**
@@ -45,7 +45,7 @@ see the [whitepaper](docs/WHITEPAPER.md).
 
 ---
 
-## Measured — server ceilings (2026-07-03, v2.7.5)
+## Measured — server ceilings (2026-07-03)
 
 Four resolvers in strict parity (forward+cache, DNSSEC off, 100k-domain corpus warmed to
 all-cache-hit), single 10 GbE Intel X710 (i40e), driven by four generators. **Truth =
@@ -125,14 +125,14 @@ A closed-loop generator's reported RTT is **`server processing + network + the t
 
 dnsmark's client path is deliberately light (batched `recvmmsg`, a tight send/poll loop), so its figure sits close to the wire — but the **wire**, not any tool, is the reference.
 
-**Line-rate awareness (v2.7.1).** Building directly on the authoritative `server_rx_qps`,
+**Line-rate awareness.** Building directly on the authoritative `server_rx_qps`,
 dnsmark reports whether a run is limited by the Ethernet link or by the server. It divides
 `server_rx_qps` by a line-rate ceiling computed from the **average on-wire reply size**
 (`rx_bytes / rx_packets` from the same egress-NIC hardware counters) and the NIC's link
 speed. The result is a `% of line rate` and a verdict: **wire-bound** at ≥ 90 % (the link is
 the limit) or **link-headroom** below (the server or the generator is, not the wire). It
-needs no receiver-side reading and works on both the AF_XDP and kernel-UDP paths. Since
-v2.7.2 the verdict is printed **only for fixed/flood runs, not in `--ramp`**: in `--ramp`,
+needs no receiver-side reading and works on both the AF_XDP and kernel-UDP paths. The
+verdict is printed **only for fixed/flood runs, not in `--ramp`**: in `--ramp`,
 `server_rx_qps` averages the whole ramp-up and sits far below the peak, so a line-rate % there
 would contradict the DSD's own Capacity summary — under `--ramp` the DSD Capacity / Within
 SLO / Knee bracket is the throughput answer, and the line-rate line appears only in fixed/flood
@@ -216,7 +216,7 @@ sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which dnsmark)
 
 # zero-copy flood, all NIC-local cores
 # --xdp defaults to firehose (--max-outstanding 0) and auto-confines to the NIC's NUMA
-# node — no numactl, no DNSMARK_SPORT_SPREAD, no ethtool tuning needed (since v2.5.0).
+# node — no numactl, no DNSMARK_SPORT_SPREAD, no ethtool tuning needed.
 dnsmark -s 10.0.0.2 -d queries.txt --xdp
 ```
 
@@ -250,8 +250,7 @@ the provider delivers the private network tagged). AF_XDP zero-copy cannot bind 
 VLAN sub-interface, so dnsmark binds the **physical parent** and bakes the tag into
 the frame template. **Experimental**: the frame layout is unit-tested and a tagged
 resolver round trip is proven end-to-end, but tagged generation has not been
-validated at line rate (no zero-copy-capable tagged NIC was available — see
-CHANGELOG 2.2.0).
+validated at line rate (no zero-copy-capable tagged NIC was available).
 
 ### Link bonding is not supported (XDP limitation)
 
@@ -261,7 +260,7 @@ frames across bond members (the second member becomes a black hole).
 
 **Native multi-NIC — saturate 2×10G from one process.** Repeat `-s`, one target per
 physical port (each on its own subnet routed via its own NIC). A single dnsmark instance
-drives one AF_XDP stack per card; since v2.5.0 each stack pins to **its own NIC's NUMA
+drives one AF_XDP stack per card; each stack pins to **its own NIC's NUMA
 node** (per-node core cursor), so two cards on separate PCIe buses / sockets scale
 independently:
 
@@ -298,18 +297,15 @@ rings instead of pinning the whole single-source flood to one queue → one core
 82599's RSS caps at 16 rings). For a single-flow / single-core test, run a single
 worker (`-c 1`).
 
-**Generator-side AF_XDP RX (responses) — accurate since v2.5.0.** With `--xdp`, dnsmark
-also *receives* responses over AF_XDP. Earlier versions funnelled all responses onto a
-single queue (`ethtool -X equal 1`) and matched them per-worker, so one TX-busy worker
-drained only a fraction of the arriving replies → the headline round-trip under-counted a
-fast server (#15). Since v2.5.0 the firehose path spreads the RETA across **all** worker
-queues, and each worker counts the responses on its own queue (no cross-core match), so the
-round-trip tracks the server's real reply rate. No manual tuning is required.
+**Generator-side AF_XDP RX (responses).** With `--xdp`, dnsmark also *receives* responses
+over AF_XDP. The firehose path spreads the RETA across **all** worker queues, and each
+worker counts the responses on its own queue (no cross-core match), so the round-trip tracks
+the server's real reply rate. No manual tuning is required.
 
 In addition, dnsmark reports an **authoritative `Server throughput (NIC rx)`** =
-`rx_packets + rx_missed_errors` on the return NIC(s): this counts every reply that reached
-the wire, even those the kernel later drops at the socket, so it equals the server's real
-reply rate without reading the remote host. When the userspace round-trip is lower (kernel
+`rx_packets + rx_missed_errors + rx_fifo_errors + rx_over_errors` on the return NIC(s): this
+counts every reply that reached the wire, even those the kernel later drops at the socket, so
+it equals the server's real reply rate without reading the remote host. When the userspace round-trip is lower (kernel
 socket / NIC-ring overflow, or a non-NUMA-local stack), dnsmark prints a NOTE and the NIC-rx
 figure is the truth.
 
@@ -359,7 +355,7 @@ saturation, and would trip a tail-based test prematurely. Each step measures its
 (the latency histogram is reset per step), so the percentiles are the load *at that step*,
 never a cumulative blur.
 
-**What the DSD Capacity means depends on the datapath (v2.7.3).** The `--xdp` ramp is an
+**What the DSD Capacity means depends on the datapath.** The `--xdp` ramp is an
 **open-loop firehose with a lossless zero-copy RX**, so its Capacity genuinely *is* the max
 replies/s on the wire (labelled *NIC-verified*). The kernel-UDP ramp (default transport /
 auto-DSD) is a different animal: it is a **gated closed loop** (dnsperf-comparable,
@@ -390,7 +386,7 @@ A real `--xdp` firehose run against a warmed resolver on a single 10 GbE X710 (l
 latency):
 
 ```
-DNS Performance Testing Tool — dnsmark 2.7.5
+DNS Performance Testing Tool — dnsmark 1.0.0
 [DISCLAIMER: authorized testing only]
 
 Parameters:

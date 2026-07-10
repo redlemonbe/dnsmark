@@ -20,7 +20,7 @@ tool *reports*, and how far that is from what the receiver's NIC actually counte
 Latency is deliberately out of scope here: this note is about throughput and counters, and a
 defensible p50/p95/p99 must be anchored to a tcpdump wire capture (methodology rule 7) — a
 separate measurement, a separate document. The current head-to-head result is the
-[v2.7.5 four-server campaign](#v275-kxdpgun-vs-dnsmark-xdp-across-4-servers--both-read-the-truth-at-the-nic-2026-07-03).
+[2026-07-03 four-server campaign](#kxdpgun-vs-dnsmark-xdp-across-4-servers--both-read-the-truth-at-the-nic-2026-07-03).
 
 ## What the two tools are for
 
@@ -101,10 +101,10 @@ fixed/flood, never in `--ramp`.
 
 ---
 
-## v2.7.5: kxdpgun vs dnsmark-xdp across 4 servers — both read the truth at the NIC (2026-07-03)
+## kxdpgun vs dnsmark-xdp across 4 servers — both read the truth at the NIC (2026-07-03)
 
 The primary, current result. Same single-link X710 rig and methodology as above, but now the
-two open-loop AF_XDP generators — **kxdpgun 3.4.6** and **dnsmark 2.7.5 `--xdp`** — are pointed
+two open-loop AF_XDP generators — **kxdpgun 3.4.6** and **dnsmark `--xdp`** — are pointed
 at **four servers in strict parity** (all forward+cache to 1.1.1.1 / 8.8.8.8 / 9.9.9.9, DNSSEC
 off, minimal-responses, large cache; the 100k-domain corpus warmed first so every measured
 query is a cache hit). This is the head-to-head the whole document has been building toward:
@@ -116,12 +116,12 @@ two AF_XDP flooders, four servers, one truth counter.
 wire, the same datapath- and tool-independent measure used throughout. dnsmark also self-reports
 it as `server_rx_qps`.
 
-**Generator commands:** dnsmark 2.7.5 XDP firehose `--xdp -Q 13M
+**Generator commands:** dnsmark XDP firehose `--xdp -Q 13M
 --max-outstanding 0`; kxdpgun 3.4.6 `-Q 13M`.
 
 Server throughput (qps) measured at the receiver NIC tx, the two AF_XDP columns side by side:
 
-| Server | dnsmark-xdp (2.7.5) | kxdpgun (3.4.6) |
+| Server | dnsmark-xdp | kxdpgun (3.4.6) |
 |--------|--------------------:|----------------:|
 | BIND9 9.x | **872 k** | **1.03 M** |
 | Unbound 1.22 | 3.06 M | 2.80 M |
@@ -160,4 +160,4 @@ that receiver-NIC-tx truth.
 
 ---
 
-*Current version: **v2.7.5**.*
+*Current version: **v1.0**.*

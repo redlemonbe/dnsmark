@@ -6,7 +6,7 @@ agree with independent references (NIC hardware counters and dnsperf), and what 
 dimension of the tool is checked against.
 
 > **Latest measured results:** the numbers from any given campaign live with that
-> campaign. The current reference dataset is the 2026-07-03 dnsmark v2.7.5 four-server ×
+> campaign. The current reference dataset is the 2026-07-03 dnsmark four-server ×
 > four-generator open-loop campaign — see `docs/benchmarking.md` §6 and the
 > cross-validation write-up in `docs/cross-validation-dnsperf.md` §4 (kxdpgun 3.4.6
 > cross-validated on all four servers at the receiver NIC). This document intentionally
@@ -78,7 +78,7 @@ confirms both figures against the NIC, not that they are equal.
 
 > Note on kxdpgun: an early attempt to cross-validate kxdpgun failed due to a script
 > timing bug (measurement window DT=0) that prevented NIC-counter extraction. It was
-> subsequently cross-validated on all four servers in the v2.7.5 campaign
+> subsequently cross-validated on all four servers in the 2026-07-03 campaign
 > (`docs/cross-validation-dnsperf.md` §4).
 
 ---
@@ -143,5 +143,5 @@ General procedure (server-, corpus-, and rig-independent):
 4. Run the four checks above (§1–§4), each against its independent reference.
 5. Read NIC hardware counters on the receiver for every throughput figure.
 
-For the current measured dataset produced with this procedure, see the v2.7.5 campaign in
+For the current measured dataset produced with this procedure, see the 2026-07-03 campaign in
 `docs/benchmarking.md` §6 and `docs/cross-validation-dnsperf.md` §4.

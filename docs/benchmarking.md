@@ -12,7 +12,7 @@
 3. [Measuring Receiver Throughput Correctly](#3-measuring-receiver-throughput-correctly)
 4. [Interpreting Results](#4-interpreting-results)
 5. [Gotchas](#5-gotchas)
-6. [Reference Result](#6-reference-result--four-server-cross-generator-campaign-2026-07-03-dnsmark-v275)
+6. [Reference Result](#6-reference-result--four-server-cross-generator-campaign-2026-07-03)
 7. [Latency accuracy](#7-latency-accuracy--what-a-generator-actually-measures)
 
 ---
@@ -47,7 +47,7 @@ regardless of core count).
 
 ## 2. NIC & Host Tuning
 
-> **What `--xdp` now does for you (v2.5.0), generator-side:** CPU governor → `performance`,
+> **What `--xdp` does for you, generator-side:** CPU governor → `performance`,
 > auto-confine to the NIC's NUMA node (CPU + memory, single-NIC — replaces `numactl
 > --cpunodebind=N --membind=N`), source-port spread (internal, no `DNSMARK_SPORT_SPREAD`),
 > RSS RETA spread across the worker queues, one busy-poll worker per NIC-local core, and
@@ -84,7 +84,7 @@ collapsing throughput to a single core's worth. Adding source+destination ports
 dnsmark fans queries across the receiver's RSS queues. In **kernel mode** each
 worker sends from its own UDP source port (a kernel socket per `-c` worker). With
 **`--xdp`**, each worker **cycles its source port over a wide range**
-(`SPORT_SPREAD=2048`, **since v2.2.2**), so query traffic carries thousands of
+(`SPORT_SPREAD=2048`), so query traffic carries thousands of
 distinct 5-tuples and spreads across the receiver's full RSS — run enough workers
 to light up the queues. For single-queue / single-core testing, run a single worker
 (`-c 1`).
@@ -131,16 +131,16 @@ full clock during the burst — no code change involved.
 **Warm-up rule:** flood for at least **15 seconds** before sampling. DVFS
 transients, JIT compilation paths, and TLB cold-starts all resolve within that
 window. Sample only after the throughput curve flattens. (dnsmark's own auto
-warm-up default is now **5 s** as of v2.7.1, up from 3 s, so the reported rate is
-already steady-state; the 15 s rule above still applies to hand-run `ethtool -S`
-deltas.)
+warm-up default is **5 s**, so the reported rate is already steady-state; the 15 s
+rule above still applies to hand-run `ethtool -S` deltas.)
 
 ---
 
 ## 3. Measuring Receiver Throughput Correctly
 
-> **Since v2.5.0 dnsmark reports this for you.** The summary line
-> **`Server throughput (NIC rx)`** = `rx_packets + rx_missed_errors` on the generator's
+> **dnsmark reports this for you.** The summary line
+> **`Server throughput (NIC rx)`** = `rx_packets + rx_missed_errors + rx_fifo_errors +
+> rx_over_errors` on the generator's
 > return NIC(s) — the authoritative server reply rate (it counts replies the kernel later
 > drops at the socket, and adds back NIC ring-overflow drops). You no longer need the
 > manual `ethtool -S` delta below; it is kept as the explanation of *why* that line is the
@@ -148,7 +148,7 @@ deltas.)
 
 > **Why NIC rx is the truth, not userspace round-trip:** the `Round-trip completed`
 > counter can under-report a fast server when responses are funnelled onto one XSK
-> queue whose drain rate is far below the arrival rate. The firehose RX (v2.5.0+)
+> queue whose drain rate is far below the arrival rate. The firehose RX
 > spreads the RETA across all worker queues and counts per-queue, so round-trip now
 > tracks the NIC-rx truth. If `Round-trip completed` is still below `Server throughput
 > (NIC rx)` you are generator-RX-bound (kernel socket / NIC-ring overflow, or a
@@ -188,7 +188,7 @@ paste /tmp/nic_before.txt /tmp/nic_after.txt | \
   awk '/rx_queue_[0-9]+_packets/ { before=$2; getline; after=$2; total+=after-before } END { print total/10, "pps" }'
 ```
 
-### 3.3 Line-rate awareness — is the wire or the server the limit? (v2.7.3)
+### 3.3 Line-rate awareness — is the wire or the server the limit?
 
 > **Scope: the line-rate line and verdict are emitted for fixed/flood runs only,
 > never in `--ramp`.** In a fixed/flood run `server_rx_qps` reflects one steady
@@ -299,15 +299,13 @@ dos-à-dos). Use **medians** from multiple samples, not the peak reading.
 
 ## 5. Gotchas
 
-### 5.1 dnsmark < 1.2.1 — silent TX fallback
+### 5.1 ARP-unresolved TX fallback
 
-In versions before **1.2.1**, when the server's MAC address is not ARP-resolved,
-dnsmark silently falls back to the kernel `sendmmsg` path.
-`Queries sent` increments normally, but **nothing leaves the NIC**:
-`tx_bytes_nic` on the generator stays flat.
-
-**1.2.1 emits a loud `WARN`** when this fallback occurs. Always verify
-`tx_bytes_nic` on the generator side, regardless of version.
+When the server's MAC address is not ARP-resolved, dnsmark cannot build zero-copy
+frames and **falls back to the kernel `sendmmsg` path**, emitting a loud `WARN`.
+`Queries sent` increments normally, but **nothing leaves the NIC over zero-copy**:
+`tx_bytes_nic` on the generator stays flat. Always verify `tx_bytes_nic` on the
+generator side.
 
 ```bash
 # workaround: pin the ARP entry permanently
@@ -380,7 +378,7 @@ over the full duration:
 dnsmark -s <ip> -Q <C> -l 30
 ```
 
-### 5.6 kernel-UDP ramp Capacity is the closed-loop knee, not the raw ceiling (v2.7.3)
+### 5.6 kernel-UDP ramp Capacity is the closed-loop knee, not the raw ceiling
 
 The `--ramp` / auto-DSD **Capacity** figure means different things in the two
 transports, and conflating them under-reports the server by a large factor
@@ -392,7 +390,7 @@ own *kernel* receive path drops replies under load, so those slots never free,
 which clogs the outstanding budget and caps the **offered** rate well below the
 server's real capacity — typically several-fold below the open-loop NIC-verified
 figure. The resulting DSD figure is therefore the closed-loop SLO knee —
-**generator-recv bound** — not the server's raw ceiling. As of v2.7.3 it is
+**generator-recv bound** — not the server's raw ceiling. It is
 labelled accordingly:
 
 ```
@@ -429,7 +427,7 @@ is line-rate / wire-bound (§3.3, §4.2) and needs no relabelling.
 
 ---
 
-## 6. Reference Result — four-server cross-generator campaign, 2026-07-03 (dnsmark v2.7.5)
+## 6. Reference Result — four-server cross-generator campaign, 2026-07-03
 
 **This is the current, primary reference result.** Four DNS servers in strict
 parity, driven by four different generators, all scored by the same NIC-tx truth.

@@ -4,7 +4,7 @@
 > third-party load generator** — `dnsperf` (DNS-OARC), the long-standing reference DNS
 > performance tool. Measured data only; truth is the receiver NIC hardware counters, not
 > the generator's self-report. Where a value is generator-bound, it is stated as such. The
-> current measured campaign is the 2026-07-03 v2.7.5 four-server round (§4).
+> current measured campaign is the 2026-07-03 four-server round (§4).
 
 ## 1. Objective
 
@@ -53,7 +53,7 @@ design bounds the measurement.
   saturation throughput. Where they overlap — correctness, NIC-truth, and latency at
   comparable load levels — they agree. The measured cross-tool numbers are in §4.
 
-## 4. 2026-07-03 — v2.7.5 four-server campaign: dnsperf vs dnsmark vs kxdpgun
+## 4. 2026-07-03 — four-server campaign: dnsperf vs dnsmark vs kxdpgun
 
 The widest cross-tool round to date: **four servers** in strict parity, driven by **four
 generators** with different load disciplines, all measured by the one datapath-independent
@@ -74,8 +74,8 @@ query is a **cache hit** — this isolates the serving path, not the recursion p
 
 **Generators — four load disciplines.**
 - `dnsperf` — closed-loop kernel-UDP (`-c 500 -T 20 -q 100000`).
-- `dnsmark 2.7.5` kernel firehose (`-Q 6M --max-outstanding 0`).
-- `dnsmark 2.7.5` XDP firehose (`--xdp -Q 13M --max-outstanding 0`).
+- `dnsmark` kernel firehose (`-Q 6M --max-outstanding 0`).
+- `dnsmark` XDP firehose (`--xdp -Q 13M --max-outstanding 0`).
 - `kxdpgun 3.4.6` (`-Q 13M`).
 
 ### Server throughput — receiver NIC tx (qps)

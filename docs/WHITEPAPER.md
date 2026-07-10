@@ -35,8 +35,8 @@ own in-flight table, and its own send/receive loop.
 
 - For UDP/TCP/DoT, N = `--clients` (`-c`).
 - For AF_XDP, N is **auto-detected** from the NIC and **capped to NIC-local physical
-  cores** (v2.1.0): N = min(RX queue count, per-NIC core budget). Binding one XSK per
-  HW queue oversubscribes the few NIC-local cores and collapses throughput (the pre-2.1.0
+  cores**: N = min(RX queue count, per-NIC core budget). Binding one XSK per
+  HW queue oversubscribes the few NIC-local cores and collapses throughput (a
   "peak then collapse"): many more workers than NIC-local cores contend and read *far
   less* than a worker count matched to the cores. The budget is topology-dependent: on a
   2-socket Intel the NIC-local physical cores plus at most 6 cross-NUMA cores (the
@@ -54,7 +54,7 @@ The target rate is divided by the number of **actually spawned** workers, not by
 
 ## 3. The default datapath — the unified UDP worker
 
-The core of v2.0.0 is a **single-threaded** send-and-receive loop, one per worker
+The core of the default path is a **single-threaded** send-and-receive loop, one per worker
 (`transport/udp.rs::unified_udp_worker`). Send and receive happen in the *same* thread
 on the *same* clock, so an RTT is measured start-to-finish with no inter-thread
 hand-off. The loop, each iteration:
@@ -83,9 +83,8 @@ hand-off. The loop, each iteration:
 
 Why this shape:
 
-- **One thread, one clock.** The previous (pre-2.0) design split sending and receiving
-  across two threads; the hand-off added a context switch (~34 µs) to every measured
-  RTT. Unifying the loop removes it.
+- **One thread, one clock.** A split send/receive design across two threads would add a
+  context switch (~34 µs) to every measured RTT; unifying the loop removes it.
 - **`poll` with a deadline of "time until next send"** means the worker sleeps exactly
   as long as it should: it wakes the instant a response arrives (low latency) but also
   in time to send the next query (accurate rate). It never blocks past a send deadline.
@@ -137,12 +136,12 @@ kernel mode is the portable default below the per-skb wall.
 
 **The `--ramp` saturation search (§5b) also runs on this path**, rate-paced to the ramp's current
 target QPS with per-query **RTT sampled** into the histogram. So that latency tracking never caps the
-offered load, the kernel-UDP throughput path **splits TX and RX across two threads** (since 2.4.0): a
+offered load, the kernel-UDP throughput path **splits TX and RX across two threads**: a
 TX thread floods/paces and records each send time into a lock-free in-flight table (one `AtomicU64`
 slot per 16-bit DNS id — the id is the index, so no lock and no collision), while a **dedicated RX
 thread** drains responses (`poll`+`recvmmsg`), matches ids and records RTT + completions. A single
-shared clock keeps `RTT = recv - send` exact. Draining RX in the TX thread (as before 2.4.0) starved
-TX — the per-iteration `recvmmsg` capped the kernel-UDP ramp far below the flood rate; the split lets
+shared clock keeps `RTT = recv - send` exact. Draining RX in the TX thread would starve
+TX — the per-iteration `recvmmsg` caps the kernel-UDP ramp far below the flood rate; the split lets
 the dichotomy offer up to the flood rate and find the server's real knee. The AF_XDP ramp needs
 **no** split — its ring-based RX drain is cheap enough to run inside the unified worker (§6), with q0
 RSS concentration keeping that one queue continuously drained. Pure flood (`--max-outstanding 0`
@@ -221,12 +220,12 @@ Two independent limits shape the send side:
   > `--max-outstanding` far above the queue depth over-fills the queue and *lowers* goodput at
   > higher latency — the expected closed-loop over-pipelining, not a server change.
 
-  > Versions up to 2.2.2 gated the kernel-UDP path on a **single shared** `global_in_flight`
-  > atomic. With `--max-outstanding 100` split across *N* workers that left only ~`100/N` in
-  > flight *per worker* (~5 on a 20-worker host) — a starved closed loop whose reported rate was
-  > a small fraction of what the server was actually serving in the same mode: a generator
-  > artefact misread as a slow server. The gate is now per-worker (2.2.3); a shared
-  > `global_in_flight` is still kept, but only as a reported statistic, never as the hot-path gate.
+  > The gate is **per-worker**, not a single shared `global_in_flight` atomic. Gating on one
+  > shared counter would split `--max-outstanding 100` across *N* workers, leaving only ~`100/N`
+  > in flight *per worker* (~5 on a 20-worker host) — a starved closed loop whose reported rate
+  > is a small fraction of what the server is actually serving in the same mode: a generator
+  > artefact misread as a slow server. A shared `global_in_flight` is kept only as a reported
+  > statistic, never as the hot-path gate.
 
 `--ramp` replaces the fixed rate with the two-phase saturation search described in
 §5b (`engine/ramp.rs`): it climbs QPS until the step saturates — the latency SLO breaks,
@@ -268,7 +267,7 @@ its own window: the latency histogram is reset at the start of every step
 (`ramp_step_latency()`), so the percentiles are the load *at that step*, never a cumulative
 blur.
 
-> **In kernel-UDP the criterion also gates on delivered throughput (since 2.7.7).** The
+> **In kernel-UDP the criterion also gates on delivered throughput.** The
 > kernel ramp is a gated closed loop: the shallow in-flight budget keeps p50 pinned at the
 > floor even once the generator's kernel-recv can no longer *offer* the doubled target, so
 > latency alone never trips and the exponential phase would climb to `MAX_DOUBLINGS` and
@@ -280,7 +279,7 @@ blur.
 > bisection is additionally capped at `MAX_BISECT` iterations so a noisy served signal always
 > terminates on the tightest bracket found.
 
-> **The SLO is auto-calculated from the latency floor — never hardcoded (since 2.5.5).**
+> **The SLO is auto-calculated from the latency floor — never hardcoded.**
 > A fixed 1 ms is wrong the moment the baseline RTT exceeds it (two switches + a router, or
 > a kernel/VM resolver with a ~ms service floor) — every step would "fail" and the knee
 > would read 0. The ramp records the lowest p50 it sees (the floor) and sets the SLO to
@@ -295,7 +294,7 @@ blur.
 > never sampled); in kernel-UDP the offer gate (above) stops the climb at the ceiling. Either
 > way the reported figure is the served peak, not the offered target.
 
-> **Two Capacity meanings, one per datapath — read the label (since v2.7.3).** What
+> **Two Capacity meanings, one per datapath — read the label.** What
 > "Capacity" measures depends on the datapath, because the two ramps are not the same shape:
 > - In **kernel-UDP** the ramp is a **gated closed loop** (dnsperf-comparable, latency-honest).
 >   The generator's own kernel receive path drops replies under load, and those drops clog the
@@ -385,7 +384,7 @@ Design points that make this fast *and* correct:
     queues (`equal queue_count`) with per-queue counting. A single q0 worker (busy on the TX
     batch) drains only ~350 k resp/s while millions arrive, which produced the #15-P1 14×
     round-trip under-count; the spread + per-queue count makes round-trip track the server's
-    real reply rate (**accurate since v2.5.0**, matching the README).
+    real reply rate (matching the README).
 
   TX always spreads across all bound queues regardless. (RETA only, no channel reconfig,
   safe around a live zero-copy bind; best-effort, warns on failure.)
@@ -409,17 +408,17 @@ Operational hardening (so a benchmark is repeatable without a setup ritual):
   diverge it shouts and refuses to present a fictional rate. It never falls back to the
   netdev `tx_packets` counter, which counts *submissions*, not transmissions, under
   zero-copy — exactly the fiction the guard exists to catch. The sent counter itself is
-  the **submitted**-descriptor count (v2.1.0): the completion ring under-reports at
+  the **submitted**-descriptor count: the completion ring under-reports at
   multi-Mpps, so it is not used for throughput.
-- **Auto warm-up** (v2.1.0). The first seconds of a run (default 3 s, `DNSMARK_WARMUP`)
+- **Auto warm-up.** The first seconds of a run (default 5 s, `DNSMARK_WARMUP`)
   are excluded from the measurement window, so XSK bind, ring fill and NIC ramp do not
   pollute the reported steady-state rate (`engine/mod.rs`).
-- **CPU governor guard** (v2.1.0). With `--xdp`, every CPU is pinned to the
+- **CPU governor guard.** With `--xdp`, every CPU is pinned to the
   `performance` governor for the run and restored on exit (`governor.rs`) — DVFS is the
   #1 benchmark confounder.
-- **Huge-page UMEM** (v2.1.0). The UMEM is backed by 2 MiB huge pages when available,
+- **Huge-page UMEM.** The UMEM is backed by 2 MiB huge pages when available,
   with a 4 KiB fallback (`transport/xdp/umem.rs`) — fewer dTLB misses at multi-Mpps.
-- **802.1Q VLAN — experimental** (v2.2.0). `DNSMARK_VLAN=<vid>` bakes one 802.1Q tag
+- **802.1Q VLAN — experimental.** `DNSMARK_VLAN=<vid>` bakes one 802.1Q tag
   into the frame template (the hot path stays copy+patch), an optional tag is skipped
   on RX, and the AF_XDP socket binds the **physical parent** of a VLAN sub-interface
   (AF_XDP zero-copy cannot bind a sub-interface) while reading src IP/MAC from the
@@ -465,13 +464,13 @@ the generator's send counter but the egress NIC's hardware **rx** counter on the
 (`rx_packets` + ring-overflow drops) — `server_rx_qps`. That NIC-counter truth is the
 reference for every throughput figure in this document; the generator's own RX drain (§5b)
 is a lower bound, never the quoted number. This is why the two ramps report different
-Capacity meanings (§5b, since v2.7.3): the kernel-UDP closed-loop knee is generator-recv
+Capacity meanings (§5b): the kernel-UDP closed-loop knee is generator-recv
 bound and is *not* `server_rx_qps`, so its label points to the open-loop
 `dnsmark -s <ip> -Q 0 --max-outstanding 0` run — whose `Server throughput (NIC rx)` *is*
 `server_rx_qps` — for the raw ceiling; the `--xdp` ramp, being a lossless open-loop firehose,
 already reports the on-wire max directly.
 
-### 7a. The generator effect — why one server yields four headline numbers (2026-07-03, dnsmark 2.7.5)
+### 7a. The generator effect — why one server yields four headline numbers (2026-07-03)
 
 The point above is not academic. Run the **same server** under four different generators and
 it reports four different "throughputs" — not because the server changed, but because each
@@ -536,8 +535,8 @@ the honest receiver-NIC-tx count, just at a smaller average reply size than the 
 §7's ceiling assumes. All four columns are the receiver-NIC-tx truth; nothing here is a generator
 self-report.
 
-**Line-rate awareness (`--` / `--json`, since v2.7.1) — is the run wire-bound or is there
-headroom?** At multi-Mpps the honest next question is *what* is the wall. dnsmark now answers
+**Line-rate awareness (`--json`) — is the run wire-bound or is there
+headroom?** At multi-Mpps the honest next question is *what* is the wall. dnsmark answers
 it from its **own** hardware observations, building directly on `server_rx_qps`: it divides
 the authoritative served rate by the line-rate ceiling implied by the average on-wire reply
 size (the egress NIC's `rx_bytes/rx_packets`) and the egress-NIC link speed, and reports the
@@ -549,8 +548,8 @@ result as a **% of line rate** with a verdict:
 This needs no receiver-side reading beyond the NIC counter already at the heart of
 `server_rx_qps`, and it works identically in AF_XDP and kernel-UDP mode.
 
-> **The line-rate verdict is emitted for fixed/flood runs only, never in `--ramp` (since
-> v2.7.2).** In a fixed or flood run `server_rx_qps` reflects one steady window, so the
+> **The line-rate verdict is emitted for fixed/flood runs only, never in `--ramp`.**
+> In a fixed or flood run `server_rx_qps` reflects one steady window, so the
 > % of line rate is meaningful. In `--ramp` the same counter spans the whole ramp-up and
 > its average sits far below the peak — a line-rate % there would contradict the DSD's own
 > "Capacity" summary. In `--ramp` the DSD Capacity / Within SLO / Knee bracket (§5b) *is*
@@ -563,10 +562,10 @@ physical core building minimal DNS frames already emits fast enough to fill the 
 consequence for the datapath discussion above: a **single core can saturate a 10 G NIC in
 both directions** (TX *and* RX-count), so a 1-core unified worker and a 2-core TX/RX split
 reach the **same** wire-bound throughput. The wire is the wall, not the CPU and not PCIe.
-This is also why the auto warm-up default is now **5 s** (was 3 s): the reported rate is read
+This is also why the auto warm-up default is **5 s**: the reported rate is read
 at steady state, after the link has settled at its ceiling.
 
-**`--wire-latency` (built-in wire anchor, since 2.5.8).** Rather than only validating against
+**`--wire-latency` (built-in wire anchor).** Rather than only validating against
 an external `tcpdump`, dnsmark can read the wire stamps itself: a serial-ping-pong mode that
 takes kernel **SO_TIMESTAMPING** TX+RX timestamps (raw-hardware when the NIC stamps the flow,
 else software/driver-level) and reports the round-trip with the **generator's userspace/socket
@@ -588,7 +587,7 @@ The practical rules that follow:
 
 Every run produces the same metrics, available live (TUI), as JSON (`--json`, for
 CI/automation), as CSV (`--csv`), or as plain text. The plain-text report (header
-`DNS Performance Testing Tool — dnsmark 2.7.5`) prints the parameters, then the
+`DNS Performance Testing Tool — dnsmark 1.0.0`) prints the parameters, then the
 statistics (queries sent/completed/lost + response-code breakdown), then the throughput
 block in this fixed order:
 
@@ -613,13 +612,13 @@ worth knowing (e.g. high loss → the result may be bounded by the *receiver's* 
 the server; read the receiver's NIC counters). A one-line host banner is printed at
 startup.
 
-Since v2.7.1 the report also carries the **line-rate verdict** (§7). The text report prints
+The report also carries the **line-rate verdict** (§7). The text report prints
 a `Line rate: X% of Y Gb/s wire (Z B replies, ceiling N M/s)` line followed by a
 `-> WIRE-BOUND: …` or `-> link has headroom: …` verdict, and `--json` adds a **`line_rate`**
 object — `{rate_qps, avg_reply_bytes, link_mbps, line_rate_pps, percent_of_line, verdict}` —
 plus an explanatory entry in `notes`. It is computed entirely from `server_rx_qps` and the
 egress NIC counters, so it appears in both AF_XDP and kernel-UDP runs with no receiver-side
-reading. Since v2.7.2 it is emitted for **fixed/flood runs only** — in `--ramp` the
+reading. It is emitted for **fixed/flood runs only** — in `--ramp` the
 `server_rx_qps` average spans the whole ramp-up and would contradict the DSD Capacity
 summary, so the line-rate line is suppressed and the JSON `line_rate` is `null`, with the DSD Capacity /
 Within SLO / Knee bracket (§5b) is the throughput answer instead.
@@ -644,25 +643,28 @@ Within SLO / Knee bracket (§5b) is the throughput answer instead.
 
 ### Known caveats (write them down rather than hide them)
 
-- **In-flight table sizing and eviction accounting.** Each UDP worker's in-flight table
-  is a power-of-two slot array indexed by `id & (len−1)`. With sequentially-issued ids
-  and the table sized to ≥ the outstanding window (controlled-rate mode), there are zero
-  collisions. In **flood/unlimited** mode (`--max-outstanding 0`) the number in flight
-  can exceed the table length; when two ids hash to the same slot, `insert()` detects the
-  collision and the evicted query is counted as a **timeout** (a loss) and removed from
-  `global_in_flight` — so `sent == completed + lost` holds exactly even in flood mode,
-  with no query silently disappearing. Eviction-timeouts, like all timeouts, count toward
-  `queries_lost`, not the latency histogram. Quote latency from **controlled-rate** runs.
+- **In-flight table sizing and id-reuse accounting.** Each UDP worker's in-flight table is
+  a **65 536-slot array direct-indexed by the 16-bit DNS id** — the id *is* the slot index,
+  so two *distinct* ids never collide (`Vec<u64>` in the closed-loop unified worker, a
+  `Box<[AtomicU64]>` `SharedInFlight` in the flood TX/RX split). In **controlled-rate** mode
+  the outstanding gate holds far fewer than 65 536 queries live at once, so an id is never
+  reused while its query is still in flight — zero aliasing. In **flood/unlimited** mode
+  (`--max-outstanding 0`) ids are issued sequentially and wrap every 65 536 sends, so at
+  offered rate *R* an id is reused after ≈ `65536 / R`: a reply slower than that arrives
+  after its slot has already been overwritten by the reused id's fresh send, so it can no
+  longer be matched to its original query. Such unmatched queries are cleared by the 10 ms
+  **timeout sweep** (by age) and counted as **timeouts** in `queries_lost`, never as latency
+  samples. Quote latency from **controlled-rate** runs.
 - **Flood mode bounds the latency window (read p99 with the loss rate).** A consequence of
-  the above: at offered rate *R*, the in-flight table holds at most `table_len` queries,
-  so a response slower than ≈ `table_len / R` is evicted (counted as a *loss*) before it
-  can return (e.g. a 65 536-slot table at R = 10 M qps evicts anything slower than
-  ≈ 6.5 ms). In **flood** the latency histogram therefore holds only the responses that
+  the above: at offered rate *R*, an id is reused after ≈ `65536 / R`, so a response slower
+  than that returns to a slot already overwritten by the reused id and is counted as a
+  *loss* (e.g. a 65 536-slot table at R = 10 M qps bounds the matchable window to ≈ 6.5 ms).
+  In **flood** the latency histogram therefore holds only the responses that
   came back *within* that window — its p99 is the latency of the queries that **made it
   back**, and is optimistic if read without the loss rate. This is not hidden data (the
   slow ones are losses, reported in `queries_lost`), but it means **p99 in flood must be
   read together with loss%** — and for any latency figure you should use a controlled rate,
-  where there are no evictions and loss ≈ 0.
+  where there is no reuse and loss ≈ 0.
 - **`--compare` shares one async runtime.** The two servers run as concurrent tasks in
   the same runtime, so a side-by-side compare is fair at controlled rates but not a clean
   isolation at saturation (the tasks contend for the runtime). For saturation
@@ -709,8 +711,8 @@ choice of copy is invisible in qps and p50.
 
 Because `copy_from_slice` is **as fast as or faster than** the hand-written SIMD at these
 sizes — and is simpler, `unsafe`-free, and one fewer thing to audit — the hot-path copy
-uses `copy_from_slice`, and the hand-rolled AVX2/SSE2 memcpy has been **removed**
-(v2.0.2). CPU-tier detection is kept only for the startup banner. dnsmark claims **no**
+uses `copy_from_slice`, and the hand-rolled AVX2/SSE2 memcpy has been **removed**.
+CPU-tier detection is kept only for the startup banner. dnsmark claims **no**
 SIMD-driven speedup anywhere — the copy is an implementation detail, not a feature. If
 profiling on a 25/100 G NIC ever puts the copy on the critical path, the correct fix is to
 eliminate the copy entirely (zero-copy UMEM frames reuse the template in-place), not to
@@ -718,6 +720,6 @@ re-introduce a hand-rolled loop.
 
 ---
 
-*This document describes the implementation as of v2.7.5 (2026-07-03). Mechanisms are
+*This document describes the implementation as of v1.0 (2026-07-03). Mechanisms are
 referenced to their source files so the description can be checked against the code
 rather than taken on trust.*
