@@ -28,23 +28,22 @@ chosen explicitly; dnsmark never silently changes datapath
 ## 2. Worker pool
 
 A run spawns **N worker threads**, each pinned to a CPU core
-(`tokio::task::spawn_blocking` + `pin_to_cpu(worker_id)`). Workers share nothing on
-the hot path except one atomic counter for the global outstanding gate (kernel paths;
-the AF_XDP unified path shares nothing at all — see §5); each owns its own socket, its
-own in-flight table, and its own send/receive loop.
+(`tokio::task::spawn_blocking` + `pin_to_cpu(worker_id)`). Nothing is shared across
+workers on the hot path — each owns its own socket, its own in-flight table, and its own
+send/receive loop, and the outstanding gate is a **per-worker local counter, not a shared
+atomic** (see §5).
 
 - For UDP/TCP/DoT, N = `--clients` (`-c`).
-- For AF_XDP, N is **auto-detected** from the NIC and **capped to NIC-local physical
-  cores**: N = min(RX queue count, per-NIC core budget). Binding one XSK per
+- For AF_XDP, N is **auto-detected** from the NIC and **capped to the NIC-local physical
+  cores**: N = min(RX queue count, NIC-local physical core count). Binding one XSK per
   HW queue oversubscribes the few NIC-local cores and collapses throughput (a
   "peak then collapse"): many more workers than NIC-local cores contend and read *far
-  less* than a worker count matched to the cores. The budget is topology-dependent: on a
-  2-socket Intel the NIC-local physical cores plus at most 6 cross-NUMA cores (the
-  inter-socket QPI saturates beyond that); on many-node AMD, 12 per port. Workers are pinned to
-  **physical** cores (`autodetect.rs::physical_cores_numa_sorted`), NIC-local node
-  first, never an HT sibling; a global cross-NIC cursor gives a second NIC distinct
-  cores, and when the core pool is spent no further workers spawn
-  (`transport/xdp/receiver.rs`).
+  less* than a worker count matched to the cores. The pool is **strictly NIC-local** — the
+  physical cores whose NUMA node matches the NIC's (`autodetect.rs::physical_cores_numa_sorted`
+  filtered to the NIC's node; `transport/xdp/receiver.rs`); a wider cross-NUMA budget was
+  evaluated and removed, so no cross-socket cores are added. Workers pin to **physical**
+  cores, never an HT sibling; a global cross-NIC cursor gives a second NIC distinct cores,
+  and when the core pool is spent no further workers spawn.
 
 The target rate is divided by the number of **actually spawned** workers, not by
 `--clients`, so a low-queue NIC still drives the full target
@@ -55,7 +54,7 @@ The target rate is divided by the number of **actually spawned** workers, not by
 ## 3. The default datapath — the unified UDP worker
 
 The core of the default path is a **single-threaded** send-and-receive loop, one per worker
-(`transport/udp.rs::unified_udp_worker`). Send and receive happen in the *same* thread
+(`transport/udp.rs::closed_loop_unified`). Send and receive happen in the *same* thread
 on the *same* clock, so an RTT is measured start-to-finish with no inter-thread
 hand-off. The loop, each iteration:
 
@@ -65,14 +64,14 @@ hand-off. The loop, each iteration:
      send(fd, query, MSG_DONTWAIT)
      in_flight.insert(id, timestamp)
      in_flight_count += 1           (per-worker counter — the § 5 gate)
-     advance next_send by send_interval   (no burst catch-up after a stall)
+     advance next_send by send_interval   (bounded catch-up; a stall > 2 ms resets it — § 5)
 
 2. WAIT  poll(fd, POLLIN, µs_until_next_send)
      wakes immediately on a response, or at the next send deadline — never overshoots.
      For sub-millisecond intervals it busy-spins with a non-blocking peek instead
      (poll() has only ms resolution).
 
-3. DRAIN recvmmsg(fd, …, 64, MSG_DONTWAIT)        ← up to 64 responses per syscall
+3. DRAIN recvmmsg(fd, …, 256, MSG_DONTWAIT)       ← up to 256 responses per syscall
      for each response:
        timestamp = clock.now()
        rtt = timestamp − in_flight.take(id)
@@ -88,7 +87,7 @@ Why this shape:
 - **`poll` with a deadline of "time until next send"** means the worker sleeps exactly
   as long as it should: it wakes the instant a response arrives (low latency) but also
   in time to send the next query (accurate rate). It never blocks past a send deadline.
-- **`recvmmsg` batches** up to 64 datagrams per syscall — the receive path is cheap, so
+- **`recvmmsg` batches** up to 256 datagrams per syscall — the receive path is cheap, so
   it contributes little of the generator's own overhead.
 - Send and receive sockets carry **8 MB** SO_SNDBUF/SO_RCVBUF so bursts are not dropped
   by the kernel before the loop drains them.
@@ -103,9 +102,9 @@ iteration is ~3 syscalls (`sendmsg` + `poll` + `recvmmsg`) plus per-query bookke
 *measure* latency — but it caps the raw send rate.
 
 When all you need is **maximum offered load** — `--max-outstanding 0` (saturation /
-flood) — dnsmark switches to a dedicated **throughput worker**
-(`transport/udp.rs::throughput_udp_worker`) that strips everything not needed to
-bombard:
+flood) — dnsmark switches to a dedicated **throughput path that splits TX and RX across
+two threads** (`transport/udp.rs::throughput_udp_tx` and `throughput_udp_rx`), stripping
+everything not needed to bombard:
 
 - **`sendmmsg`, batch 64** — one syscall pushes 64 queries instead of one `send` per
   packet, amortising the syscall-entry cost (the dominant per-packet overhead in
@@ -174,12 +173,12 @@ datapaths reach correctness differently, so their tables differ.
   closed-loop path — its default gate is 32, not 0.) Every worker sweeps its own table (§3, step 4).
 - **AF_XDP path (`transport/xdp/receiver.rs`, `InFlight`) — one shared table, by necessity.**
   A single `Arc`-shared 65 536-slot `Box<[AtomicU64]>` indexed directly by the **global
-  16-bit DNS id**, with **no per-worker partition**: each bound RX queue has its own XSK (with
-  its own UMEM and rings), and the NIC's RSS scatters replies across those queues, so a reply
-  may return on *any* worker's queue and must still match its send timestamp. Only worker 0 runs the 10 ms timeout sweep
-  and the end-of-run drain over the shared table (one scan, no cross-worker double-counting).
-  (A legacy per-worker `unified_udp_worker` with a thread-local table also lives in `udp.rs`
-  but is dead code.)
+  16-bit DNS id** (ids are allocated in disjoint per-worker ranges, so globally unique; §6),
+  with **no per-worker table partition**: each bound RX queue has its own XSK (with its own
+  UMEM and rings), and the NIC's RSS scatters replies across those queues, so a reply may
+  return on *any* worker's queue and must still match its send timestamp. Only worker 0 runs
+  the 10 ms timeout sweep and the end-of-run drain over the shared table (one scan, no
+  cross-worker double-counting).
 
 **The latency histogram.** Completed RTTs go into an HDR histogram
 (`stats/mod.rs`, range **1 µs – 60 s, 3 significant figures**), from which
@@ -195,8 +194,10 @@ the end-of-run drain mark such queries as timeouts (`inc_timeout`); they move in
 `queries_lost`, never into `queries_completed` or the latency histogram. This keeps three counters clean: `queries_completed` = real responses,
 `queries_lost` = timeouts + send errors, and `sent == completed + lost` exactly.
 
-**Outstanding depth** is tracked too (mean and max concurrent in-flight), and reported
-in JSON — this is the closed-loop outstanding depth (the `-q`-style window).
+**Outstanding depth** (mean and max concurrent in-flight) is sampled on the **AF_XDP path**
+only (`stats.record_inflight`, `transport/xdp/receiver.rs`) and reported in JSON. On the
+kernel path the outstanding counter stays a worker local and is not recorded, so
+`inflight_mean` / `inflight_max` read 0 there.
 
 ---
 
@@ -205,27 +206,33 @@ in JSON — this is the closed-loop outstanding depth (the `-q`-style window).
 Two independent limits shape the send side:
 
 - **Rate** — each worker holds a `send_interval = 1 / qps_per_worker`. It sends when
-  `now ≥ next_send`, then advances `next_send`. After a stall it does **not** burst to
-  catch up (`next_send = now + interval`), so a scheduler hiccup cannot produce a
-  thundering send and a distorted tail.
-- **Outstanding** — each worker bounds its **own** in-flight at `--max-outstanding`
-  (kernel-UDP default 100) with a purely local counter: a per-worker closed-loop window.
-  This holds on **both** datapaths (kernel-UDP and AF_XDP); there is no shared atomic on
-  either hot path.
+  `now ≥ next_send`, then advances `next_send += send_interval`. Small lags are caught up
+  in a **bounded** burst (the send-fill loop emits the queued slots to hold the offered
+  rate — the same discipline dnsperf uses), but a real stall (falling **> 2 ms** behind)
+  resets the schedule (`next_send = now`), so a scheduler hiccup cannot produce a thundering
+  send, and the outstanding gate bounds the burst regardless (`closed_loop_unified`,
+  `udp.rs`).
+- **Outstanding** — a closed-loop window bounded by `--max-outstanding` (kernel-UDP
+  default 100). On the **kernel** path each worker bounds its **own** in-flight with a
+  purely local counter — a per-worker window, no shared atomic. On the **AF_XDP** path the
+  workers share one `global_in_flight` atomic, so there `--max-outstanding` is a **global**
+  cap. In firehose mode (`--max-outstanding 0`) the gate is off on both.
 
-  > **`--max-outstanding` is PER WORKER, not a global cap.** dnsperf's `-q` is a **total**
-  > outstanding cap; dnsmark's is multiplied by the worker count (`-c`). To reproduce a
-  > dnsperf `-q N` run, set `--max-outstanding N/clients` (a swept, bounded closed-loop then
-  > reads the same served rate on both tools; see `docs/cross-validation-dnsperf.md`). Setting
-  > `--max-outstanding` far above the queue depth over-fills the queue and *lowers* goodput at
-  > higher latency — the expected closed-loop over-pipelining, not a server change.
+  > **On the kernel path, `--max-outstanding` is PER WORKER, not a global cap.** dnsperf's
+  > `-q` is a **total** outstanding cap; dnsmark's kernel-path value is multiplied by the
+  > worker count (`-c`). To reproduce a dnsperf `-q N` run, set `--max-outstanding N/clients`
+  > (a swept, bounded closed-loop then reads the same served rate on both tools; see
+  > `docs/cross-validation-dnsperf.md`). Setting `--max-outstanding` far above the queue depth
+  > over-fills the queue and *lowers* goodput at higher latency — the expected closed-loop
+  > over-pipelining, not a server change. (On AF_XDP the workers share one gate, so the value
+  > is a global cap there.)
 
-  > The gate is **per-worker**, not a single shared `global_in_flight` atomic. Gating on one
-  > shared counter would split `--max-outstanding 100` across *N* workers, leaving only ~`100/N`
-  > in flight *per worker* (~5 on a 20-worker host) — a starved closed loop whose reported rate
-  > is a small fraction of what the server is actually serving in the same mode: a generator
-  > artefact misread as a slow server. A shared `global_in_flight` is kept only as a reported
-  > statistic, never as the hot-path gate.
+  > Why per-worker on the kernel path: gating on one shared counter would split
+  > `--max-outstanding 100` across *N* workers, leaving only ~`100/N` in flight *per worker*
+  > (~5 on a 20-worker host) — a starved closed loop whose reported rate is a small fraction
+  > of what the server is actually serving in the same mode: a generator artefact misread as a
+  > slow server. So `closed_loop_unified` keeps only its local counter; the `global_in_flight`
+  > argument it is passed is unused on that path.
 
 `--ramp` replaces the fixed rate with the two-phase saturation search described in
 §5b (`engine/ramp.rs`): it climbs QPS until the step saturates — the latency SLO breaks,
@@ -362,17 +369,18 @@ Design points that make this fast *and* correct:
   the ixgbe zero-copy datapath and collapses throughput. Each worker owns its queue's
   socket, UMEM and rings — no shared per-packet state.
 - **Workers pinned to NIC-local physical cores** (never an HT sibling) so the DMA and
-  the response handling stay on the memory controller closest to the NIC; at most a
-  small cross-NUMA budget is used after the local cores.
+  the response handling stay on the memory controller closest to the NIC. The worker pool
+  is strictly NIC-local (§2).
 - **Cycled source port + global reply matching.** Each worker *cycles* its UDP source
   port over a wide range (`10000 + (counter mod 2048)`, with a per-worker phase offset so
   workers do not emit the same port in lockstep). A fixed one-port-per-worker scheme
   emitted only `nworkers` distinct flows and collapsed the receiver's RSS onto a few
   queues, so it was dropped. Reply matching is by **global DNS transaction id** into a
-  shared 65536-slot lock-free in-flight table — so a reply may return on *any* of the
-  bound RX queues (wherever the generator's RSS scattered it) and still match. There is no
-  per-worker id partition and no shared-state-free per-worker matching; a reply on
-  "another worker's" queue is **not** lost.
+  shared 65536-slot lock-free in-flight table: each worker **inserts from a disjoint id
+  range** (`id_base = worker × 65536/N`, so ids are globally unique), while **matching is
+  global** — a reply may return on *any* of the bound RX queues (wherever the generator's
+  RSS scattered it) and any worker still matches it; a reply on "another worker's" queue is
+  **not** lost.
 - **Generator-side RSS steering — two regimes, because one RETA cannot serve both.** The
   NIC's default RSS spans **all** HW queues, so replies frequently hashed to an unbound
   queue and were dropped before the socket (a false ~100 % loss). The RETA is steered to
@@ -405,7 +413,9 @@ Operational hardening (so a benchmark is repeatable without a setup ritual):
   counters read a flat zero.
 - **Wire-truth guard.** dnsmark reads the NIC PHY tx counter (`*_nic`) around the run and
   prints the PHY-confirmed egress next to the submitted-descriptor egress; if they
-  diverge it shouts and refuses to present a fictional rate. It never falls back to the
+  diverge (PHY < 50 % of the reported egress) it **shouts a red WARNING** that the number
+  is fictional — the figure is still printed, flagged as unreliable, not suppressed
+  (`output/text.rs`). It never falls back to the
   netdev `tx_packets` counter, which counts *submissions*, not transmissions, under
   zero-copy — exactly the fiction the guard exists to catch. The sent counter itself is
   the **submitted**-descriptor count: the completion ring under-reports at
@@ -567,9 +577,9 @@ at steady state, after the link has settled at its ceiling.
 
 **`--wire-latency` (built-in wire anchor).** Rather than only validating against
 an external `tcpdump`, dnsmark can read the wire stamps itself: a serial-ping-pong mode that
-takes kernel **SO_TIMESTAMPING** TX+RX timestamps (raw-hardware when the NIC stamps the flow,
-else software/driver-level) and reports the round-trip with the **generator's userspace/socket
-overhead excluded** — and, being serial, free of the open-loop queuing that inflates
+takes kernel **SO_TIMESTAMPING** TX+RX timestamps and reports the round-trip with the
+**generator's userspace/socket overhead excluded** — and, being serial, free of the open-loop
+queuing that inflates
 throughput-mode latency. It reports server + network (the generator cannot isolate the
 server's own term — that still needs a capture *on the server*), but it removes the tool's
 third term, so the reported round-trip sits below the userspace serial RTT by the amount of
@@ -585,8 +595,11 @@ The practical rules that follow:
 
 ## 8. Output
 
-Every run produces the same metrics, available live (TUI), as JSON (`--json`, for
-CI/automation), as CSV (`--csv`), or as plain text. The plain-text report (header
+Every run produces the same underlying measurements, exposed through four outputs — a live
+**TUI**, **JSON** (`--json`, for CI/automation), **CSV** (`--csv`), and **plain text**. The
+**JSON is the complete reference output**; the TUI and CSV are partial views (the TUI omits
+min/avg/max, the NIC-rate lines and the line-rate verdict; the CSV omits the send / NIC-rx /
+wire rates, the line-rate line and the in-flight depth). The plain-text report (header
 `DNS Performance Testing Tool — dnsmark 1.0.0`) prints the parameters, then the
 statistics (queries sent/completed/lost + response-code breakdown), then the throughput
 block in this fixed order:
@@ -607,10 +620,9 @@ JSON schema is stable and is the recommended interface for automated comparison.
 
 The JSON also carries a **`host`** object — the generator's CPU model, physical/logical
 core counts, NUMA nodes, memory, and the egress NIC (driver, link speed, NUMA node) — so a
-result records the rig it was produced on, and a **`notes`** array that flags conditions
-worth knowing (e.g. high loss → the result may be bounded by the *receiver's* NIC/bus, not
-the server; read the receiver's NIC counters). A one-line host banner is printed at
-startup.
+result records the rig it was produced on, and a **`notes`** array. `notes` currently carries
+the line-rate verdict's explanation (§7) and is the extensible slot for such flags. A one-line
+host banner is printed at startup.
 
 The report also carries the **line-rate verdict** (§7). The text report prints
 a `Line rate: X% of Y Gb/s wire (Z B replies, ceiling N M/s)` line followed by a
@@ -675,8 +687,9 @@ Within SLO / Knee bracket (§5b) is the throughput answer instead.
   paced window, so an effect slower than a step (cache pollution, thermal throttling)
   can pass a step it would fail at steady state. Confirm a published figure with a
   fixed-rate run at the reported maximum.
-- **IPv6 + `--xdp`.** NUMA-local pinning is derived from the IPv4 route; an IPv6 target
-  skips it — workers still run, just without NUMA pinning.
+- **IPv6 targets skip NUMA pinning.** NUMA-local pinning is derived from the IPv4 route
+  (`/proc/net/route`), so **any** IPv6 target — not only under `--xdp` — skips it and warns
+  once; workers still run, just without NUMA pinning.
 - **The XDP capability probe is advisory.** A successful `AF_XDP` socket open means the
   kernel supports the family, not that attach will succeed (containers, missing BPF
   privileges, virtual interfaces). dnsmark falls back if attach fails; treat the
@@ -686,6 +699,14 @@ Within SLO / Knee bracket (§5b) is the throughput answer instead.
   percentiles cannot be averaged. This is conservative and *surfaces* a slow NIC rather
   than hiding it behind a weighted average; use `--nic-stats` for per-NIC percentiles.
   (Aggregate throughput, mean, min and max are exact.)
+- **`--wire-latency` reports software/driver stamps.** The mode requests kernel
+  `SO_TIMESTAMPING` but the raw-hardware path is not currently wired through
+  (`transport/wire_latency.rs` reports the software/driver stamp); the round-trip still
+  excludes the tool's userspace overhead, but it is not a NIC-hardware timestamp.
+- **Test scope.** Unit tests cover wire assembly, flood-mode eviction, the ramp and
+  multi-NIC aggregation; the integration tests (`tests/integration.rs`) require a live DNS
+  server and are `#[ignore]` by default. DoT/TCP transports and the XDP loader/UMEM/socket
+  layer have no unit coverage — validate those on real hardware.
 
 ---
 
